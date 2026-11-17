@@ -139,10 +139,10 @@ templates.
 
 The default monitors reference no Secrets, so discovery RBAC grants the
 Target Allocator Secret access through a Role in the collector namespace only.
-This chart does not configure Target Allocator mTLS. Without it, the Target
-Allocator does not pass Secret values to the collector. Monitors that
-authenticate with a Secret, for example `basicAuth` or a `tlsConfig` client
-certificate, are not supported by this chart.
+With the default values, this chart does not configure Target Allocator mTLS.
+Without it, the Target Allocator does not pass Secret values to the collector.
+So with the default values, monitors that authenticate with a Secret, for
+example `basicAuth` or a `tlsConfig` client certificate, do not work.
 
 The default observability namespace is `monitoring`. A different namespace
 also requires NetworkPolicy reachability to the collector.
