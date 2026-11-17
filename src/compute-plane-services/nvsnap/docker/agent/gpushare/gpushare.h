@@ -47,6 +47,8 @@ SPDX-License-Identifier: Apache-2.0
  *   mx pause  (before quiesce)  ModelExpress stops serving its weights to
  *            peers and drops its NIXL/RDMA state, which CRIU cannot dump.
  *   mx resume (after open)  it registers them again and republishes.
+ *   mx resume HOST  the same, advertising HOST (MX_WORKER_HOST) to peers:
+ *            after a restore into another pod, that pod's address.
  *            Both need ModelExpress >= 0.7 (an earlier one: "err").
  *
  * Shared memory is tracked whether it is passed as a POSIX fd or, with an

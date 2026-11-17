@@ -2096,11 +2096,19 @@ static void do_ipcget(unsigned long long base, int s)
  * Python. Not while launches are held: a Python thread waiting in the gate
  * holds the GIL. Needs ModelExpress >= 0.7: earlier releases keep no load
  * context once loaded, so there is nothing to pause. The reply counts the RDMA device files still open or
- * mapped: CRIU fails on any. */
+ * mapped: CRIU fails on any.
+ *
+ * "mx resume HOST": ModelExpress publishes MX_WORKER_HOST, else the
+ * address its sockets route from, as the address peers pull from. After a
+ * restore into another pod both are the captured pod's address, which the
+ * restored process keeps; only the caller knows the new one. HOST becomes
+ * MX_WORKER_HOST, which ModelExpress reads again on every publish. */
 static const char mx_py[] =
-    "def _nvsnap_mx(op, fd):\n"
+    "def _nvsnap_mx(op, fd, host):\n"
     "    import gc, os, sys\n"
     "    try:\n"
+    "        if host:\n"
+    "            os.environ['MX_WORKER_HOST'] = host\n"
     "        L = sys.modules.get('modelexpress.engines.vllm.loader')\n"
     "        if L is None:\n"
     "            rep = 'ok no ModelExpress loader'\n"
@@ -2155,9 +2163,16 @@ static void do_mx(char *reply, size_t n, const char *op)
     int (*ensure)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "PyGILState_Ensure");
     void (*release)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "PyGILState_Release");
     int (*run)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "PyRun_SimpleString");
-    char out[168] = "err no result", code[sizeof(mx_py) + 64];
+    char out[168] = "err no result", code[sizeof(mx_py) + 400];
+    const char *host = !strncmp(op, "resume ", 7) ? op + 7 : "";
     int p[2], fds, maps;
-    if (strcmp(op, "pause") && strcmp(op, "resume")) { snprintf(reply, n, "err unknown command"); return; }
+    /* HOST goes into Python source: an IP address or DNS name only (a
+     * request is at most 255 bytes). */
+    if (strcmp(op, "pause") && strcmp(op, "resume") &&
+        (!*host || strlen(host) > 200 || host[strspn(host, "0123456789abcdefghijklmnopqrstuvwxyz"
+                                                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ.:-")])) {
+        snprintf(reply, n, "err unknown command"); return;
+    }
     if (!is_init || !ensure || !release || !run || !is_init()) {
         snprintf(out, sizeof(out), "ok no Python");
     } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
@@ -2167,8 +2182,8 @@ static void do_mx(char *reply, size_t n, const char *op)
         snprintf(reply, n, "err pipe: %s", strerror(errno));
         return;
     } else {
-        snprintf(code, sizeof(code), "%s_nvsnap_mx('%s', %d)\ndel _nvsnap_mx\n", mx_py,
-                 *op == 'p' ? "pause" : "resume", p[1]);
+        snprintf(code, sizeof(code), "%s_nvsnap_mx('%s', %d, '%s')\ndel _nvsnap_mx\n", mx_py,
+                 *op == 'p' ? "pause" : "resume", p[1], host);
         int g = ensure();
         int r = run(code);
         release(g);

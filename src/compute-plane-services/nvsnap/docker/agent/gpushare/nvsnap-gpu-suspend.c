@@ -41,7 +41,10 @@ SPDX-License-Identifier: Apache-2.0
  *                 ModelExpress >= 0.7: with an earlier one, mx-pause fails
  *                 (the load context is gone, nothing to pause); upgrade it.
  *   mx-resume     After open (or resume without --hold-gate): ModelExpress
- *                 registers the weights again and republishes them.
+ *                 registers the weights again and republishes them. After a
+ *                 restore into another pod, pass --host with that pod's IP:
+ *                 the restored process still has the captured pod's address
+ *                 and would publish it, unreachable from other pods.
  *   gpus [FILE]   Print (or write to FILE) the UUIDs of the GPUs visible here.
  *
  * --hold-gate (resume after stop + CRIU restore): the pids run, but their
@@ -295,6 +298,7 @@ static int visible_gpus(CUuuid *out, int max)
  * library does not load or lacks an entry point.
  */
 static const char *libcuda_path = "libcuda.so.1";  /* --libcuda */
+static const char *mx_host;  /* --host (mx-resume) */
 
 #define PROBE_BYTES (1 << 20)
 
@@ -1720,6 +1724,7 @@ static void usage(const char *prog)
         "         probe        (is the one visible GPU usable? prints ok or the failing\n"
         "                       step and CUDA error; exit 0, 2 on a failure, 1 if it cannot ask)\n"
         "--libcuda PATH: (probe) the driver library to load (default libcuda.so.1)\n"
+        "--host H: (mx-resume) the address peers pull the weights from (the new pod's IP)\n"
         "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever)\n"
         "--gpu-map FILE: restore GPUs listed in FILE onto the GPUs visible here\n"
         "--store S --ckpt-dir C: (suspend) libnvsnap_gpushare processes save GPU memory\n"
@@ -1764,6 +1769,8 @@ int main(int argc, char **argv)
             fabric_dir = argv[argi + 1];
         else if (strcmp(argv[argi], "--libcuda") == 0)
             libcuda_path = argv[argi + 1];
+        else if (strcmp(argv[argi], "--host") == 0)
+            mx_host = argv[argi + 1];
         else
             break;
         argi += 2;
@@ -1823,7 +1830,15 @@ int main(int argc, char **argv)
         return failures;
     }
     if (strcmp(action, "mx-pause") == 0 || strcmp(action, "mx-resume") == 0) {
-        failures = ctl_all_par(pids, n, action[3] == 'p' ? "mx pause" : "mx resume") < 0;
+        char cmd[300];
+        if (mx_host && action[3] == 'p') {
+            fprintf(stderr, "--host goes with mx-resume\n");
+            free(pids);
+            return 1;
+        }
+        snprintf(cmd, sizeof(cmd), "mx %s%s%s", action[3] == 'p' ? "pause" : "resume",
+                 mx_host ? " " : "", mx_host ? mx_host : "");
+        failures = ctl_all_par(pids, n, cmd) < 0;
         free(pids);
         return failures;
     }

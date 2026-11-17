@@ -388,7 +388,10 @@ Limits of the move:
   `nvsnap-gpu-suspend mx-pause`, before the preflight and the suspend, makes
   ModelExpress stop serving its weights and drop its NIXL/RDMA state, and
   `mx-resume`, after `open`, registers the weights again and republishes
-  them under a new worker id. `mx-pause` fails while any RDMA device file is
+  them under a new worker id. After a restore into another pod, the agent
+  passes that pod's IP with `--host`: ModelExpress advertises
+  `MX_WORKER_HOST`, else the address its sockets route from, and both still
+  name the captured pod, which other pods cannot reach. `mx-pause` fails while any RDMA device file is
   still open or mapped, so RDMA outside ModelExpress still blocks the
   capture. A process without ModelExpress or Python answers `ok`.
 
