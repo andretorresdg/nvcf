@@ -35,7 +35,10 @@ sys.path.insert(0, HERE)
 from test_mx_host import CUDA_INC, build  # noqa: E402
 
 # argv: LOG MODE. MODE "none": no vLLM; "busy": a KV send is in flight for
-# 1 s after the first pause request; "fail": the connector shutdown raises.
+# 1 s after the first pause request; "fail": the connector shutdown raises;
+# "fail1": it raises on TP worker 1 only; "failresume": the first re-created
+# connector fails to register; "stuck": the listener ignores its stop event.
+# Env: WORKERS (TP workers, all in this process), LEASE, HELD.
 WORKER = r"""
 import ctypes, enum, os, queue, sys, threading, time, types
 LOG, MODE = sys.argv[1], sys.argv[2]
@@ -64,17 +67,23 @@ class Executor:
     def shutdown(self, wait):
         pass
 
+FAILED_REGISTER = []
+
 class Worker:
     def __init__(self, vllm_config, engine_id, kv_cache_config):
+        self.idx = vllm_config.idx
         self.engine_id, self.use_host_buffer = engine_id, False
         self._recving_transfers, self._reqs_to_send, self._handshake_futures = {}, {}, {}
         self._handshake_initiation_executor = Executor()
         log("worker", engine_id)
     def register_kv_caches(self, kv):
+        if MODE == "failresume" and self.engine_id != "e0" and not FAILED_REGISTER:
+            FAILED_REGISTER.append(1)
+            raise RuntimeError("register failed")
         self.device_kv_caches = kv
         log("register", kv)
     def _finish_shutdown(self):
-        if MODE == "fail":
+        if MODE == "fail" or (MODE == "fail1" and self.idx == 1):
             raise RuntimeError("shutdown failed")
         log("shutdown", self.engine_id)
 
@@ -89,18 +98,24 @@ class Sched:
         self._kv_lease_duration = float(os.environ.get("LEASE", "30"))
         self._stop_event, self._nixl_handshake_listener_t = threading.Event(), None
     def listen(self):
-        t = threading.Thread(target=self._stop_event.wait, daemon=True)
+        stuck = MODE == "stuck" and self._nixl_handshake_listener_t is None
+        t = threading.Thread(target=(lambda: time.sleep(3600)) if stuck else self._stop_event.wait,
+                             daemon=True)
         t.start()
         self._nixl_handshake_listener_t = t
         log("listen", self.side_channel_host, self.engine_id)
 
 if MODE != "none":
     cfg = types.SimpleNamespace(engine_id="e0")
-    wc = NixlPullConnector()  # worker side, as get_kv_transfer_group() returns it
-    wc.kv_transfer_config, wc.engine_id = cfg, "e0"
-    wc._vllm_config, wc.kv_cache_config = object(), object()
-    wc.connector_worker = Worker(None, "e0", None)
-    wc.connector_worker.register_kv_caches("kv0")
+    WC = []  # worker side, one per TP worker, as get_kv_transfer_group() returns it
+    for i in range(int(os.environ.get("WORKERS", "1"))):
+        wc = NixlPullConnector()
+        wc.kv_transfer_config, wc.engine_id = types.SimpleNamespace(engine_id="e0"), "e0"
+        wc._vllm_config, wc.kv_cache_config = types.SimpleNamespace(idx=i), object()
+        wc.connector_worker = Worker(wc._vllm_config, "e0", None)
+        wc.connector_worker.register_kv_caches("kv0")
+        WC.append(wc)
+    CUR = [WC[0]]
     kc = NixlPullConnector()  # scheduler side
     kc.engine_id, kc.connector_scheduler = "e0", Sched()
     def set_meta(meta):
@@ -123,9 +138,19 @@ if MODE != "none":
 
     class ModelExecutor:
         def collective_rpc(self, fn, args=()):
-            return [fn(None, *args)]
+            out, err = [], None
+            for w in WC:  # like vLLM: every worker runs it; the first error is raised
+                CUR[0] = w
+                try:
+                    out.append(fn(None, *args))
+                except Exception as x:
+                    err = err or x
+            CUR[0] = WC[0]
+            if err:
+                raise err
+            return out
         def get_kv_connector_handshake_metadata(self):
-            return [{0: wc.connector_worker.engine_id}]
+            return [{i: w.connector_worker.engine_id} for i, w in enumerate(WC)]
 
     class EngineCoreProc:
         def __init__(self):
@@ -141,7 +166,7 @@ if MODE != "none":
                 if kind == EngineCoreRequestType.ADD:
                     self.scheduler.requests[req.request_id] = req
                 if MODE == "busy" and self._idle_state_callbacks and not hasattr(self, "busy"):
-                    self.busy = wc.connector_worker._reqs_to_send
+                    self.busy = WC[0].connector_worker._reqs_to_send
                     self.busy["r1"] = 1
                     threading.Timer(1.0, lambda: (self.busy.clear(), log("drained"))).start()
                 cbs, self._idle_state_callbacks = self._idle_state_callbacks, []
@@ -149,8 +174,8 @@ if MODE != "none":
                     cb(self)
 
     st = mod("vllm.distributed.kv_transfer.kv_transfer_state",
-             has_kv_transfer_group=lambda: True, get_kv_transfer_group=lambda: wc)
-    mod("vllm.distributed.kv_transfer", get_kv_transfer_group=lambda: wc)
+             has_kv_transfer_group=lambda: True, get_kv_transfer_group=lambda: CUR[0])
+    mod("vllm.distributed.kv_transfer", get_kv_transfer_group=lambda: CUR[0])
     mod("vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector",
         NixlBaseConnector=NixlBaseConnector, NixlPullConnector=NixlPullConnector)
     mod("vllm.v1.engine.core", EngineCoreProc=EngineCoreProc)
@@ -248,7 +273,45 @@ class NixlPauseResume(unittest.TestCase):
         self.assertIn("resuming every pid", p.stderr)
         ev = self.events()
         self.assertEqual(ev[-1], "pause_state UNPAUSED", ev)
-        self.assertEqual(ev[-2], "listen 10.0.0.1 e0", ev)  # same engine: nothing was released
+        self.assertTrue(ev[-2].startswith("listen 10.0.0.1 ") and ev[-2] != "listen 10.0.0.1 e0", ev)
+
+    def test_partial_release_leaves_one_engine_id(self):
+        # TP worker 1 fails to shut down: after the rollback both workers must
+        # come back under the same new engine id.
+        self.start("fail1", WORKERS="2")
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        ev = self.events()
+        ids = [e.split()[1] for e in ev[ev.index("pause_state PAUSED_NEW"):] if e.startswith("worker ")]
+        self.assertEqual(len(ids), 2, ev)
+        self.assertEqual(ids[0], ids[1], ev)
+        self.assertNotEqual(ids[0], "e0", ev)
+        self.assertEqual(ev[-1], "pause_state UNPAUSED", ev)
+
+    def test_failed_resume_can_be_retried(self):
+        self.start("failresume")
+        self.ok("nixl-pause")
+        p = self.tool("nixl-resume")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn("register failed", p.stdout)
+        self.assertIn("resumed as engine", self.ok("nixl-resume"))
+        self.assertEqual(self.events()[-1], "pause_state UNPAUSED")
+
+    def test_lease_counts_the_drain(self):
+        # The send in flight holds the pause for 1 s: that counts toward the
+        # lease (1.5 s / 3), so the held request is prefilled locally.
+        self.start("busy", LEASE="1.5", HELD="1")
+        self.ok("nixl-pause")
+        self.assertIn("1 request(s) prefilled here", self.ok("nixl-resume"))
+
+    def test_stuck_listener_keeps_serving(self):
+        self.start("stuck")
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn("listener did not stop", p.stdout)
+        ev = self.events()
+        self.assertEqual(ev[-1], "pause_state UNPAUSED", ev)
+        self.assertFalse([e for e in ev if e.startswith("shutdown")], ev)
 
     def test_held_request_prefilled_locally(self):
         self.start(LEASE="0.3", HELD="1")

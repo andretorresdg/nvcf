@@ -385,9 +385,9 @@ Limits of the move:
   registrations in a NIC context, queue pairs connected to peers) would not
   survive a restore anyway. The capture preflight blocks such a capture and
   the instance runs on and starts cold (ARCHITECTURE.md, "Who is captured";
-  MPTCP support: #2926). This covers NCCL over InfiniBand or RoCE. A
-  workload that has released its RDMA devices by capture time is not
-  blocked.
+  MPTCP support: #2926). This covers NCCL over InfiniBand or RoCE, and
+  NIXL KV transfer over RDMA (disaggregated prefill/decode). A workload that
+  has released its RDMA devices by capture time is not blocked.
 - ModelExpress (>= 0.7) peer-to-peer over RDMA is the exception:
   `nvsnap-gpu-suspend mx-pause`, before the preflight and the suspend, makes
   ModelExpress stop serving its weights and drop its NIXL/RDMA state, and
@@ -398,8 +398,9 @@ Limits of the move:
   name the captured pod, which other pods cannot reach. `mx-pause` fails while any RDMA device file is
   still open or mapped, so RDMA outside ModelExpress still blocks the
   capture. A process without ModelExpress or Python answers `ok`.
-- vLLM's NIXL KV connector (disaggregated prefill/decode, `NixlConnector`
-  in pull mode, KV in GPU memory) is the other exception.
+- vLLM's NIXL KV connector (`NixlConnector` in pull mode, KV in GPU
+  memory) can release its RDMA devices with `nixl-pause`, but the agent does
+  not call it yet, so these workloads are still refused.
   `nvsnap-gpu-suspend nixl-pause`, before the suspend, makes the engine take
   no new requests, waits up to 60 s for KV transfers in flight, stops the
   handshake listener and shuts the connector down on every TP worker, which
@@ -410,8 +411,9 @@ Limits of the move:
   as for `mx-resume`. Requests that reached a paused decode engine are
   prefilled there if the pause outlasted a third of prefill's hold on their
   KV (`kv_lease_duration`, 30 s by default), since prefill may have reused
-  those blocks. `nixl-pause` fails, and resumes every pid, while any RDMA
-  device file is left. At TP > 1 the engine-core process allocates no GPU
+  those blocks. `nixl-pause` fails while any RDMA device file is left: the
+  engine checks every worker after the release and resumes itself, and the
+  tool resumes every pid on any failure. At TP > 1 the engine-core process allocates no GPU
   memory, so the pod needs `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` (see "How it
   works"); without it the workers time out waiting for the engine and the
   pause is refused. At TP > 1 in a pod with RDMA NICs, NCCL opens

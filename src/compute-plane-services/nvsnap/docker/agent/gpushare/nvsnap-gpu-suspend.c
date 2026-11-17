@@ -40,6 +40,7 @@ SPDX-License-Identifier: Apache-2.0
  *                 are left (RDMA outside ModelExpress, too). Needs
  *                 ModelExpress >= 0.7: with an earlier one, mx-pause fails
  *                 (the load context is gone, nothing to pause); upgrade it.
+ *                 When it fails, every pid is mx-resumed.
  *   mx-resume     After open (or resume without --hold-gate): ModelExpress
  *                 registers the weights again and republishes them. After a
  *                 restore into another pod, pass --host with that pod's IP:
@@ -1840,34 +1841,25 @@ int main(int argc, char **argv)
         free(pids);
         return failures;
     }
-    if (strcmp(action, "mx-pause") == 0 || strcmp(action, "mx-resume") == 0) {
+    if (!strcmp(action, "mx-pause") || !strcmp(action, "mx-resume") ||
+        !strcmp(action, "nixl-pause") || !strcmp(action, "nixl-resume")) {
+        /* "mx-pause" -> "mx pause", "nixl-resume" -> "nixl resume [HOST]" */
+        const char *dash = strchr(action, '-');
+        int kind = (int)(dash - action), pause = dash[1] == 'p';
         char cmd[300];
-        if (mx_host && action[3] == 'p') {
-            fprintf(stderr, "--host goes with mx-resume\n");
-            free(pids);
-            return 1;
-        }
-        snprintf(cmd, sizeof(cmd), "mx %s%s%s", action[3] == 'p' ? "pause" : "resume",
-                 mx_host ? " " : "", mx_host ? mx_host : "");
-        failures = ctl_all_par(pids, n, cmd) < 0;
-        free(pids);
-        return failures;
-    }
-    if (strcmp(action, "nixl-pause") == 0 || strcmp(action, "nixl-resume") == 0) {
-        char cmd[300];
-        int pause = action[5] == 'p';
         if (mx_host && pause) {
-            fprintf(stderr, "--host goes with nixl-resume\n");
+            fprintf(stderr, "--host goes with %.*s-resume\n", kind, action);
             free(pids);
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "nixl %s%s%s", pause ? "pause" : "resume",
+        snprintf(cmd, sizeof(cmd), "%.*s %s%s%s", kind, action, pause ? "pause" : "resume",
                  mx_host ? " " : "", mx_host ? mx_host : "");
         failures = ctl_all_par(pids, n, cmd) < 0;
-        /* A pid that paused would serve no KV until resumed. */
+        /* A pid that paused would serve nothing until resumed. */
         if (failures && pause) {
-            fprintf(stderr, "nixl-pause failed: resuming every pid\n");
-            ctl_all_par(pids, n, "nixl resume");
+            fprintf(stderr, "%s failed: resuming every pid\n", action);
+            snprintf(cmd, sizeof(cmd), "%.*s resume", kind, action);
+            ctl_all_par(pids, n, cmd);
         }
         free(pids);
         return failures;
