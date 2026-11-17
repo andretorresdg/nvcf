@@ -343,6 +343,10 @@ func (r *Reconciler) doModelCacheSharedFS(ctx context.Context,
 		}
 		roPV, err := r.newSharedFSReaderPV(ctx, stCopy, icmsReq, writerPV, roPVCName)
 		if err != nil {
+			if k8sutil.IsTransientK8sError(err) {
+				log.V(1).Info("Transient error building the shared-FS reader PV, will retry", "pvc", roPVCName)
+				return reconcile.Result{Requeue: true}, nil
+			}
 			return reconcile.Result{}, err
 		}
 		if err := r.Client.Create(ctx, roPV); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -769,6 +773,31 @@ func ConfiguredReaderMountOptions(driver string, configured []string) []string {
 	return nil
 }
 
+// nvmeshOnlyMountOptions are the XFS options in the NVMesh default
+// (ro,norecovery,nouuid) that NFS and other filesystems reject.
+var nvmeshOnlyMountOptions = []string{"norecovery", "nouuid"}
+
+// LegacyReaderMountOptions returns the configured cache mount options for a
+// reader with no durable selection on the agent's regular-workflow path, which
+// has no per-driver ConfigMap to fall back to. The configured list is still the
+// documented override for those readers (for example ro,sec=krb5p on an NFS
+// driver), so on a non-NVMesh driver it is kept except for the NVMesh-only
+// options, which are returned in dropped. NVMesh and an unknown driver keep the
+// list unchanged.
+func LegacyReaderMountOptions(driver string, configured []string) (kept, dropped []string) {
+	if driver == "" || driver == NVMeshStorageClassProvisioner {
+		return configured, nil
+	}
+	for _, opt := range configured {
+		if slices.Contains(nvmeshOnlyMountOptions, strings.TrimSpace(opt)) {
+			dropped = append(dropped, opt)
+			continue
+		}
+		kept = append(kept, opt)
+	}
+	return kept, dropped
+}
+
 // readerVolumeDriver returns the CSI driver of a read-only model cache PV. The
 // PV's own CSI source is authoritative; fallback, then the model cache storage
 // class provisioner, are used only when the PV does not name one. It returns an
@@ -838,14 +867,17 @@ func (r *Reconciler) resolveReaderMountOptions(ctx context.Context,
 	// reader options, and the catalog cannot supply them, so a non-NVMesh
 	// driver's entry in the mount option ConfigMap is still honored here. That
 	// entry is where an installation keeps options such as NFS sec= that its
-	// readers need.
-	if driver != "" && driver != NVMeshStorageClassProvisioner {
+	// readers need. A roxReadOnly selection already has the catalog's complete
+	// list, so the ConfigMap is not consulted for it. On a non-NVMesh driver
+	// extra is empty here, so the entry is the whole of it.
+	if selection.Transition == ModelCacheTransitionRWXReadOnly &&
+		driver != "" && driver != NVMeshStorageClassProvisioner {
 		entry, found, err := r.provisionerDefaultMountOptions(ctx, driver)
 		if err != nil {
 			return nil, err
 		}
 		if found {
-			extra = append(slices.Clone(entry), extra...)
+			extra = entry
 		}
 	}
 	return r.mergeRequiredMountOptions(ctx, pv, selection.RequiredMountOptions, extra), nil
@@ -1087,6 +1119,11 @@ func (r *Reconciler) doModelCacheNVMesh(ctx context.Context, //nolint:gocyclo
 		secondaryPV.Spec.AccessModes = accessModesRO
 		secondaryPV.Spec.MountOptions, err = r.resolveReaderMountOptions(ctx, stCopy, secondaryPV)
 		if err != nil {
+			if k8sutil.IsTransientK8sError(err) {
+				log.V(1).Info("Transient error resolving secondary PV mount options, will retry",
+					"pv", secondaryPV.Name)
+				return reconcile.Result{Requeue: true}, nil
+			}
 			return reconcile.Result{}, fmt.Errorf("resolve secondary PV mount options: %w", err)
 		}
 		secondaryPV.Spec.ClaimRef = &corev1.ObjectReference{

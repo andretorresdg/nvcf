@@ -852,6 +852,14 @@ func TestReaderMountOptions_ConfigMapReadError(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []string{"ro", "norecovery", "nouuid"}, got)
 	})
+	t.Run("durable rox fss reader does not read the ConfigMap", func(t *testing.T) {
+		roxFSS := storageRequestWithSelection(
+			readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionROXReadOnly, []string{"ro"}))
+		got, err := newReconciler(t).resolveReaderMountOptions(context.Background(), roxFSS,
+			newReaderPVOnDriver(fssProvisioner))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"ro"}, got)
+	})
 	t.Run("shared-fs reader PV is not built", func(t *testing.T) {
 		writerPV := newReaderPVOnDriver(fssProvisioner)
 		writerPV.Name = "writer-pv"
@@ -2479,6 +2487,21 @@ func TestResolveReaderMountOptions(t *testing.T) {
 			want:       []string{"sec=krb5p"},
 		},
 		{
+			// A roxReadOnly selection already carries the catalog's complete
+			// reader options, so a legacy ConfigMap entry for the driver must not
+			// be added on top (here a conflicting nfsvers).
+			name: "rox selection on another driver ignores its ConfigMap entry",
+			selection: readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionROXReadOnly,
+				[]string{"ro", "nfsvers=4.1"}),
+			pvDriver: fssProvisioner,
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "nfsvers=3",
+			},
+			configured: nvmeshOptions,
+			want:       []string{"ro", "nfsvers=4.1"},
+		},
+		{
 			name:       "fss reader on a PV without a CSI driver falls back to the selection's provisioner",
 			selection:  readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil),
 			cmData:     nvmeshMountOptionDefaults,
@@ -2727,3 +2750,29 @@ func TestReconcile_ModelCacheSharedFSWriterIdentity(t *testing.T) {
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+func TestLegacyReaderMountOptions(t *testing.T) {
+	const fss = "fss.csi.oraclecloud.com"
+	nvmesh := []string{"ro", "norecovery", "nouuid"}
+	tests := []struct {
+		name        string
+		driver      string
+		configured  []string
+		wantKept    []string
+		wantDropped []string
+	}{
+		{"nvmesh keeps every option", NVMeshStorageClassProvisioner, nvmesh, nvmesh, nil},
+		{"unknown driver keeps every option", "", nvmesh, nvmesh, nil},
+		{"another driver drops the nvmesh-only options", fss, nvmesh, []string{"ro"}, []string{"norecovery", "nouuid"}},
+		{"another driver keeps a compatible override", fss, []string{"ro", "sec=krb5p"},
+			[]string{"ro", "sec=krb5p"}, nil},
+		{"nothing configured", fss, nil, nil, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kept, dropped := LegacyReaderMountOptions(tt.driver, tt.configured)
+			assert.Equal(t, tt.wantKept, kept)
+			assert.Equal(t, tt.wantDropped, dropped)
+		})
+	}
+}

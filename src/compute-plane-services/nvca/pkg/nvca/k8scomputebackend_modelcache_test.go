@@ -457,9 +457,21 @@ func TestReaderMountOptionsForRequest(t *testing.T) {
 			want:       nvmeshOptions,
 		},
 		{
-			name:       "no selection on another driver drops the configured nvmesh options",
+			name:       "no selection on another driver drops the nvmesh-only options",
 			pvDriver:   fssProvisioner,
 			configured: nvmeshOptions,
+			want:       []string{"ro"},
+		},
+		{
+			name:       "no selection on another driver keeps a compatible override",
+			pvDriver:   fssProvisioner,
+			configured: []string{"ro", "sec=krb5p"},
+			want:       []string{"ro", "sec=krb5p"},
+		},
+		{
+			name:       "no selection on another driver with only nvmesh-only options gets none",
+			pvDriver:   fssProvisioner,
+			configured: []string{"norecovery", "nouuid"},
 			want:       nil,
 		},
 		{
