@@ -3622,11 +3622,23 @@ GATED_M(cuLaunchHostFunc, (CUstream st, CUhostFn fn, void *u), (st, fn, u))
 
 static void *wrapper_for(const char *name, void *real);
 
+/* A process that uses the GPU but allocates nothing itself (vLLM's engine
+ * core at TP > 1: its workers own the GPU memory) still needs a control
+ * socket for "nixl", which runs in its Python. Every CUDA user looks up
+ * driver entry points first. */
+static void ctl_on_cuda_use(void)
+{
+    static pid_t tried;  /* once per process: a failure is logged once */
+    pid_t me = getpid();
+    if (__atomic_exchange_n(&tried, me, __ATOMIC_RELAXED) != me) start_ctl();
+}
+
 static CUresult w_gpa2(const char *sym, void **pfn, int ver, cuuint64_t flags,
                        CUdriverProcAddressQueryResult *st)
 {
     CUresult r = REAL(r_gpa2, "cuGetProcAddress_v2")(sym, pfn, ver, flags, st);
     if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn);
+    ctl_on_cuda_use();
     return r;
 }
 
@@ -3634,6 +3646,7 @@ static CUresult w_gpa1(const char *sym, void **pfn, int ver, cuuint64_t flags)
 {
     CUresult r = REAL(r_gpa1, "cuGetProcAddress")(sym, pfn, ver, flags);
     if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn);
+    ctl_on_cuda_use();
     return r;
 }
 

@@ -40,7 +40,9 @@ tests for amd64 and arm64 with warnings as errors.
 ## How it works
 
 Each process that loads the shim runs a control thread on the abstract socket
-`@nvsnap-gpushare.<pid>`. `nvsnap-gpu-suspend` sends it these commands
+`@nvsnap-gpushare.<pid>`, from its first use of CUDA (its first driver
+entry-point lookup), even if it never allocates GPU memory itself, as vLLM's
+engine core at TP > 1 does not. `nvsnap-gpu-suspend` sends it these commands
 (`gpushare.h`):
 
 | Command | Who | What it does |
