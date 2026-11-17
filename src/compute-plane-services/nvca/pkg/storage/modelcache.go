@@ -582,11 +582,20 @@ var accessModesRO = []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}
 //
 // The ConfigMap is read on each call so that an operator editing it takes effect
 // without restarting the agent.
-func (r *Reconciler) provisionerDefaultMountOptions(ctx context.Context, provisioner string) ([]string, bool) {
+//
+// A read error other than NotFound is returned, unless the provisioner has
+// built-in defaults to fall back to. Treating it as "no entry" would give the
+// reader PV an incomplete set of options (for example without an NFS sec=), and
+// a shared-filesystem reader PV is never patched once its claim exists, so the
+// incomplete set would outlive the error. Returning it makes the reconcile retry
+// before the PV is written.
+func (r *Reconciler) provisionerDefaultMountOptions(
+	ctx context.Context, provisioner string,
+) ([]string, bool, error) {
 	log := logf.FromContext(ctx)
 
 	if provisioner == "" {
-		return nil, false
+		return nil, false, nil
 	}
 
 	cmName := r.cacheMountOptionsConfigMap
@@ -605,19 +614,23 @@ func (r *Reconciler) provisionerDefaultMountOptions(ctx context.Context, provisi
 			log.Info("Cache mount option defaults unreadable, falling back to the built-in defaults",
 				"configmap", cmName, "namespace", ModelCacheInitNamespace,
 				"provisioner", provisioner, "reason", err.Error())
-			return defaults, true
+			return defaults, true, nil
 		}
-		log.V(1).Info("Could not read the cache mount option defaults, using configured mount options",
+		if !apierrors.IsNotFound(err) {
+			return nil, false, fmt.Errorf("read cache mount option defaults %s/%s: %w",
+				ModelCacheInitNamespace, cmName, err)
+		}
+		log.V(1).Info("Cache mount option defaults not found, using configured mount options",
 			"configmap", cmName, "namespace", ModelCacheInitNamespace, "reason", err.Error())
-		return nil, false
+		return nil, false, nil
 	}
 
 	raw, found := cm.Data[provisioner]
 	if !found {
-		return nil, false
+		return nil, false, nil
 	}
 
-	return splitMountOptions(raw), true
+	return splitMountOptions(raw), true, nil
 }
 
 // splitMountOptions parses a comma separated mount option list, dropping empty
@@ -792,14 +805,17 @@ func (r *Reconciler) configuredMountOptionsFor(
 // volume always receives it, with configured options appended (NVMesh only)
 // except where they would negate a default. Otherwise the configured options
 // are used, again only on NVMesh or when the driver is unknown.
-func (r *Reconciler) resolveCacheMountOptions(ctx context.Context, pv *corev1.PersistentVolume) []string {
+func (r *Reconciler) resolveCacheMountOptions(ctx context.Context, pv *corev1.PersistentVolume) ([]string, error) {
 	driver := r.readerVolumeDriver(ctx, pv, "")
 	configured := r.configuredMountOptionsFor(ctx, pv, driver)
-	defaults, found := r.provisionerDefaultMountOptions(ctx, driver)
-	if !found {
-		return configured
+	defaults, found, err := r.provisionerDefaultMountOptions(ctx, driver)
+	if err != nil {
+		return nil, err
 	}
-	return r.mergeRequiredMountOptions(ctx, pv, defaults, configured)
+	if !found {
+		return configured, nil
+	}
+	return r.mergeRequiredMountOptions(ctx, pv, defaults, configured), nil
 }
 
 // resolveReaderMountOptions returns the mount options for the read-only PV that
@@ -811,7 +827,7 @@ func (r *Reconciler) resolveCacheMountOptions(ctx context.Context, pv *corev1.Pe
 // including in-flight legacy requests, keep the per-provisioner ConfigMap path.
 func (r *Reconciler) resolveReaderMountOptions(ctx context.Context,
 	st *nvcav1new.StorageRequest, pv *corev1.PersistentVolume,
-) []string {
+) ([]string, error) {
 	selection, ok := durableReaderSelection(ctx, st)
 	if !ok {
 		return r.resolveCacheMountOptions(ctx, pv)
@@ -824,11 +840,15 @@ func (r *Reconciler) resolveReaderMountOptions(ctx context.Context,
 	// entry is where an installation keeps options such as NFS sec= that its
 	// readers need.
 	if driver != "" && driver != NVMeshStorageClassProvisioner {
-		if entry, found := r.provisionerDefaultMountOptions(ctx, driver); found {
+		entry, found, err := r.provisionerDefaultMountOptions(ctx, driver)
+		if err != nil {
+			return nil, err
+		}
+		if found {
 			extra = append(slices.Clone(entry), extra...)
 		}
 	}
-	return r.mergeRequiredMountOptions(ctx, pv, selection.RequiredMountOptions, extra)
+	return r.mergeRequiredMountOptions(ctx, pv, selection.RequiredMountOptions, extra), nil
 }
 
 // durableReaderSelection returns the StorageRequest's persisted selection when
@@ -917,7 +937,10 @@ func (r *Reconciler) reconcileSecondaryPVMountOptions(ctx context.Context,
 ) error {
 	log := logf.FromContext(ctx)
 
-	want := r.resolveReaderMountOptions(ctx, st, secondaryPV)
+	want, err := r.resolveReaderMountOptions(ctx, st, secondaryPV)
+	if err != nil {
+		return fmt.Errorf("resolve secondary PV mount options: %w", err)
+	}
 	if slices.Equal(secondaryPV.Spec.MountOptions, want) {
 		return nil
 	}
@@ -1062,7 +1085,10 @@ func (r *Reconciler) doModelCacheNVMesh(ctx context.Context, //nolint:gocyclo
 		}
 		maps.Copy(secondaryPV.Labels, getClusterWideResourceLabels(stCopy))
 		secondaryPV.Spec.AccessModes = accessModesRO
-		secondaryPV.Spec.MountOptions = r.resolveReaderMountOptions(ctx, stCopy, secondaryPV)
+		secondaryPV.Spec.MountOptions, err = r.resolveReaderMountOptions(ctx, stCopy, secondaryPV)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("resolve secondary PV mount options: %w", err)
+		}
 		secondaryPV.Spec.ClaimRef = &corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "PersistentVolumeClaim",
@@ -2033,7 +2059,11 @@ func (r *Reconciler) newSharedFSReaderPV(
 	// reader attaches the same XFS filesystem as the writer and needs nouuid
 	// and norecovery or the mount fails outright. deriveReaderVolumeHandle
 	// above already handles the NVMesh driver reaching this path.
-	roPV.Spec.MountOptions = r.resolveReaderMountOptions(ctx, stCopy, roPV)
+	mountOptions, err := r.resolveReaderMountOptions(ctx, stCopy, roPV)
+	if err != nil {
+		return nil, fmt.Errorf("resolve reader PV mount options: %w", err)
+	}
+	roPV.Spec.MountOptions = mountOptions
 	roPV.Status = corev1.PersistentVolumeStatus{}
 	if err := r.setControlledObjectMeta(ctx, stCopy, roPV); err != nil {
 		return nil, err

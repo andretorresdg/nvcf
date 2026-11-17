@@ -46,6 +46,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -763,7 +764,9 @@ func TestResolveCacheMountOptions(t *testing.T) {
 			r := newMountOptionsReconciler(t, c, tt.configured)
 			pv := newReaderPVOnDriver(tt.pvDriver)
 
-			if got := r.resolveCacheMountOptions(context.Background(), pv); !slices.Equal(got, tt.want) {
+			got, err := r.resolveCacheMountOptions(context.Background(), pv)
+			require.NoError(t, err)
+			if !slices.Equal(got, tt.want) {
 				t.Errorf("resolveCacheMountOptions() = %v, want %v", got, tt.want)
 			}
 		})
@@ -782,8 +785,8 @@ func TestResolveCacheMountOptions_ConfigMapEditTakesEffect(t *testing.T) {
 	pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "secondary-pv-test"}}
 
 	want := []string{"ro", "norecovery", "nouuid"}
-	if got := r.resolveCacheMountOptions(ctx, pv); !slices.Equal(got, want) {
-		t.Fatalf("before edit = %v, want %v", got, want)
+	if got, err := r.resolveCacheMountOptions(ctx, pv); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("before edit = %v, %v, want %v", got, err, want)
 	}
 
 	cm := &corev1.ConfigMap{}
@@ -797,9 +800,66 @@ func TestResolveCacheMountOptions_ConfigMapEditTakesEffect(t *testing.T) {
 	}
 
 	want = []string{"ro", "norecovery", "nouuid", "noatime"}
-	if got := r.resolveCacheMountOptions(ctx, pv); !slices.Equal(got, want) {
-		t.Errorf("after edit = %v, want %v (edit did not take effect without a restart)", got, want)
+	if got, err := r.resolveCacheMountOptions(ctx, pv); err != nil || !slices.Equal(got, want) {
+		t.Errorf("after edit = %v, %v, want %v (edit did not take effect without a restart)", got, err, want)
 	}
+}
+
+// A ConfigMap read that fails for any reason other than NotFound must not be
+// read as "no entry": the reader PV would be written without the driver's
+// options (such as NFS sec=), and a shared-filesystem reader PV is not patched
+// afterwards. The error is returned so the reconcile retries, except for a
+// driver with built-in defaults, which still falls back to them.
+func TestReaderMountOptions_ConfigMapReadError(t *testing.T) {
+	readErr := apierrors.NewServiceUnavailable("etcd timeout")
+	newReconciler := func(t *testing.T) *Reconciler {
+		t.Helper()
+		c := fake.NewClientBuilder().
+			WithScheme(mgrScheme).
+			WithObjects(newMountOptionDefaultsObjects(NVMeshStorageClassProvisioner, map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "sec=krb5p",
+			})...).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object,
+					opts ...client.GetOption,
+				) error {
+					if _, ok := obj.(*corev1.ConfigMap); ok {
+						return readErr
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}).
+			Build()
+		return newMountOptionsReconciler(t, c, []string{"ro", "norecovery", "nouuid"})
+	}
+	durableFSS := storageRequestWithSelection(
+		readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil))
+
+	t.Run("durable fss reader returns the error", func(t *testing.T) {
+		_, err := newReconciler(t).resolveReaderMountOptions(context.Background(), durableFSS,
+			newReaderPVOnDriver(fssProvisioner))
+		require.ErrorIs(t, err, readErr)
+	})
+	t.Run("legacy fss reader returns the error", func(t *testing.T) {
+		_, err := newReconciler(t).resolveCacheMountOptions(context.Background(),
+			newReaderPVOnDriver(fssProvisioner))
+		require.ErrorIs(t, err, readErr)
+	})
+	t.Run("nvmesh reader falls back to the built-in defaults", func(t *testing.T) {
+		got, err := newReconciler(t).resolveCacheMountOptions(context.Background(),
+			newReaderPVOnDriver(NVMeshStorageClassProvisioner))
+		require.NoError(t, err)
+		assert.Equal(t, []string{"ro", "norecovery", "nouuid"}, got)
+	})
+	t.Run("shared-fs reader PV is not built", func(t *testing.T) {
+		writerPV := newReaderPVOnDriver(fssProvisioner)
+		writerPV.Name = "writer-pv"
+		roPV, err := newReconciler(t).newSharedFSReaderPV(context.Background(), durableFSS,
+			&nvcav2beta1.ICMSRequest{}, writerPV, "ro-pvc")
+		require.ErrorIs(t, err, readErr)
+		assert.Nil(t, roPV)
+	})
 }
 
 // TestModelCacheStorageClassResolvedOnce covers the storage class NewReconciler
@@ -2492,7 +2552,8 @@ func TestResolveReaderMountOptions(t *testing.T) {
 			r := newMountOptionsReconciler(t, c, tt.configured)
 			pv := newReaderPVOnDriver(tt.pvDriver)
 
-			got := r.resolveReaderMountOptions(context.Background(), storageRequestWithSelection(tt.selection), pv)
+			got, err := r.resolveReaderMountOptions(context.Background(), storageRequestWithSelection(tt.selection), pv)
+			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
