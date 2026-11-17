@@ -3838,12 +3838,17 @@ static void *wrapper_for(const char *name, void *real);
 /* A process that uses the GPU but allocates nothing itself (vLLM's engine
  * core at TP > 1: its workers own the GPU memory) still needs a control
  * socket for "nixl", which runs in its Python. Every CUDA user looks up
- * driver entry points first. */
+ * driver entry points first. Only with NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1
+ * (set for workloads opted in to nixl): with a socket, such a process takes
+ * part in every suspend (hold, quiesce, release, load), where it is
+ * otherwise skipped. */
 static void ctl_on_cuda_use(void)
 {
     static pid_t tried;  /* once per process: a failure is logged once */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVSNAP_GPUSHARE_CTL_ON_CUDA_USE"); on = e && *e == '1'; }
     pid_t me = getpid();
-    if (__atomic_exchange_n(&tried, me, __ATOMIC_RELAXED) != me) start_ctl();
+    if (on && __atomic_exchange_n(&tried, me, __ATOMIC_RELAXED) != me) start_ctl();
 }
 
 static CUresult w_gpa2(const char *sym, void **pfn, int ver, cuuint64_t flags,

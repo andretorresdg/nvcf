@@ -40,9 +40,11 @@ tests for amd64 and arm64 with warnings as errors.
 ## How it works
 
 Each process that loads the shim runs a control thread on the abstract socket
-`@nvsnap-gpushare.<pid>`, from its first use of CUDA (its first driver
-entry-point lookup), even if it never allocates GPU memory itself, as vLLM's
-engine core at TP > 1 does not. `nvsnap-gpu-suspend` sends it these commands
+`@nvsnap-gpushare.<pid>`, from its first export, import, IPC or host-memory
+call. With `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` it starts at the process's first
+use of CUDA (its first driver entry-point lookup) instead, even if the process
+never allocates GPU memory itself, as vLLM's engine core at TP > 1 does not;
+`nixl-pause` needs that (set it for the workloads that use it). `nvsnap-gpu-suspend` sends it these commands
 (`gpushare.h`):
 
 | Command | Who | What it does |
@@ -409,9 +411,14 @@ Limits of the move:
   prefilled there if the pause outlasted a third of prefill's hold on their
   KV (`kv_lease_duration`, 30 s by default), since prefill may have reused
   those blocks. `nixl-pause` fails, and resumes every pid, while any RDMA
-  device file is left; at TP > 1 NCCL opens the RDMA devices even within a
-  node, so such a pod needs `NCCL_IB_DISABLE=1` (TP within one node) for its
-  capture to go through. A process holding both ModelExpress and NIXL KV
+  device file is left. At TP > 1 the engine-core process allocates no GPU
+  memory, so the pod needs `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` (see "How it
+  works"); without it the workers time out waiting for the engine and the
+  pause is refused. At TP > 1 in a pod with RDMA NICs, NCCL opens
+  the RDMA devices even when every rank is on one node, and keeps them open
+  until the process exits (destroying all its communicators does not close
+  them), so `nixl-pause` refuses such a pod until gpushare handles RDMA
+  devices itself. A process holding both ModelExpress and NIXL KV
   RDMA state is not handled yet: whichever pause runs first fails its RDMA
   check, since the other still holds RDMA devices.
 

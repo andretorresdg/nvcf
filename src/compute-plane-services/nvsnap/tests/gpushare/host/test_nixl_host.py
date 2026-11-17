@@ -279,5 +279,52 @@ class NixlPauseResume(unittest.TestCase):
         self.assertIn("not paused", self.ok("nixl-resume"), "the worker died")
 
 
+# Looks up one driver entry point and allocates nothing, like vLLM's engine
+# core at TP > 1, then waits.
+LOOKUP = r"""
+import ctypes, time
+lib = ctypes.CDLL("libcuda.so.1")
+p = ctypes.c_void_p()
+r = lib.cuGetProcAddress_v2(b"cuInit", ctypes.byref(p), 12000, ctypes.c_ulonglong(0), None)
+print("ready" if r == 0 else "lookup failed: %d" % r, flush=True)
+while True:
+    time.sleep(0.1)
+"""
+
+
+class ControlSocketOnCudaUse(unittest.TestCase):
+    """The control socket starts on the first entry-point lookup only with
+    NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1; otherwise nothing changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        NixlPauseResume.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def has_socket(self, **extra):
+        env = dict(self.env, LD_PRELOAD=os.path.join(self.tmp, "libnvsnap_gpushare.so"))
+        env.pop("NVSNAP_GPUSHARE_CTL_ON_CUDA_USE", None)
+        env.update(extra)
+        p = subprocess.Popen([sys.executable, "-I", "-c", LOOKUP], env=env, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        line = p.stdout.readline().strip()
+        if line != "ready":
+            self.fail("process did not start: %r" % line)
+        time.sleep(0.3)
+        with open("/proc/net/unix") as f:
+            return "@nvsnap-gpushare.%d" % p.pid in f.read()
+
+    def test_off_by_default(self):
+        self.assertFalse(self.has_socket())
+
+    def test_on_with_env(self):
+        self.assertTrue(self.has_socket(NVSNAP_GPUSHARE_CTL_ON_CUDA_USE="1"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
