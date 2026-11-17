@@ -45,6 +45,15 @@ SPDX-License-Identifier: Apache-2.0
  *                 restore into another pod, pass --host with that pod's IP:
  *                 the restored process still has the captured pod's address
  *                 and would publish it, unreachable from other pods.
+ *   nixl-pause    Before suspend (after mx-pause, if both): vLLM's NIXL KV
+ *                 connector (disaggregated prefill/decode) in each pid stops:
+ *                 the engine takes no new requests, waits for KV transfers in
+ *                 flight, and drops its NIXL agent and RDMA state. Fails, as
+ *                 mx-pause does, while any RDMA device file is left (NCCL
+ *                 over RDMA, say); then every pid is resumed.
+ *   nixl-resume   After open: the connectors come back under a new engine id
+ *                 and the engine takes requests again. --host as for
+ *                 mx-resume: the address decode engines reach it at.
  *   gpus [FILE]   Print (or write to FILE) the UUIDs of the GPUs visible here.
  *
  * --hold-gate (resume after stop + CRIU restore): the pids run, but their
@@ -298,7 +307,7 @@ static int visible_gpus(CUuuid *out, int max)
  * library does not load or lacks an entry point.
  */
 static const char *libcuda_path = "libcuda.so.1";  /* --libcuda */
-static const char *mx_host;  /* --host (mx-resume) */
+static const char *mx_host;  /* --host (mx-resume, nixl-resume) */
 
 #define PROBE_BYTES (1 << 20)
 
@@ -1720,11 +1729,13 @@ static void usage(const char *prog)
         "         open         (after resume --hold-gate: let the pids' GPU launches through)\n"
         "         mx-pause     (before suspend: ModelExpress drops its NIXL/RDMA state)\n"
         "         mx-resume    (after open: ModelExpress registers and republishes again)\n"
+        "         nixl-pause   (before suspend: vLLM's NIXL KV connector drops its RDMA state)\n"
+        "         nixl-resume  (after open: the connector comes back under a new engine id)\n"
         "         gpus [FILE]  (print or write the visible GPU UUIDs, for --gpu-map)\n"
         "         probe        (is the one visible GPU usable? prints ok or the failing\n"
         "                       step and CUDA error; exit 0, 2 on a failure, 1 if it cannot ask)\n"
         "--libcuda PATH: (probe) the driver library to load (default libcuda.so.1)\n"
-        "--host H: (mx-resume) the address peers pull the weights from (the new pod's IP)\n"
+        "--host H: (mx-resume, nixl-resume) the address peers reach this pod at (its IP)\n"
         "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever)\n"
         "--gpu-map FILE: restore GPUs listed in FILE onto the GPUs visible here\n"
         "--store S --ckpt-dir C: (suspend) libnvsnap_gpushare processes save GPU memory\n"
@@ -1839,6 +1850,25 @@ int main(int argc, char **argv)
         snprintf(cmd, sizeof(cmd), "mx %s%s%s", action[3] == 'p' ? "pause" : "resume",
                  mx_host ? " " : "", mx_host ? mx_host : "");
         failures = ctl_all_par(pids, n, cmd) < 0;
+        free(pids);
+        return failures;
+    }
+    if (strcmp(action, "nixl-pause") == 0 || strcmp(action, "nixl-resume") == 0) {
+        char cmd[300];
+        int pause = action[5] == 'p';
+        if (mx_host && pause) {
+            fprintf(stderr, "--host goes with nixl-resume\n");
+            free(pids);
+            return 1;
+        }
+        snprintf(cmd, sizeof(cmd), "nixl %s%s%s", pause ? "pause" : "resume",
+                 mx_host ? " " : "", mx_host ? mx_host : "");
+        failures = ctl_all_par(pids, n, cmd) < 0;
+        /* A pid that paused would serve no KV until resumed. */
+        if (failures && pause) {
+            fprintf(stderr, "nixl-pause failed: resuming every pid\n");
+            ctl_all_par(pids, n, "nixl resume");
+        }
         free(pids);
         return failures;
     }

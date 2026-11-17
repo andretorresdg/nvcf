@@ -2157,13 +2157,14 @@ static void rdma_files(int *open, int *mapped)
     if (f) fclose(f);
 }
 
-static void do_mx(char *reply, size_t n, const char *op)
+/* Run fn(op, fd, host) from src in this process's Python ("mx", "nixl"). */
+static void do_py(char *reply, size_t n, const char *src, size_t srclen, const char *fn, const char *op)
 {
     int (*is_init)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "Py_IsInitialized");
     int (*ensure)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "PyGILState_Ensure");
     void (*release)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "PyGILState_Release");
     int (*run)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "PyRun_SimpleString");
-    char out[168] = "err no result", code[sizeof(mx_py) + 400];
+    char out[320] = "err no result";
     const char *host = !strncmp(op, "resume ", 7) ? op + 7 : "";
     int p[2], fds, maps;
     /* HOST goes into Python source: an IP address or DNS name only (a
@@ -2176,17 +2177,21 @@ static void do_mx(char *reply, size_t n, const char *op)
     if (!is_init || !ensure || !release || !run || !is_init()) {
         snprintf(out, sizeof(out), "ok no Python");
     } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
-        snprintf(reply, n, "err launches are held: mx pause goes before quiesce, mx resume after open");
+        snprintf(reply, n, "err launches are held: %s pause goes before quiesce, %s resume after open", fn, fn);
         return;
     } else if (pipe2(p, O_CLOEXEC) != 0) {
         snprintf(reply, n, "err pipe: %s", strerror(errno));
         return;
     } else {
-        snprintf(code, sizeof(code), "%s_nvsnap_mx('%s', %d, '%s')\ndel _nvsnap_mx\n", mx_py,
-                 *op == 'p' ? "pause" : "resume", p[1], host);
+        size_t len = srclen + 400;
+        char *code = malloc(len);
+        if (!code) { close(p[0]); close(p[1]); snprintf(reply, n, "err out of memory"); return; }
+        snprintf(code, len, "%s_nvsnap_%s('%s', %d, '%s')\ndel _nvsnap_%s\n", src, fn,
+                 *op == 'p' ? "pause" : "resume", p[1], host, fn);
         int g = ensure();
         int r = run(code);
         release(g);
+        free(code);
         close(p[1]);
         ssize_t k = read(p[0], out, sizeof(out) - 1);
         close(p[0]);
@@ -2194,14 +2199,221 @@ static void do_mx(char *reply, size_t n, const char *op)
         else if (r) snprintf(out, sizeof(out), "err Python raised (see stderr)");
     }
     rdma_files(&fds, &maps);
-    /* RDMA left after a pause (NCCL or NIXL outside ModelExpress, say)
-     * fails the dump: fail the pause instead. */
+    /* RDMA left after a pause (NCCL, say) fails the dump: fail the pause
+     * instead. */
     if (*op == 'p' && (fds || maps) && !strncmp(out, "ok ", 3))
         snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped (%s): CRIU cannot dump them",
                  fds, maps, out + 3);
     else
         snprintf(reply, n, "%s; %d RDMA device file(s) open, %d mapped", out, fds, maps);
 }
+
+/* ── NIXL KV transfer (vLLM disaggregated prefill/decode) ────────────── */
+
+/* vLLM's NixlConnector (pull mode) moves KV between prefill and decode
+ * engines over NIXL/UCX, and over RDMA holds what CRIU cannot dump. vLLM
+ * creates its NIXL agent once and has no call to drop it, so "nixl pause"
+ * does it from outside, through vLLM's own functions: in the engine-core
+ * process it stops taking new requests, waits (up to 60 s) until no KV
+ * transfer is in flight, stops the handshake listener and shuts down the
+ * connector on every TP worker (which frees the NIXL agent and its memory
+ * registrations); in a TP worker process it waits until the engine has
+ * done so. If that fails, the engine resumes. "nixl resume [HOST]"
+ * creates the connectors again on the same KV memory under a new engine
+ * id, so peers handshake with it afresh instead of using the queue pairs
+ * and keys they cached, restarts the listener (on HOST, the pod's new IP,
+ * when given) and takes requests again. Requests that reached a paused
+ * decode engine are prefilled locally if the pause outlasted a third of
+ * prefill's hold on their KV (kv_lease_duration): the prefill side may have
+ * reused those blocks. Only the pull connector with KV in GPU memory is
+ * handled. Not while launches are held, as for "mx". */
+static const char nixl_py[] =
+    "def _nvsnap_nixl(op, fd, host):\n"
+    "    import os, queue, sys, threading, time, uuid\n"
+    "\n"
+    "    def conn():\n"
+    "        st = sys.modules.get('vllm.distributed.kv_transfer.kv_transfer_state')\n"
+    "        if st is None or not st.has_kv_transfer_group():\n"
+    "            return None\n"
+    "        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import connector as m\n"
+    "        c = st.get_kv_transfer_group()\n"
+    "        if not isinstance(c, m.NixlBaseConnector):\n"
+    "            return None\n"
+    "        if not isinstance(c, m.NixlPullConnector):\n"
+    "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(c).__name__)\n"
+    "        return c\n"
+    "\n"
+    "    def w_busy(_w):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        w = get_kv_transfer_group().connector_worker\n"
+    "        return 0 if w is None else (len(w._recving_transfers) + len(w._reqs_to_send)\n"
+    "                                    + len(w._handshake_futures))\n"
+    "\n"
+    "    def w_release(_w):\n"
+    "        import gc\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        c = get_kv_transfer_group()\n"
+    "        w = c.connector_worker\n"
+    "        if w is None:\n"
+    "            return 0\n"
+    "        if w.use_host_buffer:\n"
+    "            raise RuntimeError('KV in a host buffer is not handled')\n"
+    "        c._nvsnap_kv, c._nvsnap_cls = w.device_kv_caches, type(w)\n"
+    "        w._handshake_initiation_executor.shutdown(wait=True)\n"
+    "        w._finish_shutdown()\n"
+    "        c.connector_worker = None\n"
+    "        del w\n"
+    "        gc.collect()\n"
+    "        return 1\n"
+    "\n"
+    "    def w_resume(_w, engine_id):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        c = get_kv_transfer_group()\n"
+    "        if c.connector_worker is not None:\n"
+    "            return 0\n"
+    "        c.kv_transfer_config.engine_id = c.engine_id = engine_id\n"
+    "        w = c._nvsnap_cls(c._vllm_config, engine_id, c.kv_cache_config)\n"
+    "        w.register_kv_caches(c._nvsnap_kv)\n"
+    "        c.connector_worker = w\n"
+    "        del c._nvsnap_kv, c._nvsnap_cls\n"
+    "        return 1\n"
+    "\n"
+    "    def engine():\n"
+    "        core = sys.modules.get('vllm.v1.engine.core')\n"
+    "        f = sys._current_frames().get(threading.main_thread().ident)\n"
+    "        while core is not None and f is not None:\n"
+    "            if isinstance(f.f_locals.get('self'), core.EngineCoreProc):\n"
+    "                return f.f_locals['self']\n"
+    "            f = f.f_back\n"
+    "        return None\n"
+    "\n"
+    "    def on_main(e, fn, timeout):\n"
+    "        from vllm.v1.engine import EngineCoreRequestType\n"
+    "        deadline = time.monotonic() + timeout\n"
+    "        while True:\n"
+    "            box, cancelled = queue.Queue(), threading.Event()\n"
+    "\n"
+    "            def cb(_e=None):\n"
+    "                if not cancelled.is_set():\n"
+    "                    try:\n"
+    "                        box.put(fn(e))\n"
+    "                    except BaseException as x:\n"
+    "                        box.put((True, x))\n"
+    "            e._idle_state_callbacks.append(cb)\n"
+    "            e.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n"
+    "            try:\n"
+    "                done, res = box.get(timeout=max(0.1, deadline - time.monotonic()))\n"
+    "            except queue.Empty:\n"
+    "                cancelled.set()\n"
+    "                raise TimeoutError('the engine did not go idle in %d s' % timeout)\n"
+    "            if isinstance(res, BaseException):\n"
+    "                raise res\n"
+    "            if done:\n"
+    "                return res\n"
+    "            if time.monotonic() > deadline:\n"
+    "                raise TimeoutError('KV transfers still in flight after %d s: %r' % (timeout, res))\n"
+    "            time.sleep(0.2)\n"
+    "\n"
+    "    def stop_listener(s):\n"
+    "        t = s._nixl_handshake_listener_t\n"
+    "        if t is not None:\n"
+    "            s._stop_event.set()\n"
+    "            t.join()\n"
+    "            s._stop_event = threading.Event()\n"
+    "            s._nixl_handshake_listener_t = None\n"
+    "\n"
+    "    def e_resume(e):\n"
+    "        from vllm.v1.engine import EngineCoreRequestType\n"
+    "        from vllm.v1.request import RequestStatus\n"
+    "        st = e.__dict__.pop('_nvsnap_nixl', None)\n"
+    "        if st is None:\n"
+    "            return True, 'not paused'\n"
+    "        kc = e.scheduler.get_kv_connector()\n"
+    "        s = kc.connector_scheduler\n"
+    "        new_id = None\n"
+    "        if any(e.model_executor.collective_rpc(w_released)):\n"
+    "            new_id = str(uuid.uuid4())\n"
+    "            e.model_executor.collective_rpc(w_resume, args=(new_id,))\n"
+    "            e.vllm_config.kv_transfer_config.engine_id = kc.engine_id = s.engine_id = new_id\n"
+    "        if host:\n"
+    "            s.side_channel_host = os.environ['VLLM_NIXL_SIDE_CHANNEL_HOST'] = host\n"
+    "        stop_listener(s)\n"
+    "        meta = {}\n"
+    "        for d in e.model_executor.get_kv_connector_handshake_metadata():\n"
+    "            meta.update(d or {})\n"
+    "        kc.set_xfer_handshake_metadata_pp_aware(meta)\n"
+    "        n = 0\n"
+    "        if time.monotonic() - st['at'] > s._kv_lease_duration / 3:\n"
+    "            for r in list(e.scheduler.requests.values()):\n"
+    "                p = r.kv_transfer_params\n"
+    "                if r.status == RequestStatus.WAITING and p and p.get('do_remote_prefill'):\n"
+    "                    p['do_remote_prefill'] = False\n"
+    "                    n += 1\n"
+    "        e.scheduler.set_pause_state(st['prev'])\n"
+    "        e.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n"
+    "        return True, ('resumed as engine %s, side channel %s:%s, %d request(s) prefilled here'\n"
+    "                      % (new_id or kc.engine_id, s.side_channel_host, s.side_channel_port, n))\n"
+    "\n"
+    "    def w_released(_w):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        return get_kv_transfer_group().connector_worker is None\n"
+    "\n"
+    "    def run():\n"
+    "        e = engine()\n"
+    "        if e is None:\n"
+    "            c = conn()\n"
+    "            if c is None:\n"
+    "                return 'ok no NIXL KV connector'\n"
+    "            pause = op == 'pause'\n"
+    "            deadline = time.monotonic() + 90\n"
+    "            while (c.connector_worker is None) != pause:\n"
+    "                if time.monotonic() > deadline:\n"
+    "                    raise TimeoutError('the engine did not %s this worker\\'s NIXL connector'\n"
+    "                                       % ('release' if pause else 're-create'))\n"
+    "                time.sleep(0.2)\n"
+    "            return 'ok TP worker: NIXL connector %s' % ('released' if pause else 'up')\n"
+    "        kc = e.scheduler.get_kv_connector()\n"
+    "        m = sys.modules.get('vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector')\n"
+    "        if kc is None or m is None or not isinstance(kc, m.NixlBaseConnector):\n"
+    "            return 'ok no NIXL KV connector'\n"
+    "        if not isinstance(kc, m.NixlPullConnector):\n"
+    "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(kc).__name__)\n"
+    "        if op == 'resume':\n"
+    "            return 'ok ' + on_main(e, e_resume, 60)\n"
+    "        if '_nvsnap_nixl' in e.__dict__:\n"
+    "            return 'ok already paused'\n"
+    "        from vllm.v1.core.sched.interface import PauseState\n"
+    "        prev = e.scheduler.pause_state\n"
+    "        e._nvsnap_nixl = {'prev': prev, 'at': time.monotonic()}\n"
+    "        if prev == PauseState.UNPAUSED:\n"
+    "            e.scheduler.set_pause_state(PauseState.PAUSED_NEW)\n"
+    "\n"
+    "        def step(e):\n"
+    "            busy = e.model_executor.collective_rpc(w_busy)\n"
+    "            if any(busy):\n"
+    "                return False, busy\n"
+    "            stop_listener(e.scheduler.get_kv_connector().connector_scheduler)\n"
+    "            e._nvsnap_nixl['at'] = time.monotonic()\n"
+    "            e._nvsnap_nixl['released'] = True\n"
+    "            return True, sum(e.model_executor.collective_rpc(w_release))\n"
+    "        try:\n"
+    "            n = on_main(e, step, 60)\n"
+    "        except BaseException:\n"
+    "            try:\n"
+    "                on_main(e, e_resume, 30)\n"
+    "            except BaseException:\n"
+    "                st = e.__dict__.get('_nvsnap_nixl')\n"
+    "                if st and not st.get('released'):  # nothing released: just unpause\n"
+    "                    del e._nvsnap_nixl\n"
+    "                    e.scheduler.set_pause_state(st['prev'])\n"
+    "            raise\n"
+    "        return 'ok engine paused, NIXL connector released on %d worker(s)' % n\n"
+    "\n"
+    "    try:\n"
+    "        rep = run()\n"
+    "    except BaseException as x:\n"
+    "        rep = 'err %s: %s' % (type(x).__name__, x)\n"
+    "    os.write(fd, rep.encode()[:300])\n";
 
 /* A reply's longest form ("ok remapped ...", do_remap) fits: the tool
  * reads at most GPUSHARE_REPLY_MAX bytes of it (nvsnap-gpu-suspend.c). */
@@ -2226,7 +2438,8 @@ static void serve(int s)
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
-    else if (!strncmp(buf, "mx ", 3)) { do_mx(rep, sizeof(rep), buf + 3); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "nixl ", 5)) { do_py(rep, sizeof(rep), nixl_py, sizeof(nixl_py), "nixl", buf + 5); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "export ", 7)) do_export(strtoull(buf + 7, NULL, 10), 0, s);
     else if (!strncmp(buf, "exportfab ", 10)) do_export(strtoull(buf + 10, NULL, 10), 1, s);
     else if (!strcmp(buf, "whose") && fd >= 0) do_whose(fd, s);
