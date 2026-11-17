@@ -569,10 +569,10 @@ assert_yaml_value "$autoscaler_monitor_manifest" \
 assert_yaml_value "$autoscaler_monitor_manifest" \
   '.spec.endpoints[0].interval' 30s 'function autoscaler scrape interval'
 
-# The Target Allocator reads only the Secrets that monitors reference, and it
-# watches Secrets in its own namespace. The bundled monitors reference none, so
-# discovery RBAC grants Secrets through a Role in the release namespace, not
-# through the ClusterRole. A non-default namespace catches a hardcoded one.
+# The Target Allocator watches Secrets in its own namespace by default. The
+# bundled monitors reference none, so discovery RBAC grants Secrets through a
+# Role in the release namespace, not through the ClusterRole. A non-default
+# namespace catches a hardcoded one.
 collector_chart="$stack_dir/charts/nvcf-otel-collector"
 collector_namespace=telemetry
 collector_manifests="$work_dir/collector-manifests.yaml"

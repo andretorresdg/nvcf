@@ -137,29 +137,12 @@ The worker and DCGM PodMonitors set the `job` label to `nvcf-worker` and
 selects series by these names, so keep them aligned with the collector
 templates.
 
-The Target Allocator reads only the Secrets that monitors reference. By
-default, it watches Secrets in the collector namespace. The default monitors
-reference none, so discovery RBAC grants Secrets through a Role in the
-collector namespace only.
-
-A monitor in another namespace can reference a Secret, for example in
-`basicAuth` or `tlsConfig`. That namespace then needs both of these:
-
-- A Role and RoleBinding that grant the `<collectorName>-targetallocator`
-  service account `get`, `list`, and `watch` on Secrets. The default service
-  account is `nvcf-observability-targetallocator`.
-- An entry in `collector.targetAllocator.prometheusCR.secretNamespaces`, so
-  the Target Allocator picks up Secret updates. This list replaces the
-  default, so also list the collector namespace.
-
-```yaml
-collector:
-  targetAllocator:
-    prometheusCR:
-      secretNamespaces:
-        - monitoring
-        - my-app
-```
+The default monitors reference no Secrets, so discovery RBAC grants the
+Target Allocator Secret access through a Role in the collector namespace only.
+This chart does not configure Target Allocator mTLS. Without it, the Target
+Allocator does not pass Secret values to the collector. Monitors that
+authenticate with a Secret, for example `basicAuth` or a `tlsConfig` client
+certificate, are not supported by this chart.
 
 The default observability namespace is `monitoring`. A different namespace
 also requires NetworkPolicy reachability to the collector.

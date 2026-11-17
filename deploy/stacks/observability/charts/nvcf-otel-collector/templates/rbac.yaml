@@ -110,10 +110,8 @@ subjects:
     name: {{ .Values.collectorName }}-targetallocator
     namespace: {{ .Release.Namespace }}
 {{- /*
-The Target Allocator reads only the Secrets that monitors reference, and it
-watches Secrets in its own namespace. The bundled monitors reference none, so
-a Role in the release namespace is enough. A monitor in another namespace that
-references a Secret needs its own Role and RoleBinding for this service account.
+The Target Allocator watches Secrets in its own namespace by default. The
+bundled monitors reference none, so a Role in the release namespace is enough.
 */}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
