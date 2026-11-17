@@ -137,6 +137,14 @@ The worker and DCGM PodMonitors set the `job` label to `nvcf-worker` and
 selects series by these names, so keep them aligned with the collector
 templates.
 
+The Target Allocator reads only the Secrets that monitors reference, and it
+watches Secrets in its own namespace. The default monitors reference none, so
+discovery RBAC grants Secrets through a Role in the collector namespace only.
+A monitor in another namespace that references a Secret, for example in
+`basicAuth` or `tlsConfig`, needs a Role and RoleBinding for the
+`<collectorName>-targetallocator` service account in that namespace. The
+default service account is `nvcf-observability-targetallocator`.
+
 The default observability namespace is `monitoring`. A different namespace
 also requires NetworkPolicy reachability to the collector.
 
