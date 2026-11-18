@@ -2161,8 +2161,13 @@ static void rdma_files(int *open, int *mapped)
     if (f) fclose(f);
 }
 
-/* Run fn(op, fd, host) from src in this process's Python ("mx", "nixl"). */
-static void do_py(char *reply, size_t n, const char *src, size_t srclen, const char *fn, const char *op)
+static unsigned ucx_ver[3];
+static int ucx_loaded(void);
+
+/* Run fn(op, fd, host EXTRA) from src in this process's Python ("mx",
+ * "nixl"); EXTRA is more arguments, from this file only. */
+static void do_py(char *reply, size_t n, const char *src, size_t srclen, const char *fn, const char *op,
+                  const char *extra)
 {
     int (*is_init)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "Py_IsInitialized");
     int (*ensure)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "PyGILState_Ensure");
@@ -2190,8 +2195,8 @@ static void do_py(char *reply, size_t n, const char *src, size_t srclen, const c
         size_t len = srclen + 400;
         char *code = malloc(len);
         if (!code) { close(p[0]); close(p[1]); snprintf(reply, n, "err out of memory"); return; }
-        snprintf(code, len, "%s_nvsnap_%s('%s', %d, '%s')\ndel _nvsnap_%s\n", src, fn,
-                 *op == 'p' ? "pause" : "resume", p[1], host, fn);
+        snprintf(code, len, "%s_nvsnap_%s('%s', %d, '%s'%s)\ndel _nvsnap_%s\n", src, fn,
+                 *op == 'p' ? "pause" : "resume", p[1], host, extra, fn);
         int g = ensure();
         int r = run(code);
         release(g);
@@ -2233,7 +2238,7 @@ static void do_py(char *reply, size_t n, const char *src, size_t srclen, const c
  * reused those blocks. Only the pull connector with KV in GPU memory is
  * handled. Not while launches are held, as for "mx". */
 static const char nixl_py[] =
-    "def _nvsnap_nixl(op, fd, host):\n"
+    "def _nvsnap_nixl(op, fd, host, ucx):\n"
     "    import os, queue, sys, threading, time, uuid\n"
     "\n"
     "    def conn():\n"
@@ -2385,12 +2390,21 @@ static const char nixl_py[] =
     "        return True, ('resumed as engine %s, side channel %s:%s, %d request(s) prefilled here'\n"
     "                      % (new_id or kc.engine_id, s.side_channel_host, s.side_channel_port, n))\n"
     "\n"
+    "    # Restored into another pod, only UCX 1.22 reads its routes again (see\n"
+    "    # ucs_netlink_route_exists in gpushare.c): refuse the pause for another.\n"
+    "    def ucx_ok():\n"
+    "        if op == 'pause' and ucx and not ucx.startswith('1.22.'):\n"
+    "            raise RuntimeError('UCX %s is not 1.22: restored into another pod, it would keep the old '\n"
+    "                               'pod\\'s routes, and NIXL would reach no peer' % ucx)\n"
+    "        return ', UCX ' + ucx if op == 'pause' and ucx else ''\n"
+    "\n"
     "    def run():\n"
     "        e = engine()\n"
     "        if e is None:\n"
     "            c = conn()\n"
     "            if c is None:\n"
     "                return 'ok no NIXL KV connector'\n"
+    "            v = ucx_ok()\n"
     "            pause = op == 'pause'\n"
     "            deadline = time.monotonic() + 90\n"
     "            while (getattr(c, '_nvsnap_state', None) == 'released') != pause:\n"
@@ -2398,13 +2412,14 @@ static const char nixl_py[] =
     "                    raise TimeoutError('the engine did not %s this worker\\'s NIXL connector'\n"
     "                                       % ('release' if pause else 're-create'))\n"
     "                time.sleep(0.2)\n"
-    "            return 'ok TP worker: NIXL connector %s' % ('released' if pause else 'up')\n"
+    "            return 'ok TP worker: NIXL connector %s%s' % ('released' if pause else 'up', v)\n"
     "        kc = e.scheduler.get_kv_connector()\n"
     "        m = sys.modules.get('vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector')\n"
     "        if kc is None or m is None or not isinstance(kc, m.NixlBaseConnector):\n"
     "            return 'ok no NIXL KV connector'\n"
     "        if not isinstance(kc, m.NixlPullConnector):\n"
     "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(kc).__name__)\n"
+    "        v = ucx_ok()\n"
     "        if op == 'resume':\n"
     "            return 'ok ' + on_main(e, e_resume, 60)\n"
     "        if '_nvsnap_nixl' in e.__dict__:\n"
@@ -2440,7 +2455,7 @@ static const char nixl_py[] =
     "                    del e._nvsnap_nixl\n"
     "                    e.scheduler.set_pause_state(st['prev'])\n"
     "            raise\n"
-    "        return 'ok engine paused, NIXL connector released on %d worker(s)' % n\n"
+    "        return 'ok engine paused, NIXL connector released on %d worker(s)%s' % (n, v)\n"
     "\n"
     "    try:\n"
     "        rep = run()\n"
@@ -2471,8 +2486,13 @@ static void serve(int s)
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
-    else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3); msg_send(s, rep, -1); }
-    else if (!strncmp(buf, "nixl ", 5)) { do_py(rep, sizeof(rep), nixl_py, sizeof(nixl_py), "nixl", buf + 5); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3, ""); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "nixl ", 5)) {
+        char ucx[32] = ", ''";
+        if (ucx_loaded()) snprintf(ucx, sizeof(ucx), ", '%u.%u.%u'", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
+        do_py(rep, sizeof(rep), nixl_py, sizeof(nixl_py), "nixl", buf + 5, ucx);
+        msg_send(s, rep, -1);
+    }
     else if (!strncmp(buf, "export ", 7)) do_export(strtoull(buf + 7, NULL, 10), 0, s);
     else if (!strncmp(buf, "exportfab ", 10)) do_export(strtoull(buf + 10, NULL, 10), 1, s);
     else if (!strcmp(buf, "whose") && fd >= 0) do_whose(fd, s);
@@ -2639,19 +2659,24 @@ static void *ucx_sym(const char *stem, const char *name)
     return p;
 }
 
-static unsigned ucx_ver[3];
-
-static int ucx_122(void)
+/* 1 with the version of the UCX loaded in this process in ucx_ver; 0 if
+ * none is (yet). */
+static int ucx_loaded(void)
 {
-    static int v = -1;
-    if (v < 0) {
+    static int found;
+    if (!__atomic_load_n(&found, __ATOMIC_ACQUIRE)) {
+        unsigned v[3];
         void (*get)(unsigned *, unsigned *, unsigned *) =
             (void (*)(unsigned *, unsigned *, unsigned *))ucx_sym("libucp", "ucp_get_version");
-        if (get) get(&ucx_ver[0], &ucx_ver[1], &ucx_ver[2]);
-        v = ucx_ver[0] == 1 && ucx_ver[1] == 22;
+        if (!get) return 0;
+        get(&v[0], &v[1], &v[2]);
+        memcpy(ucx_ver, v, sizeof(v));
+        __atomic_store_n(&found, 1, __ATOMIC_RELEASE);
     }
-    return v;
+    return 1;
 }
+
+static int ucx_122(void) { return ucx_loaded() && ucx_ver[0] == 1 && ucx_ver[1] == 22; }
 
 static unsigned long first_netns;
 

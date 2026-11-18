@@ -16,7 +16,9 @@ on both sides). Each fake logs what vLLM would do. The test checks that
     is prefilled locally;
   * a failed pause leaves the engine serving as before, and the tool exits
     non-zero;
-  * a process without vLLM answers ok, and a bad host never reaches Python.
+  * a process without vLLM answers ok, and a bad host never reaches Python;
+  * nixl-pause names the process's UCX, and refuses a UCX other than 1.22
+    (restored into another pod, it would keep the old pod's routes).
 
 Run: python3 -I tests/gpushare/host/test_nixl_host.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -38,7 +40,8 @@ from test_mx_host import CUDA_INC, build  # noqa: E402
 # 1 s after the first pause request; "fail": the connector shutdown raises;
 # "fail1": it raises on TP worker 1 only; "failresume": the first re-created
 # connector fails to register; "stuck": the listener ignores its stop event.
-# Env: WORKERS (TP workers, all in this process), LEASE, HELD.
+# Env: WORKERS (TP workers, all in this process), LEASE, HELD, UCX_LIB (a
+# stub libucp to load, as NIXL loads UCX; its version is 1.<UCX_MINOR>.0).
 WORKER = r"""
 import ctypes, enum, os, queue, sys, threading, time, types
 LOG, MODE = sys.argv[1], sys.argv[2]
@@ -183,6 +186,8 @@ if MODE != "none":
     mod("vllm.v1.core.sched.interface", PauseState=PauseState)
     mod("vllm.v1.request", RequestStatus=RequestStatus)
 
+if os.environ.get("UCX_LIB"):
+    ctypes.CDLL(os.environ["UCX_LIB"])
 h = ctypes.c_ulonglong()
 fd = os.open(os.devnull, os.O_RDONLY)
 imp = ctypes.CDLL("libcuda.so.1").cuMemImportFromShareableHandle
@@ -207,6 +212,14 @@ class NixlPauseResume(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp()
         build(cls.tmp)
         cls.env = dict(os.environ, LD_LIBRARY_PATH=cls.tmp)
+        # Named as NIXL bundles it.
+        cls.ucp = os.path.join(cls.tmp, "libucp-1234abcd.so.0")
+        with open(cls.ucp + ".c", "w") as f:
+            f.write("#include <stdlib.h>\n"
+                    "void ucp_get_version(unsigned *a, unsigned *b, unsigned *c)\n"
+                    "{ *a = 1; *b = atoi(getenv(\"UCX_MINOR\")); *c = 0; }\n")
+        subprocess.run(["gcc", "-O2", "-Wall", "-Werror", "-shared", "-fPIC", "-o", cls.ucp, cls.ucp + ".c"],
+                       check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -324,6 +337,18 @@ class NixlPauseResume(unittest.TestCase):
         self.start(HELD="1")
         self.ok("nixl-pause")
         self.assertIn("0 request(s) prefilled here", self.ok("nixl-resume"))
+
+    def test_pause_names_ucx(self):
+        self.start(UCX_LIB=self.ucp, UCX_MINOR="22")
+        self.assertIn("released on 1 worker(s), UCX 1.22.0;", self.ok("nixl-pause"))
+        self.assertIn("resumed as engine", self.ok("nixl-resume"))
+
+    def test_pause_refuses_other_ucx(self):
+        self.start(UCX_LIB=self.ucp, UCX_MINOR="21")
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn("UCX 1.21.0 is not 1.22", p.stdout)
+        self.assertNotIn("pause_state PAUSED_NEW", self.events())  # refused before pausing
 
     def test_without_vllm(self):
         self.start("none")

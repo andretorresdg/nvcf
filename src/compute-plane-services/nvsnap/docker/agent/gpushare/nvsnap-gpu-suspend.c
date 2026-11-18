@@ -51,7 +51,10 @@ SPDX-License-Identifier: Apache-2.0
  *                 the engine takes no new requests, waits for KV transfers in
  *                 flight, and drops its NIXL agent and RDMA state. Fails, as
  *                 mx-pause does, while any RDMA device file is left (NCCL
- *                 over RDMA, say); then every pid is resumed.
+ *                 over RDMA, say), or when the process's UCX is not 1.22
+ *                 (restored into another pod, it would keep the old pod's
+ *                 routes); then every pid is resumed. The reply names the
+ *                 UCX ("..., UCX 1.22.0").
  *   nixl-resume   After open: the connectors come back under a new engine id
  *                 and the engine takes requests again. --host as for
  *                 mx-resume: the address decode engines reach it at.
