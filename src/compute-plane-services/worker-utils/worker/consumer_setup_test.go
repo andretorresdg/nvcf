@@ -164,17 +164,25 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 	})
 }
 
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Now() time.Time { return c.now }
+
 func TestNatsConsumerSetupBackOff(t *testing.T) {
-	now := time.Unix(0, 0)
-	b := newNatsConsumerSetupBackOff().(*phasedBackOff)
-	b.now = func() time.Time { return now }
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	b := newNatsConsumerSetupBackOffWithClock(clock)
+	now := clock.now
+	advance := func(d time.Duration) {
+		now = now.Add(d)
+		clock.now = now
+	}
 
 	maxFast := natsConsumerFastRetryMaxWait + natsConsumerFastRetryMaxWait/4
 	for now.Sub(time.Unix(0, 0)) < natsConsumerFastRetryPeriod {
 		wait := b.NextBackOff()
 		require.NotEqual(t, backoff.Stop, wait)
 		require.LessOrEqual(t, wait, maxFast, "fast phase at %s", now.Sub(time.Unix(0, 0)))
-		now = now.Add(wait)
+		advance(wait)
 	}
 
 	maxSlow := natsConsumerSlowRetryMaxWait + natsConsumerSlowRetryMaxWait/4
@@ -184,11 +192,38 @@ func TestNatsConsumerSetupBackOff(t *testing.T) {
 		require.NotEqual(t, backoff.Stop, wait, "the backoff must never stop on its own")
 		require.LessOrEqual(t, wait, maxSlow)
 		sawSlow = sawSlow || wait > maxFast
-		now = now.Add(wait)
+		advance(wait)
 	}
 	assert.True(t, sawSlow, "waits grow beyond the fast limit after the fast period")
 	assert.Greater(t, now.Sub(time.Unix(0, 0)), 6*time.Hour)
 
+}
+
+func TestPhasedBackOffReset(t *testing.T) {
+	now := time.Unix(0, 0)
+	b := &phasedBackOff{
+		fast:    backoff.NewConstantBackOff(time.Millisecond),
+		slow:    backoff.NewConstantBackOff(time.Second),
+		fastFor: time.Minute,
+		now:     func() time.Time { return now },
+	}
+	assert.Equal(t, time.Millisecond, b.NextBackOff())
+	now = now.Add(2 * time.Minute)
+	assert.Equal(t, time.Second, b.NextBackOff())
+
 	b.Reset()
-	assert.LessOrEqual(t, b.NextBackOff(), maxFast, "Reset starts over with fast retries")
+	assert.Equal(t, time.Millisecond, b.NextBackOff(), "Reset starts over with fast retries")
+	now = now.Add(2 * time.Minute)
+	assert.Equal(t, time.Second, b.NextBackOff())
+}
+
+func TestCheckNatsConsumerSetup(t *testing.T) {
+	w := &NVCFWorker{}
+	require.NoError(t, w.checkNatsConsumerSetup(context.Background()))
+
+	w.natsConsumerSetupFailing.Store(true)
+	require.Error(t, w.checkNatsConsumerSetup(context.Background()))
+
+	w.natsConsumerSetupFailing.Store(false)
+	require.NoError(t, w.checkNatsConsumerSetup(context.Background()))
 }

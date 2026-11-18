@@ -417,6 +417,9 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string
 		nats.RetryOnFailedConnect(true),
 		nats.Timeout(5*time.Second),
 		nats.MaxReconnects(maxNatsReconnects),
+		// Keep reconnecting after repeated auth errors too. The token can be rejected while the NVCF token refresh
+		// is failing during the same outage, and a closed connection is never re-created.
+		nats.IgnoreAuthErrorAbort(),
 		nats.Name("worker_"+functionVersionId+"_"+instanceId),
 		nats.CustomReconnectDelay(func(attempt int) time.Duration {
 			expBackoffMutex.Lock()

@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -138,6 +139,10 @@ type NVCFWorker struct {
 	sharedProxyClient       httpstream.ProxyClient
 	shutdownCtx             context.Context
 	shutdownCancel          context.CancelFunc
+
+	// set while NATS consumer setup keeps failing, so the worker reports not ready instead of looking able to
+	// receive work
+	natsConsumerSetupFailing atomic.Bool
 
 	// in-flight requests keyed by request id; looked up on a NATS
 	// cancel broadcast to fire the matching per-request cancel.
@@ -523,6 +528,15 @@ func (w *NVCFWorker) Run(withHttpServer bool) error {
 		return types.NewInternalError(err)
 	}
 
+	err = w.health.Register(health.Config{
+		Name:    "nats-consumer",
+		Timeout: 1 * time.Second,
+		Check:   w.checkNatsConsumerSetup,
+	})
+	if err != nil {
+		return types.NewInternalError(err)
+	}
+
 	err = metrics.Initialize(metrics.NvcfRootNamespace, w.nvcfClient.NatsConn)
 	if err != nil {
 		return types.NewInternalError(err)
@@ -559,7 +573,7 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 		stopSetupAfterFunc := context.AfterFunc(w.shutdownCtx, cancelSetup)
 		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(), func() (*consumer.GlobalNatsConsumer, error) {
 			connectedRegion := *w.nvcfClient.ConnectedRegions.Load()
-			return consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
+			c, err := consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
 				_, err := w.nvcfClient.Client.ProvisionRegionalWorker(ctx, &pb.ProvisionWorkerRequest{
 					InstanceId:        w.config.InstanceId,
 					FunctionId:        w.config.FunctionId,
@@ -568,6 +582,8 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 				}, auth.GrpcTokenFromSource(w.nvcfClient.NvcfTokenProvider))
 				return err
 			}, w.config.FunctionVersionId, connectedRegion.Primary, connectedRegion.Secondaries, w.config.MaxRequestConcurrency)
+			w.natsConsumerSetupFailing.Store(err != nil)
+			return c, err
 		}, zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
 		stopSetupAfterFunc()
 		cancelSetup()
@@ -657,18 +673,23 @@ const (
 // keeps waiting for NATS instead of exiting, because a restart does not bring an unreachable NATS back and each
 // restart counts toward replacing the whole instance. The 25% jitter keeps fast waits at or under 5s.
 func newNatsConsumerSetupBackOff() backoff.BackOff {
+	return newNatsConsumerSetupBackOffWithClock(backoff.SystemClock)
+}
+
+func newNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *phasedBackOff {
 	newExp := func(maxWait time.Duration) *backoff.ExponentialBackOff {
 		return backoff.NewExponentialBackOff(
 			backoff.WithMaxInterval(maxWait),
 			backoff.WithRandomizationFactor(0.25),
 			backoff.WithMaxElapsedTime(0),
+			backoff.WithClockProvider(clock),
 		)
 	}
 	return &phasedBackOff{
 		fast:    newExp(natsConsumerFastRetryMaxWait),
 		slow:    newExp(natsConsumerSlowRetryMaxWait),
 		fastFor: natsConsumerFastRetryPeriod,
-		now:     time.Now,
+		now:     clock.Now,
 	}
 }
 
@@ -727,6 +748,15 @@ func newNatsConsumerWithRetry(ctx context.Context, b backoff.BackOff, create fun
 		zap.L().Info("set up nats consumer after retrying", fields...)
 	}
 	return c, err
+}
+
+// checkNatsConsumerSetup fails while NATS consumer setup keeps failing, for example when NATS is connected but the
+// consumer cannot be attached, so the worker does not look able to receive work.
+func (w *NVCFWorker) checkNatsConsumerSetup(context.Context) error {
+	if w.natsConsumerSetupFailing.Load() {
+		return errors.New("nats consumer setup is failing")
+	}
+	return nil
 }
 
 // isPermanentSetupError reports whether worker provisioning rejected the
