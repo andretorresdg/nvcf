@@ -12,7 +12,11 @@ SYNC_MS and counts its calls. The test checks that
   * a drain check ("poll") uses a synchronization that finished between
     two polls, instead of discarding it and reporting busy forever;
   * quiesce never uses a synchronization that finished, or started, before
-    it was called.
+    it was called;
+  * a quiesce that finds the GPU busy while launches are held keeps them
+    held (the ranks are catching up), and opens the gates otherwise;
+  * when the process that sent "hold" exits, the gates open again;
+  * a batched copy (CUDA 12 and 13 entry points) waits at the memory gate.
 
 Run: python3 -I tests/gpushare/host/test_gate_sync.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -41,6 +45,9 @@ CUresult cuDevicePrimaryCtxRetain(void **c, int d) { (void)d; *c = (void *)1; re
 CUresult cuDevicePrimaryCtxRelease(int d) { (void)d; return 0; }
 CUresult cuCtxPushCurrent(void *c) { (void)c; return 0; }
 CUresult cuCtxPopCurrent(void **c) { *c = (void *)1; return 0; }
+int stub_batches;
+CUresult cuMemcpyBatchAsync(void) { __atomic_add_fetch(&stub_batches, 1, __ATOMIC_SEQ_CST); return 0; }
+CUresult cuMemcpyBatchAsync_v2(void) { __atomic_add_fetch(&stub_batches, 1, __ATOMIC_SEQ_CST); return 0; }
 CUresult cuCtxSynchronize(void)
 {
     const char *e = getenv("SYNC_MS");
@@ -52,9 +59,13 @@ CUresult cuCtxSynchronize(void)
 
 PROBE = r"""
 #include "gpushare.c"
+#include <sys/wait.h>
 
-extern int stub_syncs;
+extern int stub_syncs, stub_batches;
 static void *waiter(void *arg) { gate_enter(&lgate); gate_exit(&lgate); *(int *)arg = 1; return NULL; }
+static CUresult (*batch_fn)(CUdeviceptr *, CUdeviceptr *, size_t *, size_t, CUmemcpyAttributes *, size_t *,
+                            size_t, size_t *, CUstream);
+static void *batcher(void *arg) { (void)arg; batch_fn(NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL); return NULL; }
 
 int main(int argc, char **argv)
 {
@@ -98,6 +109,54 @@ int main(int argc, char **argv)
         do_quiesce(rep, sizeof(rep));
         printf("quiesce=%s syncs=%d\n", rep[0] ? rep : "ok",
                __atomic_load_n(&stub_syncs, __ATOMIC_SEQ_CST) - before);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "busy")) {
+        /* Each sync takes SYNC_MS (2500), longer than quiesce waits. */
+        do_quiesce(rep, sizeof(rep));
+        printf("unheld=%s:%d:%d\n", rep[0] == 'e' ? "busy" : "ok", lgate.closed, mgate.closed);
+        do_hold(rep, sizeof(rep));
+        do_quiesce(rep, sizeof(rep));
+        printf("held=%s:%d:%d\n", rep[0] == 'e' ? "busy" : "ok", lgate.closed, mgate.closed);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "lease")) {
+        /* A child sends "hold" over the control socket, then exits. */
+        start_ctl();
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return 3;
+        pid_t c = fork();
+        if (!c) {
+            char b;
+            int ok = request(getppid(), "hold", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok held");
+            if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
+            _exit(0);
+        }
+        char b = 0;
+        if (read(up[0], &b, 1) != 1) return 4;
+        usleep(300000);
+        printf("hold=%c closed_while_alive=%d\n", b, lgate.closed);
+        if (write(down[1], "x", 1) != 1) return 5;
+        waitpid(c, NULL, 0);
+        for (int i = 0; i < 100 && lgate.closed; i++) usleep(10000);
+        printf("closed_after_exit=%d\n", lgate.closed);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "batch")) {
+        /* cuGetProcAddress("cuMemcpyBatchAsync") returns the CUDA 12
+         * function or, for CUDA 13, _v2: each gets its own wrapper. */
+        void *v1 = cuda_sym("cuMemcpyBatchAsync"), *v2 = cuda_sym("cuMemcpyBatchAsync_v2");
+        printf("v1=%d v2=%d\n", wrapper_for("cuMemcpyBatchAsync", v1) == (void *)w_cuMemcpyBatchAsync,
+               wrapper_for("cuMemcpyBatchAsync", v2) == (void *)w_cuMemcpyBatchAsync_v2);
+        batch_fn = wrapper_for("cuMemcpyBatchAsync", v1);
+        mgate.closed = 1;
+        pthread_t t;
+        pthread_create(&t, NULL, batcher, NULL);
+        usleep(200000);
+        printf("copied_while_closed=%d\n", stub_batches);
+        gate_open();
+        pthread_join(t, NULL);
+        printf("copied_after_open=%d\n", stub_batches);
         return 0;
     }
     return 2;
@@ -146,6 +205,23 @@ class GateSync(unittest.TestCase):
         out = self.probe("fresh", sync_ms=1)
         self.assertEqual(out["quiesce"], "ok", out)
         self.assertGreaterEqual(int(out["syncs"]), 2, out)
+
+    def test_busy_quiesce_keeps_held_launches_held(self):
+        out = self.probe("busy", sync_ms=2500)
+        self.assertEqual(out["unheld"], "busy:0:0", "without a hold, a busy quiesce opens the gates")
+        self.assertEqual(out["held"], "busy:1:0", "a busy quiesce let held launches run ahead of their peers")
+
+    def test_gates_open_when_the_holder_exits(self):
+        out = self.probe("lease")
+        self.assertEqual(out["hold"], "1", out)
+        self.assertEqual(out["closed_while_alive"], "1", out)
+        self.assertEqual(out["closed_after_exit"], "0", "launches stayed held after the tool that held them exited")
+
+    def test_batched_copy_waits_at_the_memory_gate(self):
+        out = self.probe("batch")
+        self.assertEqual((out["v1"], out["v2"]), ("1", "1"), out)
+        self.assertEqual(out["copied_while_closed"], "0", "a batched copy passed the closed memory gate")
+        self.assertEqual(out["copied_after_open"], "1", out)
 
 
 if __name__ == "__main__":

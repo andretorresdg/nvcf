@@ -1157,16 +1157,21 @@ static void do_touch(char *reply, size_t n, const char *args)
  * The tool steps the drained ranks while any rank is busy, one launch at
  * a time, so the ranks behind catch up and none passes the ones ahead;
  * once every rank has drained at once, "quiesce" finishes. */
-static void do_hold(char *reply, size_t n)
+static void hold_launches(void)
 {
-    if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
-    held = 0;  /* an "open" from a restore is no longer due */
     pthread_mutex_lock(&gate_mu);
     __atomic_store_n(&lgate.closed, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&mgate.closed, 0, __ATOMIC_SEQ_CST);  /* after a "quiesce": back to holding launches only */
     mgate.pass = 0;
     pthread_cond_broadcast(&gate_cv);
     pthread_mutex_unlock(&gate_mu);
+}
+
+static void do_hold(char *reply, size_t n)
+{
+    if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    held = 0;  /* an "open" from a restore is no longer due */
+    hold_launches();
     snprintf(reply, n, "ok held");
     pthread_mutex_unlock(&mu);
 }
@@ -1225,8 +1230,12 @@ static void do_quiesce(char *reply, size_t n)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
     /* Busy: GPU work waits on work a gated thread has not launched yet
-     * (e.g. a peer's NCCL kernel). Reopen the gate; the tool retries. */
+     * (e.g. a peer's NCCL kernel). Reopen the gate; the tool retries. If
+     * "hold" held the launches, hold them again instead: the tool is
+     * catching the ranks up, and this one must not run ahead of its peers,
+     * which stay held. */
     held = 0;  /* an "open" from a restore is no longer due */
+    int holding = __atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST);
     CUresult r;
     /* Take back a "step" permit not used yet: no launch may pass the gate
      * once quiesce has drained (one already let through counts as
@@ -1237,7 +1246,8 @@ static void do_quiesce(char *reply, size_t n)
     pthread_mutex_unlock(&gate_mu);
     if (gate_close(&lgate, 2000) < 0 || timed_sync(2000, &r, 1) < 0 ||
         gate_close(&mgate, 2000) < 0 || timed_sync(2000, &r, 1) < 0) {
-        gate_open();
+        if (holding) hold_launches();
+        else gate_open();
         snprintf(reply, n, "err busy (GPU work did not drain)");
         pthread_mutex_unlock(&mu);
         return;
@@ -2080,6 +2090,51 @@ static void do_ipcget(unsigned long long base, int s)
     msg_send(s, rep, -1);
 }
 
+/* A lease on "hold": the tool holds launches for up to its timeout plus a
+ * minute while the nodes catch up, and if it dies then (killed, OOM), the
+ * gates would stay closed until someone sends "resume". So "hold" takes a
+ * pidfd of the process that sent it, and when that process exits the gates
+ * open again. "release" ends the lease (released memory must not be used
+ * until "resume"), and so do "resume" and "open". Only the control thread
+ * touches it. */
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434  /* the same on every architecture */
+#endif
+static int lease_fd = -1;
+static pid_t lease_pid;
+
+static void lease_end(void)
+{
+    if (lease_fd >= 0) close(lease_fd);
+    lease_fd = -1;
+    lease_pid = 0;
+}
+
+static void lease_take(int s)
+{
+    struct ucred c;
+    socklen_t l = sizeof(c);
+    if (getsockopt(s, SOL_SOCKET, SO_PEERCRED, &c, &l) != 0 || (lease_fd >= 0 && c.pid == lease_pid)) return;
+    lease_end();
+    int fd = (int)syscall(SYS_pidfd_open, c.pid, 0);
+    if (fd < 0) { logf_("hold: no lease on pid %d (pidfd_open: %s)", c.pid, strerror(errno)); return; }
+    lease_fd = fd;
+    lease_pid = c.pid;
+}
+
+/* The process that held the launches exited. */
+static void lease_expired(void)
+{
+    pid_t pid = lease_pid;
+    lease_end();
+    if (lock_ctl()) { logf_("hold: pid %d exited, but the state lock is busy: launches stay held", pid); return; }
+    if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
+        gate_open();
+        logf_("hold: pid %d, which held the launches, exited: launches run again", pid);
+    }
+    pthread_mutex_unlock(&mu);
+}
+
 /* A reply's longest form ("ok remapped ...", do_remap) fits: the tool
  * reads at most GPUSHARE_REPLY_MAX bytes of it (nvsnap-gpu-suspend.c). */
 static void serve(int s)
@@ -2109,6 +2164,8 @@ static void serve(int s)
     else if (!strncmp(buf, "whosefab ", 9)) do_whosefab(buf + 9, s);
     else if (!strncmp(buf, "ipcget ", 7)) do_ipcget(strtoull(buf + 7, NULL, 10), s);
     else msg_send(s, "err unknown command", -1);
+    if (!strcmp(buf, "hold") && !strcmp(rep, "ok held")) lease_take(s);
+    else if (!strncmp(buf, "release", 7) || !strncmp(buf, "resume", 6) || !strcmp(buf, "open")) lease_end();
     if (fd >= 0) close(fd);
     if (strncmp(buf, "export", 6) && strncmp(buf, "whose", 5) && strncmp(buf, "ipcget", 6) &&
         strcmp(buf, "poll") && strcmp(buf, "step"))
@@ -2163,6 +2220,10 @@ static void *ctl_main(void *arg)
 {
     wc_thread_init();
     for (;;) {
+        struct pollfd p[2] = { { listen_fd, POLLIN, 0 }, { lease_fd, POLLIN, 0 } };
+        if (poll(p, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+        if (p[1].revents) lease_expired();
+        if (!p[0].revents) continue;
         int s = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (s < 0) { if (errno == EINTR || errno == ECONNABORTED) continue; break; }
         if (peer_ok(s, 0)) serve(s);
@@ -3490,6 +3551,19 @@ GATED_M(cuStreamWaitValue32_v2, (CUstream st, CUdeviceptr a, cuuint32_t v, unsig
 GATED_M(cuStreamWaitValue64_v2, (CUstream st, CUdeviceptr a, cuuint64_t v, unsigned f), (st, a, v, f))
 GATED_M(cuStreamBatchMemOp_v2, (CUstream st, unsigned n, CUstreamBatchMemOpParams *p, unsigned f), (st, n, p, f))
 GATED_M(cuLaunchHostFunc, (CUstream st, CUhostFn fn, void *u), (st, fn, u))
+/* Batched copies (vLLM's KV block copies), managed-memory prefetches and
+ * stream-ordered allocations (flashinfer's top-k, PyTorch's cudaMallocAsync
+ * backend). cuda.h maps cuMemcpyBatchAsync and cuMemPrefetchAsync to _v2:
+ * GATED_G keeps the names of the CUDA 12 versions unexpanded. */
+GATED_G(mgate, cuMemcpyBatchAsync, (CUdeviceptr *d, CUdeviceptr *s, size_t *n, size_t c, CUmemcpyAttributes *a,
+        size_t *ai, size_t na, size_t *fail, CUstream st), (d, s, n, c, a, ai, na, fail, st))
+GATED_M(cuMemcpyBatchAsync_v2, (CUdeviceptr *d, CUdeviceptr *s, size_t *n, size_t c, CUmemcpyAttributes *a,
+        size_t *ai, size_t na, CUstream st), (d, s, n, c, a, ai, na, st))
+GATED_G(mgate, cuMemPrefetchAsync, (CUdeviceptr p, size_t n, CUdevice dev, CUstream st), (p, n, dev, st))
+GATED_M(cuMemPrefetchAsync_v2, (CUdeviceptr p, size_t n, CUmemLocation l, unsigned f, CUstream st), (p, n, l, f, st))
+GATED_M(cuMemAllocAsync, (CUdeviceptr *p, size_t n, CUstream st), (p, n, st))
+GATED_M(cuMemAllocFromPoolAsync, (CUdeviceptr *p, size_t n, CUmemoryPool pool, CUstream st), (p, n, pool, st))
+GATED_M(cuMemFreeAsync, (CUdeviceptr p, CUstream st), (p, st))
 
 static void *wrapper_for(const char *name, void *real);
 
@@ -3551,6 +3625,8 @@ static const struct { const char *name; void *wrapper; void **real; } hooks[] = 
     G(cuMemsetD2D8Async), G(cuMemsetD2D16Async), G(cuMemsetD2D32Async),
     G(cuStreamWriteValue32_v2), G(cuStreamWriteValue64_v2), G(cuStreamWaitValue32_v2),
     G(cuStreamWaitValue64_v2), G(cuStreamBatchMemOp_v2), G(cuLaunchHostFunc),
+    G(cuMemcpyBatchAsync), G(cuMemcpyBatchAsync_v2), G(cuMemPrefetchAsync), G(cuMemPrefetchAsync_v2),
+    G(cuMemAllocAsync), G(cuMemAllocFromPoolAsync), G(cuMemFreeAsync),
 #undef GD
 #undef G
 };
