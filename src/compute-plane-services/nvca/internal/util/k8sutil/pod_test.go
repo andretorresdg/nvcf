@@ -1971,24 +1971,21 @@ func TestWorkerRestartCountBaselineToRecord(t *testing.T) {
 	tests := []struct {
 		name         string
 		pod          *corev1.Pod
-		resetPeriod  time.Duration
 		wantBaseline int32
 		wantRecord   bool
 	}{
-		{name: "worker healthy for the default period", pod: newPod("", running(common.UtilsContainerName, 4, true, 31*time.Minute)), wantBaseline: 4, wantRecord: true},
+		{name: "worker healthy for the reset period", pod: newPod("", running(common.UtilsContainerName, 4, true, 31*time.Minute)), wantBaseline: 4, wantRecord: true},
 		{name: "baseline already recorded", pod: newPod("4", running(common.UtilsContainerName, 4, true, 2*time.Hour))},
 		{name: "older baseline is raised", pod: newPod("2", running(common.UtilsContainerName, 4, true, 2*time.Hour)), wantBaseline: 4, wantRecord: true},
 		{name: "worker not healthy for long enough", pod: newPod("", running(common.UtilsContainerName, 4, true, 10*time.Minute))},
 		{name: "worker running but not ready", pod: newPod("", running(common.UtilsContainerName, 4, false, 2*time.Hour))},
 		{name: "worker never restarted", pod: newPod("", running(common.UtilsContainerName, 0, true, 2*time.Hour))},
-		{name: "configured period is honored", pod: newPod("", running(common.UtilsContainerName, 4, true, 45*time.Minute)), resetPeriod: time.Hour},
 		{name: "crash after a long run records the restarts before it", pod: newPod("2", crashedAfter(5, 2*time.Hour)), wantBaseline: 4, wantRecord: true},
 		{name: "other containers are ignored", pod: newPod("", running("inference", 4, true, 2*time.Hour))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			timeConfig := (&TimeConfig{WorkerContainerRestartCountResetPeriod: tt.resetPeriod}).Complete()
-			baseline, record := WorkerRestartCountBaselineToRecord(tt.pod, now, timeConfig)
+			baseline, record := WorkerRestartCountBaselineToRecord(tt.pod, now)
 			assert.Equal(t, tt.wantRecord, record)
 			assert.Equal(t, tt.wantBaseline, baseline)
 		})

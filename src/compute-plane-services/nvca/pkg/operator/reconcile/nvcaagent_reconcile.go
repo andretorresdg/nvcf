@@ -1983,9 +1983,6 @@ func (bc *BackendK8sCache) mergeAgentConfigs(nb *nvidiaiov1.NVCFBackend) nvidiai
 		if config.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance <= 0 {
 			config.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance = bc.nvcfWorkerConfig.WorkerContainerRestartCountToFailInstance
 		}
-		if config.NVCFWorkerConfig.WorkerContainerRestartCountResetPeriod <= 0 {
-			config.NVCFWorkerConfig.WorkerContainerRestartCountResetPeriod = bc.nvcfWorkerConfig.WorkerContainerRestartCountResetPeriod
-		}
 	} else {
 		// Helm-managed: Use local worker config
 		config.NVCFWorkerConfig = bc.nvcfWorkerConfig
@@ -2689,9 +2686,6 @@ func (bc *BackendK8sCache) newAgentConfig(ctx context.Context, nb *nvidiaiov1.NV
 	}
 	if effectiveConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance > 0 {
 		cfg.Workload.WorkerContainerRestartCountToFailInstance = effectiveConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance
-	}
-	if effectiveConfig.NVCFWorkerConfig.WorkerContainerRestartCountResetPeriod > 0 {
-		cfg.Workload.WorkerContainerRestartCountResetPeriod = effectiveConfig.NVCFWorkerConfig.WorkerContainerRestartCountResetPeriod
 	}
 
 	if effectiveConfig.NVCFWorkerConfig.CacheMountOptionsEnabled {

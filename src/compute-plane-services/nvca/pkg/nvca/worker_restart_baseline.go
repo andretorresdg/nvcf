@@ -43,11 +43,9 @@ import (
 const workerRestartBaselineInterval = time.Minute
 
 // startWorkerRestartBaselineRecorder periodically records, on each function Pod, the NVCA worker container's
-// RestartCount once the worker has been healthy for the reset period, so earlier restarts stop counting toward the
-// worker restart threshold.
-func startWorkerRestartBaselineRecorder(ctx context.Context, client kubernetes.Interface, podLister listersv1.PodLister,
-	k8sTimeConfig *k8sutil.TimeConfig,
-) {
+// RestartCount once the worker has been healthy for k8sutil.WorkerRestartCountResetPeriod, so earlier restarts stop
+// counting toward the worker restart threshold.
+func startWorkerRestartBaselineRecorder(ctx context.Context, client kubernetes.Interface, podLister listersv1.PodLister) {
 	go func() {
 		t := time.NewTicker(workerRestartBaselineInterval)
 		defer t.Stop()
@@ -59,14 +57,14 @@ func startWorkerRestartBaselineRecorder(ctx context.Context, client kubernetes.I
 				if ctx.Err() != nil {
 					return
 				}
-				recordWorkerRestartBaselines(ctx, client, podLister, k8sTimeConfig, time.Now())
+				recordWorkerRestartBaselines(ctx, client, podLister, time.Now())
 			}
 		}
 	}()
 }
 
 func recordWorkerRestartBaselines(ctx context.Context, client kubernetes.Interface, podLister listersv1.PodLister,
-	k8sTimeConfig *k8sutil.TimeConfig, now time.Time,
+	now time.Time,
 ) {
 	log := core.GetLogger(ctx)
 	reqIDExists, err := labels.NewRequirement(nvcatypes.ICMSRequestIDKey, selection.Exists, nil)
@@ -80,7 +78,7 @@ func recordWorkerRestartBaselines(ctx context.Context, client kubernetes.Interfa
 		return
 	}
 	for _, pod := range pods {
-		baseline, ok := k8sutil.WorkerRestartCountBaselineToRecord(pod, now, k8sTimeConfig)
+		baseline, ok := k8sutil.WorkerRestartCountBaselineToRecord(pod, now)
 		if !ok {
 			continue
 		}

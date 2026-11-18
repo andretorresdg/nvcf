@@ -66,8 +66,7 @@ func TestRecordWorkerRestartBaselines(t *testing.T) {
 		require.NoError(t, indexer.Add(p))
 	}
 
-	recordWorkerRestartBaselines(context.Background(), client, listersv1.NewPodLister(indexer),
-		(&k8sutil.TimeConfig{}).Complete(), now)
+	recordWorkerRestartBaselines(context.Background(), client, listersv1.NewPodLister(indexer), now)
 
 	got := map[string]string{}
 	for _, name := range []string{"healthy", "recent", "unrelated"} {

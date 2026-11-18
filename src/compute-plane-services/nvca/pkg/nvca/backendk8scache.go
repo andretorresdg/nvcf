@@ -707,9 +707,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 			c.podSpecLister = podInf.Lister().Pods(c.podInstanceNamespace)
 			c.syncedFuncs = append(c.syncedFuncs, podInf.Informer().HasSynced)
 			podInfFactory.Start(ctx.Done())
-			if c.k8sTimeConfig != nil {
-				startWorkerRestartBaselineRecorder(ctx, k8sClient, c.podLister, c.k8sTimeConfig)
-			}
+			startWorkerRestartBaselineRecorder(ctx, k8sClient, c.podLister)
 		}
 
 		if err := c.initInstanceNamespaceInformer(ctx); err != nil {

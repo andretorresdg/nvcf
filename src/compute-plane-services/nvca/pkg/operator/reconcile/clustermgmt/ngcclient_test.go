@@ -27,7 +27,6 @@ import (
 	"sort"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"encoding/base64"
 
@@ -956,47 +955,6 @@ func TestWithAgentConfigMapper(t *testing.T) {
 			require.NoError(t, err, value)
 			assert.Equal(t, int32(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance, value)
 			assert.Equal(t, "high-priority", dest.NVCFBackend.Spec.AgentConfig.DeploymentConfig.PriorityClassName, value)
-		}
-	})
-
-	t.Run("maps worker container restart count reset period minutes", func(t *testing.T) {
-		src := &clusterDTO{
-			ClusterConfigurations: CaseInsensitiveClusterConfigMap{
-				NVCAWorkerContainerRestartCountResetPeriodMinutesConfig: "45",
-			},
-		}
-		dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
-
-		err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
-		require.NoError(t, err)
-		assert.Equal(t, 45*time.Minute, dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountResetPeriod)
-	})
-
-	t.Run("maps negative worker container restart count reset period to the default", func(t *testing.T) {
-		src := &clusterDTO{
-			ClusterConfigurations: CaseInsensitiveClusterConfigMap{
-				NVCAWorkerContainerRestartCountResetPeriodMinutesConfig: "-5",
-			},
-		}
-		dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
-
-		err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
-		require.NoError(t, err)
-		assert.Equal(t, time.Duration(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountResetPeriod)
-	})
-
-	t.Run("returns error for invalid worker container restart count reset period", func(t *testing.T) {
-		for _, value := range []string{"30m", "99999999999"} {
-			src := &clusterDTO{
-				ClusterConfigurations: CaseInsensitiveClusterConfigMap{
-					NVCAWorkerContainerRestartCountResetPeriodMinutesConfig: value,
-				},
-			}
-			dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
-
-			err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
-			require.Error(t, err, value)
-			assert.Contains(t, err.Error(), "failed to parse worker container restart count reset period minutes", value)
 		}
 	})
 

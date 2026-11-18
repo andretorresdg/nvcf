@@ -152,8 +152,7 @@ func hasAgentWorkerConfigOptionsChanged(ctx context.Context, newNVCAConfig nvidi
 		if newNVCAConfig.CacheMountOptionsEnabled != srcConfig.CacheMountOptionsEnabled ||
 			newNVCAConfig.CacheMountOptions != srcConfig.CacheMountOptions ||
 			newNVCAConfig.WorkerDegradationPeriod != srcConfig.WorkerDegradationPeriod ||
-			newNVCAConfig.WorkerContainerRestartCountToFailInstance != srcConfig.WorkerContainerRestartCountToFailInstance ||
-			newNVCAConfig.WorkerContainerRestartCountResetPeriod != srcConfig.WorkerContainerRestartCountResetPeriod {
+			newNVCAConfig.WorkerContainerRestartCountToFailInstance != srcConfig.WorkerContainerRestartCountToFailInstance {
 			log.Infof("Agent worker config changed from %+v to %+v", nbStatus.AgentConfig.NVCFWorkerConfig, newNVCAConfig) //nolint:staticcheck
 			return true
 		}
