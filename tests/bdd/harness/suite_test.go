@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -168,8 +169,8 @@ func TestSuiteSignalCleanupHelper(t *testing.T) {
 	}
 	// The child is killed as a process group and cannot run an EXIT trap.
 	// Suite teardown must still remove its nested secret workspace afterward.
-	child := exec.CommandContext(stepContext, "/bin/sh", "-c",
-		`work=$(mktemp -d); trap 'rm -rf "$work"' EXIT; printf fixture > "$work/secret"; printf '%s' "$2" > "$1.tmp"; mv "$1.tmp" "$1"; sleep 30 & wait`,
+	child := exec.CommandContext(stepContext, "/bin/sh", "-ec",
+		`work=$(mktemp -d "$TMPDIR/child.XXXXXX"); trap 'rm -rf "$work"' EXIT; printf fixture > "$work/secret"; printf '%s' "$2" > "$1.tmp"; mv "$1.tmp" "$1"; sleep 30 & wait`,
 		"signal-helper", readyPath, suite.tempWorkspace)
 	configureCommandCancellation(child)
 	if err := child.Run(); err == nil || stepContext.Err() == nil {
@@ -238,6 +239,11 @@ func TestNewSuiteWithoutCLIUsesOwnedWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := suite.Teardown(); err != nil {
+			t.Errorf("fallback teardown: %v", err)
+		}
+	})
 	workspace := os.Getenv("TMPDIR")
 	if workspace == previous {
 		t.Fatal("workspace was not isolated")
@@ -253,6 +259,53 @@ func TestNewSuiteWithoutCLIUsesOwnedWorkspace(t *testing.T) {
 	}
 	if os.Getenv("TMPDIR") != previous {
 		t.Fatal("TMPDIR was not restored")
+	}
+	if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace remained: %v", err)
+	}
+}
+
+func TestTempWorkspaceResolvesRelativeBase(t *testing.T) {
+	root := t.TempDir()
+	childDir := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", relative)
+	suite := &Suite{Ledger: NewLedger(root), EnvLedger: NewEnvLedger()}
+	if err := suite.createTempWorkspace(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := suite.Teardown(); err != nil {
+			t.Errorf("fallback teardown: %v", err)
+		}
+	})
+	workspace := os.Getenv("TMPDIR")
+	if !filepath.IsAbs(workspace) {
+		t.Fatalf("relative workspace exported: %q", workspace)
+	}
+	command := exec.Command("/bin/sh", "-ec", `mktemp -d "$TMPDIR/child.XXXXXX"`)
+	command.Dir = childDir
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child mktemp: %v: %s", err, output)
+	}
+	childPath := strings.TrimSpace(string(output))
+	inside, err := filepath.Rel(workspace, childPath)
+	if err != nil || !filepath.IsLocal(inside) {
+		t.Fatalf("child workspace=%q err=%v", childPath, err)
+	}
+	if err := suite.Teardown(); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("TMPDIR") != relative {
+		t.Fatal("original relative TMPDIR was not restored")
 	}
 	if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("workspace remained: %v", err)

@@ -25,6 +25,7 @@ printf 'fixture-tls\n' > "$DOCKER_CONFIG/contexts/tls/fixture/ca.pem"
 cp "$DOCKER_CONFIG/config.json" "$work/original-docker.json"
 export TEST_OPERATOR_DOCKER_CONFIG=$DOCKER_CONFIG
 export HELM_REGISTRY_CONFIG="$work/operator-helm-registry.json"
+export TEST_OPERATOR_HELM_REGISTRY_CONFIG=$HELM_REGISTRY_CONFIG
 printf '{"auths":{"registry.example.com":{"auth":"fixture-auth"}}}\n' > "$HELM_REGISTRY_CONFIG"
 # shellcheck disable=SC1091
 source "$work/image/openbao/jwt-plugin-versions.env"
@@ -157,7 +158,46 @@ set -euo pipefail
 if [[ $1 == registry && $2 == login ]]; then
   [[ ( $3 == nvcr.io || $3 == nvcr.io:443 ) && $(cat) == fixture-registry-key ]]
   TEST_REGISTRY_HOST=$3 yq -e '(.auths | has(strenv(TEST_REGISTRY_HOST))) and (.credsStore == null) and (.credHelpers == null)' "$HELM_REGISTRY_CONFIG" >/dev/null
+  TEST_REGISTRY_HOST=$3 yq -i '.auths[strenv(TEST_REGISTRY_HOST)].auth = "fixture-logged-in"' "$HELM_REGISTRY_CONFIG"
   echo oci-authenticated >> "$TEST_AUTH_LOG"
+  exit
+fi
+if [[ ${TEST_OCI_RENDER:-false} == true && $1 == template && -n ${TEST_EXPECT_NGC_CONFIG:-} ]]; then
+  [[ $HELM_REGISTRY_CONFIG != "$TEST_OPERATOR_HELM_REGISTRY_CONFIG" ]]
+  [[ $(TEST_REGISTRY_HOST=$TEST_EXPECT_NGC_CONFIG yq -r '.auths[strenv(TEST_REGISTRY_HOST)].auth' "$HELM_REGISTRY_CONFIG") == fixture-logged-in ]]
+  echo "oci-rendered $TEST_EXPECT_NGC_CONFIG" >> "$TEST_AUTH_LOG"
+fi
+if [[ $1 == pull ]]; then
+  reference=$2
+  [[ $reference == oci://* && $reference != oci://oci://* ]]
+  host=${reference#oci://}; host=${host%%/*}
+  chart_name=${reference##*/}
+  shift 2
+  destination=''
+  while (($#)); do
+    if [[ $1 == --destination ]]; then destination=$2; shift; fi
+    shift
+  done
+  [[ -n $destination ]]
+  case "$host" in
+    nvcr.io|nvcr.io:443)
+      [[ $HELM_REGISTRY_CONFIG != "$TEST_OPERATOR_HELM_REGISTRY_CONFIG" ]]
+      [[ $(TEST_REGISTRY_HOST=$host yq -r '.auths[strenv(TEST_REGISTRY_HOST)].auth' "$HELM_REGISTRY_CONFIG") == fixture-logged-in ]] ;;
+    registry.example.com|'[2001:db8::1]:5000') : ;;
+    private.example.com)
+      helper=fixture
+      if [[ ${TEST_IMPLICIT_STORE:-false} == true ]]; then helper=pass; fi
+      printf '%s' "$host" | "docker-credential-$helper" get | yq -e '.Username == "mirror-user" and .Secret == "mirror-password"' >/dev/null ;;
+    *) exit 1 ;;
+  esac
+  case "$chart_name" in
+    helm-nvcf-openbao-server) fixture=$TEST_SERVER_CHART ;;
+    helm-nvcf-ui) fixture=$TEST_UI_CHART ;;
+    *) exit 1 ;;
+  esac
+  mkdir -p "$destination"
+  cp -R "$fixture" "$destination/$chart_name"
+  echo "oci-pulled $reference" >> "$TEST_AUTH_LOG"
   exit
 fi
 if [[ $1 == repo && $2 == add ]]; then
@@ -215,6 +255,9 @@ for arg in "$@"; do
     exit
   fi
   if [[ $arg == template ]]; then
+    if [[ ${TEST_OCI_RENDER:-false} == true ]]; then
+      exec "$TEST_HELMFILE_BIN" "$@" --skip-deps
+    fi
     if [[ ${TEST_AUTHENTICATE:-false} == true ]]; then
       auth_args=()
       for auth_arg in "$@"; do
@@ -240,7 +283,8 @@ qualify() {
     --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system "$@"
 }
 : > "$TEST_DOCKER_CALLS"
-TEST_NGC_API_KEY=fixture-registry-key qualify
+TEST_OCI_RENDER=true TEST_EXPECT_NGC_CONFIG=nvcr.io TEST_NGC_API_KEY=fixture-registry-key qualify
+test "$(grep -c '^oci-rendered nvcr.io$' "$TEST_AUTH_LOG")" = 2
 test "$(grep -c '^login nvcr.io ' "$TEST_DOCKER_CALLS")" = 1
 # A source contexts directory may itself be a relative symlink.
 mv "$DOCKER_CONFIG/contexts" "$work/shared-contexts"
@@ -283,8 +327,26 @@ if TEST_MUTATE_VALUES_FILE="$work/switch-version.yaml" TEST_MUTATE_VERSION=true 
   fail 'accepted UI values changed after server selection'
 fi
 grep -Fq "expected $target" "$work/result"
+# Native resolution preserves relative operands and sibling template includes.
+printf 'addons:\n  nvcfUi:\n    openbaoMigrations:\n      jwtPluginVersion: %s\n' "$target" > "$work/stack/environments/relative-values.yaml"
+printf '{{ readFile "relative-values.yaml" }}\n' > "$work/stack/environments/relative-values.yaml.gotmpl"
+qualify --state-values-file ../environments/relative-values.yaml
+qualify --state-values-file=../environments/relative-values.yaml.gotmpl
+mkdir -p "$work/external values"
+cp "$work/stack/environments/relative-values.yaml" "$work/external values/jwt-values.yaml"
+printf '{{ readFile "jwt-values.yaml" }}\n' > "$work/external values/overrides.yaml.gotmpl"
+# A sibling include is resolved once even if it changes between release builds.
+TEST_MUTATE_VALUES_FILE="$work/external values/jwt-values.yaml" TEST_MUTATE_VERSION=true TEST_EXPECTED_TARGET=$old \
+  qualify --state-values-file "$work/external values/overrides.yaml.gotmpl"
+test "$(yq -r '.addons.nvcfUi.openbaoMigrations.jwtPluginVersion' "$work/external values/jwt-values.yaml")" = "$old"
+# Preserve Helmfile's --state-values-set precedence over file values.
+qualify --state-values-file "$work/external values/overrides.yaml.gotmpl" \
+  --state-values-set "addons.nvcfUi.openbaoMigrations.jwtPluginVersion=$target"
+# Relative operands may also point outside the stack, from helmfile.d.
+qualify --state-values-file "../../external values/overrides.yaml.gotmpl" \
+  --state-values-set "addons.nvcfUi.openbaoMigrations.jwtPluginVersion=$target"
 # Release qualification must match the inventory's OCI chart origin.
-NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify \
+TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify \
   --state-values-set global.helm.sources.url= \
   --state-values-set global.helm.sources.registry=registry.example.com \
   --state-values-set global.helm.sources.repository=release/charts
@@ -300,18 +362,31 @@ if TEST_CHART_OUTSIDE_ORIGIN=true NVCF_RELEASE_HELM_REGISTRY=registry.example.co
 fi
 grep -Fq 'qualified chart origin differs' "$work/result"
 # Normalize all trailing slashes and support the NGC TLS port explicitly.
-NVCF_RELEASE_HELM_REGISTRY=' nvcr.io:443/team/charts// ' TEST_NGC_API_KEY=fixture-registry-key qualify \
+TEST_OCI_RENDER=true TEST_EXPECT_NGC_CONFIG=nvcr.io:443 NVCF_RELEASE_HELM_REGISTRY=' nvcr.io:443/team/charts// ' TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url= \
   --state-values-set global.helm.sources.registry=nvcr.io:443 \
   --state-values-set global.helm.sources.repository=team/charts
-# A private release host with no credentials must fail before template.
-if NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
+test "$(grep -c '^oci-rendered nvcr.io:443$' "$TEST_AUTH_LOG")" = 2
+# Normalize an explicitly prefixed OCI source before native Helmfile pulls.
+TEST_OCI_RENDER=true TEST_EXPECT_NGC_CONFIG=nvcr.io:443 NVCF_RELEASE_HELM_REGISTRY=nvcr.io:443/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=oci://nvcr.io:443 \
+  --state-values-set global.helm.sources.repository=team/charts
+test "$(grep -c '^oci-rendered nvcr.io:443$' "$TEST_AUTH_LOG")" = 4
+# Bracketed IPv6 is accepted by the publisher, native pull path, and renderer.
+TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY='[2001:db8::1]:5000/team/charts' qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set 'global.helm.sources.registry=[2001:db8::1]:5000' \
+  --state-values-set global.helm.sources.repository=team/charts
+grep -Fq 'oci-pulled oci://[2001:db8::1]:5000/team/charts/helm-nvcf-ui' "$TEST_AUTH_LOG"
+# A failed private-origin pull supplies host-specific login guidance.
+if TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url= \
   --state-values-set global.helm.sources.registry=private.example.com \
   --state-values-set global.helm.sources.repository=team/charts > "$work/result" 2>&1; then
   fail 'rendered private release origin without credentials'
 fi
-grep -Fq 'no chart credentials for private.example.com' "$work/result"
+grep -Fq 'chart pull or render failed for private.example.com; run helm registry login' "$work/result"
 # Credential helpers are checked for the actual private host, without using an NGC key.
 cat > "$work/bin/docker-credential-fixture" <<'BASH'
 #!/usr/bin/env bash
@@ -320,10 +395,18 @@ set -euo pipefail
 printf '{"Username":"mirror-user","Secret":"mirror-password"}\n'
 BASH
 chmod +x "$work/bin/docker-credential-fixture"
-NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
+TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url= \
   --state-values-set global.helm.sources.registry=private.example.com \
   --state-values-set global.helm.sources.repository=team/charts
+# Helm can discover a native helper even when neither config names it.
+cp "$work/bin/docker-credential-fixture" "$work/bin/docker-credential-pass"
+yq -i 'del(.credsStore)' "$DOCKER_CONFIG/config.json"
+TEST_OCI_RENDER=true TEST_IMPLICIT_STORE=true NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=private.example.com \
+  --state-values-set global.helm.sources.repository=team/charts
+cp "$work/original-docker.json" "$DOCKER_CONFIG/config.json"
 # A lookalike hostname is still a mirror.
 TEST_AUTHENTICATE=true TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com.example.com/charts

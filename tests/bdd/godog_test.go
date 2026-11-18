@@ -3477,7 +3477,7 @@ func runLiveFeatureTags(t *testing.T, feature, tags string, options ...harness.S
 	}
 	stopSignalCleanup := suite.InstallSignalCleanup()
 	defer func() {
-		stopSignalCleanup()
+		defer stopSignalCleanup()
 		if err := suite.Teardown(); err != nil {
 			t.Errorf("teardown: %v", err)
 		}

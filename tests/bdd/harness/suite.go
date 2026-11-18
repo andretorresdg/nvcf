@@ -157,7 +157,11 @@ func (s *Suite) snapshotCLIStatePath(path string) error {
 }
 
 func (s *Suite) createTempWorkspace() error {
-	dir, err := os.MkdirTemp("", "nvcf-bdd-work-")
+	base, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("resolve temporary base: %w", err)
+	}
+	dir, err := os.MkdirTemp(base, "nvcf-bdd-work-")
 	if err != nil {
 		return fmt.Errorf("create temporary workspace: %w", err)
 	}
@@ -232,7 +236,8 @@ func (s *Suite) EndSignalSafeStep(ctx context.Context) context.Context {
 // InstallSignalCleanup restores ledger-backed files and environment variables
 // before an interrupted live run exits. It first cancels the active step, then
 // waits for that step to quiesce before restoring. The returned stop function
-// joins the signal goroutine and must run before normal Teardown.
+// joins the signal goroutine and must run after normal Teardown, so signals
+// remain handled until workspace removal completes.
 func (s *Suite) InstallSignalCleanup() func() {
 	signals := make(chan os.Signal, 1)
 	stop := make(chan struct{})

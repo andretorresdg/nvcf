@@ -375,7 +375,7 @@ jobs:
           chart_source="${chart_source%"${chart_source##*[![:space:]]}"}"
           while [[ $chart_source == */ ]]; do chart_source=${chart_source%/}; done
           export NVCF_RELEASE_HELM_REGISTRY=$chart_source
-          if [[ ! $chart_source =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?/[a-zA-Z0-9._/-]+$ ]]; then
+          if [[ -z $chart_source || $chart_source != */* || $chart_source == *://* || $chart_source == *[@?#[:space:]]* ]]; then
             echo 'NVCF_RELEASE_HELM_REGISTRY must use host/repository format' >&2
             exit 1
           fi
