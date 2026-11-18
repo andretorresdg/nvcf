@@ -82,7 +82,7 @@ Resolve the fullname used by the embedded OpenBao chart.
 {{- define "nvcf-openbao.bootstrapDeadlineSeconds" -}}
 {{- $api := include "nvcf-openbao.apiTimeoutSeconds" . | int -}}
 {{- $credentials := include "nvcf-openbao.credentialTimeoutSeconds" . | int -}}
-{{- max 1 (add (mul 2 $api) (mul 4 $credentials) 60) -}}
+{{- max 1 (add (mul 3 $api) (mul 4 $credentials) 60) -}}
 {{- end -}}
 
 {{- define "nvcf-openbao.adminEnvironment" -}}

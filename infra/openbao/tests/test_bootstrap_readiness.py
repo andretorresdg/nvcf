@@ -37,6 +37,7 @@ if 'version' in a: done(json.dumps({'serverVersion':{'gitVersion':'v1.36.6'}}))
 if 'containerStatuses' in ' '.join(a): done('false')
 if 'statefulset' in a:
  if s.get('stall') == 'get': stall('get')
+ if 'member_clock' in s and s.get('job_reads'): p.with_suffix('.clock').write_text(str(s['member_clock']))
  count = s.get('replicas', 3)
  if s.get('scale_after_snapshot'):
   s['replicas'] = s.pop('scale_after_snapshot')
@@ -56,6 +57,7 @@ if 'exec' in a and 'status' in a:
  if s.get('bad_status'): done('{"initialized":"false","sealed":true}', 2)
  done(json.dumps(status), 2 if status['sealed'] else 0)
 if 'exec' in a and 'init' in a:
+ if s.get('stall') == 'init': stall('init')
  s['init_calls'] += 1
  if s.get('deny_init'): done('', 1)
  if s['members'][0]['initialized']: done('', 1)
@@ -71,10 +73,11 @@ if 'exec' in a and 'curl' in a:
 if 'job' in a and 'get' in a:
  if s.get('job_read_delay'): time.sleep(s['job_read_delay'])
  s['job_reads'] = s.get('job_reads', 0) + 1
+ if 'job_clock' in s: p.with_suffix('.clock').write_text(str(s['job_clock']))
  if s.get('job_delay', 0):
   s['job_delay'] -= 1; done(json.dumps({'status':{}}))
  condition = s.get('job_state', 'Complete')
- done(json.dumps({'status':{'conditions':[{'type':condition, 'status':'True'}]}}))
+ done(json.dumps({'spec':{'activeDeadlineSeconds':s.get('job_active_deadline',4000)}, 'status':{'startTime':time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),'conditions':[{'type':condition, 'status':'True'}]}}))
 if 'secret' in a and 'get' in a:
  name = a[a.index('secret') + 1]
  failures = s.get('read_failures', {})
@@ -83,6 +86,7 @@ if 'secret' in a and 'get' in a:
  if name.endswith('-root-token') and s.get('root_delay', 0):
   s['root_delay'] -= 1
   if not s['root_delay']: s['secrets'][name] = {'root_token':'test-root'}
+ if 'secret_read_clock' in s: p.with_suffix('.clock').write_text(str(s['secret_read_clock']))
  if s.get('secret_read_delay'):
   p.with_suffix('.secret-read').write_text(name)
   time.sleep(s['secret_read_delay'])
@@ -120,6 +124,11 @@ if 'secret' in a and ('patch' in a or 'create' in a):
    s['secrets'][name]['bootstrap_verified'] = 'true'
    s['secrets'].pop('bao-recovery-keys', None)
    versions[name] = versions.get(name, 1) + 1
+  if s.get('competing_unverified_completion') and name.endswith('-root-token') and base64.b64decode(patch['data'].get('bootstrap_state', '')).decode() == 'complete':
+   s['competing_unverified_completion'] = False
+   s['secrets'][name]['bootstrap_state'] = 'complete'
+   versions[name] = versions.get(name, 1) + 1
+   versions['bao-recovery-keys'] = versions.get('bao-recovery-keys', 1) + 1
   if name not in s['secrets']: done('', 1)
   supplied = patch.get('metadata', {}).get('resourceVersion')
   if supplied is not None and supplied != str(versions.get(name, 1)): done('Conflict', 1)
@@ -373,7 +382,7 @@ class BootstrapReadinessTest(unittest.TestCase):
                 self.invoke(success=False, api_timeout=value)
                 self.assertEqual(self.state["calls"], [])
 
-    def run_script(self, standalone=False, **overrides):
+    def run_script(self, standalone=False, process_timeout=8, **overrides):
         stage = self.path / "stage"
         utils = stage / "utils"
         utils.mkdir(parents=True, exist_ok=True)
@@ -395,7 +404,7 @@ class BootstrapReadinessTest(unittest.TestCase):
                    OPENBAO_BOOTSTRAP_ONLY="false", OPENBAO_WAIT_ONLY="false")
         env.update(overrides)
         result = subprocess.run(["bash", str(stage / "deploy.sh"), "test", "bao", "helm"],
-                                env=env, capture_output=True, text=True, timeout=8)
+                                env=env, capture_output=True, text=True, timeout=process_timeout)
         self.state = json.loads(self.state_file.read_text())
         return result
 
@@ -411,7 +420,7 @@ class BootstrapReadinessTest(unittest.TestCase):
     def test_standalone_existing_resources_invocation_resumes_bootstrap(self):
         self.state["members"][0].update(initialized=True, sealed=False)
         self.state["secrets"].update({"bao-root-token": {"root_token": "test-root"}, "bao-unseal": {"unseal_key": "test-key"}})
-        result = self.run_script(standalone=True, OPENBAO_API_TIMEOUT_SECONDS="5")
+        result = self.run_script(standalone=True, process_timeout=30, OPENBAO_API_TIMEOUT_SECONDS="20")
         self.assertIn("reusing saved bootstrap credentials", result.stdout)
         self.assertIn("Successfully unsealed the cluster", result.stdout)
         self.assertEqual(self.state["init_calls"], 0)
@@ -711,6 +720,81 @@ class BootstrapReadinessTest(unittest.TestCase):
                 self.assertEqual("Verified recovery-key export:" in result.stdout, accepted)
                 self.assertNotIn("test-recovery", result.stdout)
                 self.assertNotIn("foreign", result.stdout)
+                exports = list(self.path.glob("openbao-recovery.*"))
+                self.assertEqual(len(exports), 1 if accepted else 0)
+                for export in exports:
+                    self.assertEqual(export.stat().st_mode & 0o777, 0o600)
+                    export.unlink()
+
+    def controlled_clock_source(self):
+        # Replace clock reads only; leave timeout environment names intact.
+        clock = self.state_file.with_suffix(".clock")
+        clock.write_text("0")
+        helper = self.path / "bootstrap-clock.sh"
+        source = (CHART / "utils/bootstrap.sh").read_text()
+        source = re.sub(r"(?<![A-Za-z0-9_])\$?SECONDS(?![A-Za-z0-9_])", "$(bootstrap_test_now)", source)
+        helper.write_text(source)
+        return helper, f"bootstrap_test_now() {{ cat {shlex.quote(str(clock))}; }}"
+
+    def test_ambiguous_completion_restarts_from_fresh_secret_snapshots(self):
+        self.state["secrets"] = {
+            "bao-root-token": self.root_secret(state="pending", mode="auto"),
+            "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
+        }
+        self.state["competing_unverified_completion"] = True
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root")
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_verified"], "true")
+        self.assertEqual(self.state["secret_versions"]["bao-recovery-keys"], 2)
+
+    def test_init_requires_remaining_job_time_in_both_scripts(self):
+        original = json.dumps(self.state)
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                self.state = json.loads(original)
+                self.state["job_active_deadline"] = 40
+                error = self.invoke(standalone=standalone, bootstrap_job="bootstrap-1", api_timeout="2",
+                                    credential_timeout="2", success=False)
+                self.assertIn("Not enough bootstrap Job time remains", error)
+                self.assertEqual(self.state["init_calls"], 0)
+                self.assertEqual(self.state["writes"], 0)
+                self.state["job_active_deadline"] = 4000
+                self.invoke(standalone=standalone, bootstrap_job="bootstrap-1", api_timeout="2", credential_timeout="2")
+                self.assertEqual(self.state["init_calls"], 1)
+                self.assertEqual(self.state["secrets"]["bao-root-token"]["root_token"], "test-root")
+
+    def test_stalled_init_request_is_bounded(self):
+        self.state["stall"] = "init"
+        started = time.monotonic()
+        self.invoke(api_timeout="2", success=False)
+        self.assertEqual(self.state_file.with_suffix(".stall").read_text(), "init")
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertEqual(self.state["writes"], 0)
+
+    def test_persistence_cannot_outlive_the_safe_job_deadline(self):
+        helper, clock = self.controlled_clock_source()
+        self.state["secret_read_clock"] = 8
+        self.invoke(function="persist_bootstrap_secret", credential_timeout="20", success=False,
+                    arguments="test bao-unseal unseal_key test-key patch", bootstrap_source=helper,
+                    extra_preamble=clock + "; bootstrap_job_deadline=7")
+        self.assertEqual(self.state["writes"], 0)
+        self.assertTrue(any(call[:2] == ["get", "secret"] for call in self.state["calls"]))
+
+    def test_final_member_checks_need_a_fresh_api_deadline(self):
+        helper, clock = self.controlled_clock_source()
+        for member in self.state["members"]:
+            member.update(initialized=True, sealed=False)
+        self.state["secrets"]["bao-root-token"] = {"root_token": "test-root"}
+        self.state.update(job_clock=5, member_clock=7)
+        options = dict(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-1", api_timeout="4",
+                       bootstrap_timeout="6", extra_preamble=clock)
+        self.invoke(**options, bootstrap_source=helper)
+        original = helper.read_text()
+        mutated = original.replace('        bootstrap_deadline=""\n        bootstrap_start_wait || return 1\n', '')
+        self.assertNotEqual(original, mutated)
+        helper.write_text(mutated)
+        self.state_file.with_suffix(".clock").write_text("0")
+        error = self.invoke(**options, bootstrap_source=helper, success=False)
+        self.assertIn("Timed out waiting for OpenBao API", error)
 
     def test_credential_persistence_budget_is_bounded(self):
         self.state["secret_read_delay"] = 10

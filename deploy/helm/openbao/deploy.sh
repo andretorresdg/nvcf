@@ -116,6 +116,7 @@ install_openbao() {
 initialize_cluster() {
     local namespace=$1
     local statefulset=$2
+    local bootstrap_deadline="" bootstrap_request_timeout=5
 
     log_section "Initializing OpenBao nodes"
 
@@ -124,10 +125,11 @@ initialize_cluster() {
     if [ "$BOOTSTRAP_INITIALIZED" = true ]; then
         return 0
     fi
+    bootstrap_prepare_initialization "$namespace" || return 1
     log_info "Initializing OpenBao cluster"
     local init_output
-    if ! init_output=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
-        bao operator init -key-shares=1 -key-threshold=1 -format=json); then
+    if ! init_output=$(bootstrap_kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
+        env BAO_CLIENT_TIMEOUT="${OPENBAO_API_TIMEOUT_SECONDS-600}s" bao operator init -key-shares=1 -key-threshold=1 -format=json); then
         log_error "OpenBao initialization failed"
         return 1
     fi

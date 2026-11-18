@@ -42,8 +42,12 @@ those gates; bootstrap and the upgrade barrier are ungated.
 sequenceDiagram
     Helm->>Kubernetes: Create StatefulSet, bootstrap scripts and bootstrap Job
     Note over Kubernetes: Members expose APIs and remain NotReady
-    Bootstrap->>OpenBao: Initialize primary and persist both credentials
-    Bootstrap->>Kubernetes: Mark credential bootstrap complete
+    Bootstrap->>Kubernetes: Read Job start time and deadline
+    Note over Bootstrap: Require init and persistence budgets before init
+    Bootstrap->>OpenBao: Initialize primary within the API budget
+    OpenBao-->>Bootstrap: Return initialization credentials
+    Bootstrap->>Kubernetes: Persist credentials within the reserved time
+    Bootstrap->>Kubernetes: Verify credentials and completion receipt
     Bootstrap->>OpenBao: Join and unseal members
     OpenBao->>Kubernetes: Members become Ready
     opt Helm --wait --wait-for-jobs
@@ -72,9 +76,12 @@ concurrent restore causes a conflict and a reread instead of an overwrite.
 The completion check also rereads the desired replica count before releasing
 the next hook.
 
-The bootstrap Job has an overall deadline of twice the API budget plus four
-credential budgets and 60 seconds for startup. The default is 1740 seconds.
-All Job retries share this deadline. Hooks check the Job first and allow a
+The bootstrap Job has an overall deadline of three times the API budget plus four
+credential budgets and 60 seconds for startup. The default is 2340 seconds.
+All Job retries share this deadline. Before init, the script reserves one API
+budget, three credential budgets and 60 seconds. It bounds the init request
+and caps later persistence at 30 seconds before Pod expiry. A late attempt
+fails before initialization if this reserve is unavailable. Hooks check the Job first and allow a
 further 60 seconds to observe termination. After Job success, the final API,
 member and credential checks get a fresh API budget. Set the Helm or Helmfile
 release timeout to cover both waits; use at least one hour with the defaults.
@@ -125,29 +132,37 @@ and namespace. Adjust `OPENBAO_SERVER_NAME` if the server fullname differs.
 The command writes a private export file and prints only its path on success.
 
 ```bash
-set -euo pipefail
-: "${KUBE_CONTEXT:?Set the target Kubernetes context}"
-: "${OPENBAO_NAMESPACE:?Set the target OpenBao namespace}"
-server=${OPENBAO_SERVER_NAME:-openbao-server}
-source deploy/helm/openbao/helm/scripts/utils/bootstrap.sh
-expected=$(kubectl --context "$KUBE_CONTEXT" -n "$OPENBAO_NAMESPACE" \
-  get secret "$server-root-token" -o json | jq -er '
-  select((.data.bootstrap_state | @base64d) == "complete" and
-         (.data.bootstrap_verified | @base64d) == "true") |
-  .data.bootstrap_credential_digest | @base64d |
-  select(test("^[a-f0-9]{64}$"))')
-umask 077
-recovery_file=$(mktemp "${TMPDIR:-/tmp}/openbao-recovery.XXXXXX")
-kubectl --context "$KUBE_CONTEXT" -n "$OPENBAO_NAMESPACE" \
-  get secret "$server-recovery-keys" -o jsonpath='{.data.recovery_keys_b64}' | \
-  base64 -d > "$recovery_file"
-actual=$(bootstrap_credential_digest auto "$(cat "$recovery_file")")
-test "$actual" = "$expected"
-printf 'Verified recovery-key export: %s\n' "$recovery_file"
+(
+  set -euo pipefail
+  : "${KUBE_CONTEXT:?Set the target Kubernetes context}"
+  : "${OPENBAO_NAMESPACE:?Set the target OpenBao namespace}"
+  server=${OPENBAO_SERVER_NAME:-openbao-server}
+  source deploy/helm/openbao/helm/scripts/utils/bootstrap.sh
+  expected=$(kubectl --context "$KUBE_CONTEXT" -n "$OPENBAO_NAMESPACE" \
+    get secret "$server-root-token" -o json | jq -er '
+    select((.data.bootstrap_state | @base64d) == "complete" and
+           (.data.bootstrap_verified | @base64d) == "true") |
+    .data.bootstrap_credential_digest | @base64d |
+    select(test("^[a-f0-9]{64}$"))')
+  umask 077
+  recovery_file=$(mktemp "${TMPDIR:-/tmp}/openbao-recovery.XXXXXX")
+  trap 'rm -f -- "$recovery_file"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  kubectl --context "$KUBE_CONTEXT" -n "$OPENBAO_NAMESPACE" \
+    get secret "$server-recovery-keys" -o jsonpath='{.data.recovery_keys_b64}' | \
+    base64 -d > "$recovery_file"
+  actual=$(bootstrap_credential_digest auto "$(cat "$recovery_file")")
+  test "$actual" = "$expected"
+  printf 'Verified recovery-key export: %s\n' "$recovery_file"
+  trap - EXIT INT TERM
+)
 ```
 
-Store the verified file in the approved recovery store before deleting the
-Secret. Older installations without a stored digest need their existing share
+Store and verify the exported file in the approved recovery store. Remove the
+private local export after that copy is verified, then delete the recovery-key
+Secret while writer exclusion still holds. Failed or interrupted verification
+removes its temporary export automatically. Older installations without a stored digest need their existing share
 verification procedure. Ask the recovery owner to verify those shares; do not
 create a digest from an unverified Secret to bypass this check.
 

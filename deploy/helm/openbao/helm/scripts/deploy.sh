@@ -233,6 +233,7 @@ install_openbao() {
 initialize_cluster() {
     local namespace=$1
     local statefulset=$2
+    local bootstrap_deadline="" bootstrap_request_timeout=5
 
     log_section "Initializing OpenBao nodes"
 
@@ -243,6 +244,7 @@ initialize_cluster() {
     if [ "$BOOTSTRAP_INITIALIZED" = true ]; then
         return 0
     fi
+    bootstrap_prepare_initialization "$namespace" || return 1
     log_info "Initializing OpenBao cluster"
     local init_output
     local root_token
@@ -253,12 +255,12 @@ initialize_cluster() {
         local recovery_shares="${RECOVERY_SHARES:-5}"
         local recovery_threshold="${RECOVERY_THRESHOLD:-3}"
         log_info "Auto-unseal seal detected; initializing with ${recovery_shares} recovery shares (threshold ${recovery_threshold})"
-        if ! init_output=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
-            bao operator init \
+        if ! init_output=$(bootstrap_kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
+            env BAO_CLIENT_TIMEOUT="${OPENBAO_API_TIMEOUT_SECONDS-600}s" bao operator init \
             -recovery-shares=${recovery_shares} \
             -recovery-threshold=${recovery_threshold} \
             -format=json); then
-            log_error "bao operator init failed. If the server is now initialized its keys were not captured; tear down with cleanup.sh and reinitialize."
+            log_error "OpenBao initialization failed; check server state and recover matching credentials before retrying"
             return 1
         fi
         root_token=$(echo ${init_output} | jq -r '.root_token')
@@ -282,12 +284,12 @@ initialize_cluster() {
         log_warn "Recovery keys stored in Secret '${statefulset}-recovery-keys'. Export them to a break-glass store and delete this Secret."
     else
         # Shamir seal: a single unseal key, stored for the auto-unseal sidecar.
-        if ! init_output=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
-            bao operator init \
+        if ! init_output=$(bootstrap_kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
+            env BAO_CLIENT_TIMEOUT="${OPENBAO_API_TIMEOUT_SECONDS-600}s" bao operator init \
             -key-shares=1 \
             -key-threshold=1 \
             -format=json); then
-            log_error "bao operator init failed. If the server is now initialized its keys were not captured; tear down with cleanup.sh and reinitialize."
+            log_error "OpenBao initialization failed; check server state and recover matching credentials before retrying"
             return 1
         fi
         local unseal_key=$(echo ${init_output} | jq -r '.unseal_keys_b64[0]')

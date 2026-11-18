@@ -41,6 +41,9 @@ bootstrap_start_wait() {
         return 1
     fi
     bootstrap_deadline=${bootstrap_deadline:-$((SECONDS + timeout))}
+    if [ -n "${bootstrap_job_deadline:-}" ] && [ "$bootstrap_deadline" -gt "$bootstrap_job_deadline" ]; then
+        bootstrap_deadline=$bootstrap_job_deadline
+    fi
 }
 
 # Credential reads and writes need a separate budget after operator init.
@@ -51,7 +54,43 @@ bootstrap_start_persistence() {
         return 1
     fi
     bootstrap_deadline=$((SECONDS + timeout))
+    if [ -n "${bootstrap_job_deadline:-}" ] && [ "$bootstrap_deadline" -gt "$bootstrap_job_deadline" ]; then
+        bootstrap_deadline=$bootstrap_job_deadline
+    fi
     bootstrap_request_timeout=$timeout
+}
+
+# Keep the init request and all three persistence phases ahead of Pod expiry.
+# bootstrap_job_deadline is shared with later per-operation budget setup.
+bootstrap_prepare_initialization() {
+    local namespace=$1 api_timeout=${OPENBAO_API_TIMEOUT_SECONDS-600}
+    local credential_timeout=${OPENBAO_CREDENTIAL_TIMEOUT_SECONDS-120} job remaining reserve
+    bootstrap_job_deadline=""
+    bootstrap_deadline=""
+    bootstrap_start_wait || return 1
+    if ! [[ $credential_timeout =~ ^[1-9][0-9]*$ ]]; then
+        log_error "OPENBAO_CREDENTIAL_TIMEOUT_SECONDS must be a positive integer"
+        return 1
+    fi
+    if [ -n "${OPENBAO_BOOTSTRAP_JOB_NAME:-}" ]; then
+        job=$(bootstrap_kubectl get job "$OPENBAO_BOOTSTRAP_JOB_NAME" -n "$namespace" -o json) || return 1
+        remaining=$(printf '%s' "$job" | jq -er '
+            select(.spec.activeDeadlineSeconds | type == "number" and . > 0 and . == floor) |
+            ((.status.startTime | fromdateiso8601) + .spec.activeDeadlineSeconds - now | floor)') || {
+            log_error "Cannot determine the remaining bootstrap Job lifetime"
+            return 1
+        }
+        reserve=$((api_timeout + 3 * credential_timeout + 60))
+        if [ "$remaining" -lt "$reserve" ]; then
+            log_error "Not enough bootstrap Job time remains to initialize and save credentials"
+            return 1
+        fi
+        # Stop client work before Kubernetes starts terminating the Pod.
+        bootstrap_job_deadline=$((SECONDS + remaining - 30))
+    fi
+    bootstrap_deadline=""
+    bootstrap_start_wait || return 1
+    bootstrap_request_timeout=$api_timeout
 }
 
 bootstrap_pause() {
@@ -243,7 +282,7 @@ complete_bootstrap_credentials() {
     local namespace=$1 statefulset=$2 mode=$3 root=$4 expected=${5:-}
     local bootstrap_deadline bootstrap_request_timeout
     bootstrap_start_persistence || return 1
-    local attempt snapshot state version owned_version saved field suffix encoded digest actual verified secondary confirmed
+    local attempt snapshot state version verification_version saved field suffix encoded digest actual verified secondary confirmed
     encoded=$(printf '%s' "$root" | base64 | tr -d '\n') || return 1
     for attempt in 1 2 3; do
         snapshot=$(bootstrap_read_secret "$namespace" "$statefulset-root-token") || return 1
@@ -283,18 +322,27 @@ complete_bootstrap_credentials() {
             log_error "Bootstrap credentials are incomplete or mismatched; recover the original '$statefulset-$suffix' credential"
             return 1
         fi
-        # Claim a specific unverified revision, including after a lost response.
-        snapshot=$(bootstrap_kubectl patch secret "$statefulset-root-token" -n "$namespace" --type=merge \
-            --patch "$(jq -cn --arg version "$version" --arg state "$(printf complete | base64 | tr -d '\n')" \
-                '{metadata: {resourceVersion: $version}, data: {bootstrap_state: $state}}')" -o json 2>/dev/null) || snapshot=""
-        if [ -z "$snapshot" ]; then snapshot=$(bootstrap_read_secret "$namespace" "$statefulset-root-token") || return 1; fi
+        # An ambiguous write can return another attempt's revision. Restart
+        # from fresh reads of both Secrets before verifying that revision.
+        if [ "$state" = pending ]; then
+            snapshot=$(bootstrap_kubectl patch secret "$statefulset-root-token" -n "$namespace" --type=merge \
+                --patch "$(jq -cn --arg version "$version" --arg state "$(printf complete | base64 | tr -d '\n')" \
+                    '{metadata: {resourceVersion: $version}, data: {bootstrap_state: $state}}')" -o json 2>/dev/null) || snapshot=""
+            if [ -z "$snapshot" ]; then
+                snapshot=$(bootstrap_read_secret "$namespace" "$statefulset-root-token") || return 1
+                if bootstrap_completion_matches "$snapshot" "$encoded" "$digest" &&
+                    [ "$(printf '%s' "$snapshot" | jq -r '.data.bootstrap_verified // "" | @base64d')" = true ]; then return 0; fi
+                if [ "$attempt" -lt 3 ]; then bootstrap_pause || true; fi
+                continue
+            fi
+        fi
         if ! bootstrap_completion_matches "$snapshot" "$encoded" "$digest"; then
             if [ "$attempt" -lt 3 ]; then bootstrap_pause || true; fi
             continue
         fi
         verified=$(printf '%s' "$snapshot" | jq -r '.data.bootstrap_verified // "" | @base64d') || return 1
         [ "$verified" != true ] || return 0
-        owned_version=$(printf '%s' "$snapshot" | jq -er '.metadata.resourceVersion') || return 1
+        verification_version=$(printf '%s' "$snapshot" | jq -er '.metadata.resourceVersion') || return 1
         # Secrets cannot be committed together. Check the secondary version and
         # data after the root CAS, then revoke completion on a concurrent change.
         confirmed=$(bootstrap_read_secret "$namespace" "$statefulset-$suffix") || confirmed='{}'
@@ -302,7 +350,7 @@ complete_bootstrap_credentials() {
             length == 2 and (.[0].metadata.uid | type == "string") and
             .[0].metadata.uid == .[1].metadata.uid and
             .[0].metadata.resourceVersion == .[1].metadata.resourceVersion and .[0].data == .[1].data' >/dev/null; then
-            reset_bootstrap_completion "$namespace" "$statefulset" "$owned_version" || true
+            reset_bootstrap_completion "$namespace" "$statefulset" "$verification_version" || true
             log_error "Bootstrap credential Secret changed during completion; refusing to continue"
             return 1
         fi
@@ -311,7 +359,7 @@ complete_bootstrap_credentials() {
             verified=$(printf '%s' "$snapshot" | jq -r '.data.bootstrap_verified // "" | @base64d') || return 1
             [ "$verified" != true ] || return 0
             version=$(printf '%s' "$snapshot" | jq -er '.metadata.resourceVersion') || return 1
-            if [ "$version" != "$owned_version" ]; then
+            if [ "$version" != "$verification_version" ]; then
                 if [ "$attempt" -lt 3 ]; then bootstrap_pause || true; fi
                 continue
             fi
@@ -463,7 +511,7 @@ wait_for_openbao_bootstrap() {
             log_error "OPENBAO_CREDENTIAL_TIMEOUT_SECONDS must be a positive integer"
             return 1
         fi
-        timeout=${OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS-$((2 * api_timeout + 4 * credential_timeout + 120))}
+        timeout=${OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS-$((3 * api_timeout + 4 * credential_timeout + 120))}
         if ! [[ $timeout =~ ^[1-9][0-9]*$ ]]; then
             log_error "OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS must be a positive integer"
             return 1
