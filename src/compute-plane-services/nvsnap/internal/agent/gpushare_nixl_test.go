@@ -30,7 +30,7 @@ func fakeNIXL(t *testing.T, out map[string]string, fail map[string]bool) *[]stri
 		calls = append(calls, c)
 		o, ok := out[verb]
 		if !ok {
-			o = "pid=7 nixl pause: ok paused engine e1, 0 transfer(s) in flight\n"
+			o = "pid=7 nixl pause: ok engine paused, NIXL connector released on 1 worker(s), UCX 1.22.0\n"
 		}
 		if fail[verb] {
 			o = "pid=7 nixl pause: err 2 RDMA device file(s) still open or mapped\nnixl-pause failed: resuming every pid\n"
@@ -76,9 +76,10 @@ func TestOptedIntoNIXLPause(t *testing.T) {
 // other than "ok no ...".
 func TestNIXLConnectorFound(t *testing.T) {
 	for out, want := range map[string]bool{
-		"pid=7 nixl pause: ok paused engine e1\npid=8 nixl pause: ok TP worker: NIXL connector released\n":   true,
-		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok no Python\n":                        false,
-		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok TP worker: NIXL connector released": true,
+		"pid=7 nixl pause: ok engine paused, NIXL connector released on 2 worker(s), UCX 1.22.0\npid=8 nixl pause: ok TP worker: NIXL connector released, UCX 1.22.0\n": true,
+		"pid=7 nixl pause: err UCX 1.19.0 is not 1.22: restored into another pod, it would keep the old pod's routes, and NIXL would reach no peer\n":                   false,
+		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok no Python\n":                                                                                   false,
+		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok TP worker: NIXL connector released":                                                            true,
 		"":                        false,
 		"warning: ok something\n": false, // not a reply line
 	} {
