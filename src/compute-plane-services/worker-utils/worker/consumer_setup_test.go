@@ -19,14 +19,17 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/hellofresh/health-go/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -224,19 +227,84 @@ func TestPhasedBackOffReset(t *testing.T) {
 }
 
 func TestServeReady(t *testing.T) {
+	measured := health.Check{
+		Status:    health.StatusOK,
+		Timestamp: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Component: health.Component{Name: "gdn-nvcf-worker-service"},
+	}
+	calls := 0
+	measure := func(context.Context) health.Check {
+		calls++
+		c := measured
+		c.Failures = maps.Clone(measured.Failures)
+		return c
+	}
 	w := &NVCFWorker{}
-	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
-	serve := func() int {
+	serve := func() (int, health.Check) {
 		rec := httptest.NewRecorder()
-		w.serveReady(rec, httptest.NewRequest(http.MethodGet, "/v1/health/ready", nil), next)
-		return rec.Code
+		w.serveReady(rec, httptest.NewRequest(http.MethodGet, "/v1/health/ready", nil), measure)
+		var got health.Check
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+		return rec.Code, got
 	}
 
-	assert.Equal(t, http.StatusOK, serve())
+	code, got := serve()
+	assert.Equal(t, http.StatusOK, code)
+	assert.Equal(t, measured.Component, got.Component)
+	assert.True(t, measured.Timestamp.Equal(got.Timestamp))
+	assert.Empty(t, got.Failures)
+
 	w.natsConsumerSetupFailing.Store(true)
-	assert.Equal(t, http.StatusServiceUnavailable, serve())
+	code, got = serve()
+	assert.Equal(t, http.StatusServiceUnavailable, code)
+	assert.Equal(t, health.StatusUnavailable, got.Status)
+	assert.Equal(t, map[string]string{"nats-consumer": "nats consumer setup is failing"}, got.Failures)
+	assert.Equal(t, measured.Component, got.Component)
+
+	measured.Status = health.StatusUnavailable
+	measured.Failures = map[string]string{"inference": "connection refused"}
+	code, got = serve()
+	assert.Equal(t, http.StatusServiceUnavailable, code)
+	assert.Equal(t, map[string]string{
+		"inference":     "connection refused",
+		"nats-consumer": "nats consumer setup is failing",
+	}, got.Failures, "keeps the other check failures")
+
 	w.natsConsumerSetupFailing.Store(false)
-	assert.Equal(t, http.StatusOK, serve(), "ready again as soon as setup succeeds")
+	code, got = serve()
+	assert.Equal(t, http.StatusServiceUnavailable, code, "other check failures still report not ready")
+	assert.Equal(t, measured.Failures, got.Failures)
+
+	measured.Status = health.StatusOK
+	measured.Failures = nil
+	code, _ = serve()
+	assert.Equal(t, http.StatusOK, code, "ready again as soon as setup succeeds")
+	assert.Equal(t, 5, calls, "the health checks run on every request")
+}
+
+func TestPublishNatsConsumer(t *testing.T) {
+	r := func(primary string, secondaries ...string) *nvcf.ConnectionRegions {
+		return &nvcf.ConnectionRegions{Primary: primary, Secondaries: secondaries}
+	}
+	c := &consumer.GlobalNatsConsumer{}
+	trigger := func() {}
+
+	t.Run("regions unchanged", func(t *testing.T) {
+		client := &nvcf.Client{}
+		client.ConnectedRegions.Store(r("a", "b"))
+		assert.True(t, publishNatsConsumer(client, c, r("a", "b"), &trigger))
+		assert.Same(t, c, client.CurrentNatsConsumer.Load())
+		assert.Same(t, &trigger, client.TriggerNewNatsConsumer.Load())
+	})
+
+	t.Run("regions changed after the consumer was built", func(t *testing.T) {
+		client := &nvcf.Client{}
+		client.ConnectedRegions.Store(r("b", "a"))
+		assert.False(t, publishNatsConsumer(client, c, r("a", "b"), &trigger))
+		assert.Same(t, c, client.CurrentNatsConsumer.Load(), "stored so a later region reload can trigger it")
+		assert.Same(t, &trigger, client.TriggerNewNatsConsumer.Load())
+	})
 }
 
 func TestSameRegions(t *testing.T) {

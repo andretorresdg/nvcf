@@ -19,6 +19,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -290,7 +291,6 @@ func NewNVCFWorker(ctx context.Context, zapLogger *logs.ZapLogger, config Config
 	shutdownCtx, shutdownCancel := context.WithCancel(ctx)
 
 	var w *NVCFWorker
-	healthReadyHandler := h.Handler()
 	w = &NVCFWorker{
 		globalCtx:               ctx,
 		shutdownCtx:             shutdownCtx,
@@ -356,7 +356,7 @@ func NewNVCFWorker(ctx context.Context, zapLogger *logs.ZapLogger, config Config
 			servers.WithRegisterServer(func(*grpc.Server) {}),
 			servers.WithHttpHealthEndpoints("/v1/health/live"),
 			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-				w.serveReady(rw, r, healthReadyHandler)
+				w.serveReady(rw, r, h.Measure)
 			})}),
 		),
 	}
@@ -567,8 +567,9 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 		// stop retrying setup when the worker starts shutting down
 		setupCtx, cancelSetup := context.WithCancel(ctx)
 		stopSetupAfterFunc := context.AfterFunc(w.shutdownCtx, cancelSetup)
+		var connectedRegion *nvcf.ConnectionRegions
 		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(), func() (*consumer.GlobalNatsConsumer, error) {
-			connectedRegion := w.nvcfClient.ConnectedRegions.Load()
+			connectedRegion = w.nvcfClient.ConnectedRegions.Load()
 			c, err := consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
 				_, err := w.nvcfClient.Client.ProvisionRegionalWorker(ctx, &pb.ProvisionWorkerRequest{
 					InstanceId:        w.config.InstanceId,
@@ -578,14 +579,7 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 				}, auth.GrpcTokenFromSource(w.nvcfClient.NvcfTokenProvider))
 				return err
 			}, w.config.FunctionVersionId, connectedRegion.Primary, connectedRegion.Secondaries, w.config.MaxRequestConcurrency)
-			if err == nil && !sameRegions(connectedRegion, w.nvcfClient.ConnectedRegions.Load()) {
-				// The region reload skips a reload while no consumer is stored, so a consumer built for regions
-				// that changed during setup would stay on them until the next reconnect refresh.
-				c, err = nil, errRegionsChangedDuringSetup
-			}
-			if !errors.Is(err, errRegionsChangedDuringSetup) {
-				w.natsConsumerSetupFailing.Store(err != nil)
-			}
+			w.natsConsumerSetupFailing.Store(err != nil)
 			return c, err
 		}, zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
 		stopSetupAfterFunc()
@@ -596,8 +590,6 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 			}
 			return types.NewInternalError(err)
 		}
-		w.nvcfClient.CurrentNatsConsumer.Store(globalNatsConsumer)
-
 		// close FetchWorkStream's ctx when region list changes to gracefully end the work stream and loop to fetch another
 		fetchCtx, cancelFetch := context.WithCancel(ctx)
 		stopAfterFunc := context.AfterFunc(w.shutdownCtx, cancelFetch)
@@ -608,7 +600,11 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 			cancelFetch()
 		}
 
-		w.nvcfClient.TriggerNewNatsConsumer.Store((*func())(&wrappedCancelFetch))
+		if !publishNatsConsumer(w.nvcfClient, globalNatsConsumer, connectedRegion, &wrappedCancelFetch) {
+			zap.L().Info("connected regions changed during nats consumer setup, setting it up again")
+			wrappedCancelFetch()
+			continue
+		}
 		inferenceHealth.CallBackFn.Store((*func())(&wrappedCancelFetch))
 
 		zap.L().Info("waiting until inference container is healthy")
@@ -753,7 +749,16 @@ func newNatsConsumerWithRetry(ctx context.Context, b backoff.BackOff, create fun
 	return c, err
 }
 
-var errRegionsChangedDuringSetup = errors.New("connected regions changed during nats consumer setup")
+// publishNatsConsumer stores the consumer and the trigger that ends its work stream, then reports whether the
+// regions it was built for are still the connected regions. The region reload stores the new regions before it
+// loads the consumer and trigger, so a region change is either seen here or triggers this consumer.
+func publishNatsConsumer(client *nvcf.Client, c *consumer.GlobalNatsConsumer, builtFor *nvcf.ConnectionRegions,
+	trigger *func(),
+) bool {
+	client.CurrentNatsConsumer.Store(c)
+	client.TriggerNewNatsConsumer.Store(trigger)
+	return sameRegions(builtFor, client.ConnectedRegions.Load())
+}
 
 func sameRegions(a, b *nvcf.ConnectionRegions) bool {
 	if a == nil || b == nil {
@@ -762,17 +767,30 @@ func sameRegions(a, b *nvcf.ConnectionRegions) bool {
 	return a.Primary == b.Primary && slices.Equal(slices.Sorted(slices.Values(a.Secondaries)), slices.Sorted(slices.Values(b.Secondaries)))
 }
 
-// serveReady reports not ready while NATS consumer setup keeps failing, for example when NATS is connected but the
-// consumer cannot be attached, so the worker does not look able to receive work. Otherwise it serves the health
-// checks. The consumer state is kept out of w.health because the inference health loop also gates fetching on it.
-func (w *NVCFWorker) serveReady(rw http.ResponseWriter, r *http.Request, next http.Handler) {
+// serveReady serves the health checks, and also reports not ready while NATS consumer setup keeps failing, for
+// example when NATS is connected but the consumer cannot be attached, so the worker does not look able to receive
+// work. The consumer state is kept out of w.health because the inference health loop also gates fetching on it.
+func (w *NVCFWorker) serveReady(rw http.ResponseWriter, r *http.Request, measure func(context.Context) health.Check) {
+	c := measure(r.Context())
 	if w.natsConsumerSetupFailing.Load() {
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = rw.Write([]byte(`{"status":"Unavailable","failures":{"nats-consumer":"nats consumer setup is failing"}}`))
+		c.Status = health.StatusUnavailable
+		if c.Failures == nil {
+			c.Failures = map[string]string{}
+		}
+		c.Failures["nats-consumer"] = "nats consumer setup is failing"
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	next.ServeHTTP(rw, r)
+	code := http.StatusOK
+	if c.Status == health.StatusUnavailable {
+		code = http.StatusServiceUnavailable
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(code)
+	_, _ = rw.Write(data)
 }
 
 // isPermanentSetupError reports whether worker provisioning rejected the
