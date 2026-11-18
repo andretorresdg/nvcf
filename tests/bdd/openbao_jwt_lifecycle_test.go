@@ -78,7 +78,7 @@ func TestOpenBaoJWTPluginLifecycle(t *testing.T) {
 	if os.Getenv("BDD_CLEANUP_MODE") != "" {
 		t.Fatal("unset BDD_CLEANUP_MODE before running this cluster-free suite")
 	}
-	runLiveFeature(t, "openbao-jwt-plugin-lifecycle.feature")
+	runLiveFeature(t, "openbao-jwt-plugin-lifecycle.feature", harness.WithoutCLI(), harness.WithTempWorkspace())
 }
 
 func TestOpenBaoUIJWTVersionFeatureFileWiresToSteps(t *testing.T) {
@@ -96,7 +96,7 @@ func TestOpenBaoUIJWTVersionFeatureFileWiresToSteps(t *testing.T) {
 				return nil
 			}
 			runner.respond = func(command string) (harness.Result, bool) {
-				return harness.Result{ExitCode: 0, Stdout: "openbao-ui-jwt-version: target-only"}, true
+				return harness.Result{ExitCode: 0, Stdout: "openbao-ui-jwt-version: target-only registry.example.com/server:fixture -> registry.example.com/migrations:fixture uses v99.1.2\n"}, true
 			}
 			sc := steps.NewScenarioContext(newWiringSuite(t, runner))
 			var out strings.Builder
@@ -129,5 +129,5 @@ func TestOpenBaoUIJWTVersion(t *testing.T) {
 	if os.Getenv("BDD_CLEANUP_MODE") != "" {
 		t.Fatal("unset BDD_CLEANUP_MODE before running this cluster-free suite")
 	}
-	runLiveFeature(t, "openbao-ui-jwt-version.feature")
+	runLiveFeature(t, "openbao-ui-jwt-version.feature", harness.WithoutCLI(), harness.WithTempWorkspace())
 }

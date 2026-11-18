@@ -66,14 +66,17 @@ func (sc *ScenarioContext) iSuccessfullyRunCommandDoc(ctx context.Context, doc *
 }
 
 func (sc *ScenarioContext) iSuccessfullyRunExecutable(ctx context.Context, executable string, table *godog.Table) error {
-	args, err := tableToSingleColumn(table, "argument")
-	if err != nil {
-		return err
+	if table == nil || len(table.Rows) < 2 || len(table.Rows[0].Cells) != 1 || table.Rows[0].Cells[0].Value != "argument" {
+		return fmt.Errorf("argument table requires an argument header and at least one data row")
 	}
-	for i := range args {
-		args[i] = dsl.Interpolate(args[i])
+	args := []string{dsl.Interpolate(executable)}
+	for i, row := range table.Rows[1:] {
+		if len(row.Cells) != 1 {
+			return fmt.Errorf("argument row %d must contain exactly one cell", i+1)
+		}
+		args = append(args, dsl.Interpolate(row.Cells[0].Value))
 	}
-	return sc.runResolvedSuccessfully(ctx, dsl.BuildCommand(append([]string{dsl.Interpolate(executable)}, args...)...))
+	return sc.runResolvedSuccessfully(ctx, dsl.BuildCommand(args...))
 }
 
 func (sc *ScenarioContext) iPollCommandUntilOutputContains(

@@ -37,7 +37,7 @@ docker_image() {
         printf '{"auths":{"nvcr.io":{}}}\n' > "$config/config.json" || return 1
       fi
       if [[ -d $original_config/contexts ]]; then
-        cp -R "$original_config/contexts" "$config/contexts" || return 1
+        cp -RH "$original_config/contexts" "$config/contexts" || return 1
       fi
       printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | DOCKER_CONFIG="$config" \
         docker login nvcr.io --username '$oauthtoken' --password-stdin >&2 || return 1

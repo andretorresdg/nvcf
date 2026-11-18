@@ -289,7 +289,9 @@ version settings. Complete this check before deploying the target-only image:
 tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed "$HELMFILE_ENV"
 ```
 
-The check freezes the selected chart and embedded values before rendering;
+The check snapshots external state-values files before discovery and shares
+that snapshot across both releases. It freezes each selected chart and its
+embedded values before rendering;
 changes to external values files cannot redirect its chart credentials.
 It renders the selected published charts, reads the target from the
 selected server image and exercises the selected migration image's mount
@@ -299,7 +301,12 @@ propagation and rejection cases with simulated images. The self-managed tag
 workflow checks the published artifacts with the optional UI enabled before
 publishing release notes and inventory assets. Dry runs skip this check.
 CI uses `NVCF_RELEASE_NGC_API_KEY` for NGC authentication with temporary Helm
-and Docker configurations.
+and Docker configurations. The chart origin must match
+`NVCF_RELEASE_HELM_REGISTRY`. NGC origins support the default HTTPS port or
+explicit port 443. Other private OCI origins require saved Helm or Docker
+credentials, a configured credential helper, or repository credentials before
+rendering. Leading and trailing whitespace and all trailing registry slashes
+are removed; empty, `.` and `..` path components are rejected.
 Legacy and bridge images retain unversioned mount support; a disabled UI has
 no UI migration check.
 

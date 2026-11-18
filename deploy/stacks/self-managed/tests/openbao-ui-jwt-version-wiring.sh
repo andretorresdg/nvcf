@@ -15,7 +15,7 @@ cp -R "$repo_root/migrations/openbao/migrations/utils" "$work/image/app/migratio
 cp "$repo_root/infra/openbao/jwt-plugin-versions.env" "$work/image/openbao/"
 export TEST_IMAGE_ROOT="$work/image" TEST_DOCKER_CALLS="$work/docker-calls"
 export TEST_MIGRATION_COMPATIBLE=true
-export NVCF_RELEASE_NGC_API_KEY=''
+export NVCF_RELEASE_NGC_API_KEY='' NVCF_RELEASE_HELM_REGISTRY=''
 export DOCKER_CONFIG="$work/operator-docker"
 mkdir -p "$DOCKER_CONFIG"
 printf '{"currentContext":"fixture-remote","credsStore":"fixture","auths":{"mirror.example.com":{}}}\n' > "$DOCKER_CONFIG/config.json"
@@ -24,6 +24,8 @@ printf '{"Name":"fixture-remote","Endpoints":{"docker":{"Host":"tcp://fixture.in
 printf 'fixture-tls\n' > "$DOCKER_CONFIG/contexts/tls/fixture/ca.pem"
 cp "$DOCKER_CONFIG/config.json" "$work/original-docker.json"
 export TEST_OPERATOR_DOCKER_CONFIG=$DOCKER_CONFIG
+export HELM_REGISTRY_CONFIG="$work/operator-helm-registry.json"
+printf '{"auths":{"registry.example.com":{"auth":"fixture-auth"}}}\n' > "$HELM_REGISTRY_CONFIG"
 # shellcheck disable=SC1091
 source "$work/image/openbao/jwt-plugin-versions.env"
 target=$JWT_PLUGIN_TARGET_VERSION old=$JWT_PLUGIN_OLD_VERSION
@@ -153,8 +155,8 @@ cat > "$TEST_AUTH_HELM" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ $1 == registry && $2 == login ]]; then
-  [[ $3 == nvcr.io && $(cat) == fixture-registry-key ]]
-  yq -e '(.auths | has("nvcr.io")) and (.credsStore == null) and (.credHelpers == null)' "$HELM_REGISTRY_CONFIG" >/dev/null
+  [[ ( $3 == nvcr.io || $3 == nvcr.io:443 ) && $(cat) == fixture-registry-key ]]
+  TEST_REGISTRY_HOST=$3 yq -e '(.auths | has(strenv(TEST_REGISTRY_HOST))) and (.credsStore == null) and (.credHelpers == null)' "$HELM_REGISTRY_CONFIG" >/dev/null
   echo oci-authenticated >> "$TEST_AUTH_LOG"
   exit
 fi
@@ -203,9 +205,13 @@ for arg in "$@"; do
   fi
   if [[ $arg == build && -n ${TEST_MUTATE_VALUES_FILE:-} ]]; then
     "$TEST_HELMFILE_BIN" "$@"
-    yq -i '.global.helm.sources.url = "https://mirror.example.com/charts" |
-      .global.helm.sources.username = "mirror-user" |
-      .global.helm.sources.password = "mirror-password"' "$TEST_MUTATE_VALUES_FILE"
+    if [[ ${TEST_MUTATE_VERSION:-false} == true ]]; then
+      TEST_TARGET_VERSION=$TEST_EXPECTED_TARGET yq -i '.addons.nvcfUi.openbaoMigrations.jwtPluginVersion = strenv(TEST_TARGET_VERSION)' "$TEST_MUTATE_VALUES_FILE"
+    else
+      yq -i '.global.helm.sources.url = "https://mirror.example.com/charts" |
+        .global.helm.sources.username = "mirror-user" |
+        .global.helm.sources.password = "mirror-password"' "$TEST_MUTATE_VALUES_FILE"
+    fi
     exit
   fi
   if [[ $arg == template ]]; then
@@ -236,6 +242,10 @@ qualify() {
 : > "$TEST_DOCKER_CALLS"
 TEST_NGC_API_KEY=fixture-registry-key qualify
 test "$(grep -c '^login nvcr.io ' "$TEST_DOCKER_CALLS")" = 1
+# A source contexts directory may itself be a relative symlink.
+mv "$DOCKER_CONFIG/contexts" "$work/shared-contexts"
+ln -s ../shared-contexts "$DOCKER_CONFIG/contexts"
+TEST_NGC_API_KEY=fixture-registry-key qualify
 # Pin distinct fixture image references to detect incorrect release selection.
 yq -i '.global.image.registry = "mirror.example.com" |
   .global.image.repository = "selected" |
@@ -265,7 +275,14 @@ test "$(grep -c ngc-authenticated "$TEST_AUTH_LOG")" = 2
 printf 'global:\n  helm:\n    sources:\n      url: https://helm.ngc.nvidia.com/nvidia/nvcf\n' > "$work/switch-values.yaml"
 TEST_AUTHENTICATE=true TEST_MUTATE_VALUES_FILE="$work/switch-values.yaml" TEST_NGC_API_KEY=fixture-registry-key \
   qualify --state-values-file "$work/switch-values.yaml"
-test "$(grep -c ngc-authenticated "$TEST_AUTH_LOG")" = 3
+test "$(grep -c ngc-authenticated "$TEST_AUTH_LOG")" = 4
+# A later edit must not mix a previously selected server with new UI values.
+printf 'addons:\n  nvcfUi:\n    openbaoMigrations:\n      jwtPluginVersion: %s\n' "$old" > "$work/switch-version.yaml"
+if TEST_MUTATE_VALUES_FILE="$work/switch-version.yaml" TEST_MUTATE_VERSION=true TEST_EXPECTED_TARGET=$target \
+  qualify --state-values-file="$work/switch-version.yaml" > "$work/result" 2>&1; then
+  fail 'accepted UI values changed after server selection'
+fi
+grep -Fq "expected $target" "$work/result"
 # Release qualification must match the inventory's OCI chart origin.
 NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify \
   --state-values-set global.helm.sources.url= \
@@ -282,6 +299,31 @@ if TEST_CHART_OUTSIDE_ORIGIN=true NVCF_RELEASE_HELM_REGISTRY=registry.example.co
   fail 'accepted chart outside the release inventory origin'
 fi
 grep -Fq 'qualified chart origin differs' "$work/result"
+# Normalize all trailing slashes and support the NGC TLS port explicitly.
+NVCF_RELEASE_HELM_REGISTRY=' nvcr.io:443/team/charts// ' TEST_NGC_API_KEY=fixture-registry-key qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=nvcr.io:443 \
+  --state-values-set global.helm.sources.repository=team/charts
+# A private release host with no credentials must fail before template.
+if NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=private.example.com \
+  --state-values-set global.helm.sources.repository=team/charts > "$work/result" 2>&1; then
+  fail 'rendered private release origin without credentials'
+fi
+grep -Fq 'no chart credentials for private.example.com' "$work/result"
+# Credential helpers are checked for the actual private host, without using an NGC key.
+cat > "$work/bin/docker-credential-fixture" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == get && $(cat) == private.example.com ]]
+printf '{"Username":"mirror-user","Secret":"mirror-password"}\n'
+BASH
+chmod +x "$work/bin/docker-credential-fixture"
+NVCF_RELEASE_HELM_REGISTRY=private.example.com/team/charts TEST_NGC_API_KEY=fixture-registry-key qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=private.example.com \
+  --state-values-set global.helm.sources.repository=team/charts
 # A lookalike hostname is still a mirror.
 TEST_AUTHENTICATE=true TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com.example.com/charts

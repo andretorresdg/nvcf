@@ -50,6 +50,8 @@ uses it for NGC chart authentication (HTTPS at `helm.ngc.nvidia.com` or OCI at
 It does not reuse `helm repo add` entries. For chart mirrors, set credentials
 in `global.helm.sources`. Authenticate Docker to image
 mirrors first; their pulls retain the existing config and credential helpers.
+The suite skips CLI state tracking and owns subprocess temporary files so
+interruption cleanup removes copied credentials after processes stop.
 Then run:
 
 ```sh

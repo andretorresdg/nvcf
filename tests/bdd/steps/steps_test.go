@@ -702,12 +702,14 @@ func TestISuccessfullyRunExecutablePreservesArguments(t *testing.T) {
 		{Cells: []*messages.PickleTableCell{{Value: "argument"}}},
 		{Cells: []*messages.PickleTableCell{{Value: "${QUOTED_PATH}"}}},
 		{Cells: []*messages.PickleTableCell{{Value: "release"}}},
+		{Cells: []*messages.PickleTableCell{{Value: ""}}},
+		{Cells: []*messages.PickleTableCell{{Value: "  "}}},
 	}}
 	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err != nil {
 		t.Fatal(err)
 	}
 	args, err := shlex.Split(fake.runs[0].command)
-	if err != nil || !slices.Equal(args, []string{"qualifier", os.Getenv("QUOTED_PATH"), "release"}) {
+	if err != nil || !slices.Equal(args, []string{"qualifier", os.Getenv("QUOTED_PATH"), "release", "", "  "}) {
 		t.Fatalf("args=%q err=%v", args, err)
 	}
 	fake.result.ExitCode = 1
@@ -716,6 +718,15 @@ func TestISuccessfullyRunExecutablePreservesArguments(t *testing.T) {
 	}
 	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", nil); err == nil {
 		t.Fatal("accepted missing argument table")
+	}
+	table.Rows[0].Cells[0].Value = "wrong-header"
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
+		t.Fatal("accepted wrong argument header")
+	}
+	table.Rows[0].Cells[0].Value = "argument"
+	table.Rows[1].Cells = append(table.Rows[1].Cells, &messages.PickleTableCell{Value: "extra"})
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
+		t.Fatal("accepted extra argument cell")
 	}
 }
 

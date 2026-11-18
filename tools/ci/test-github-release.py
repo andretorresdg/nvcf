@@ -2793,7 +2793,7 @@ class GithubReleaseTest(unittest.TestCase):
         image_overrides = re.findall(r'"(global\.image\.(?:registry|repository)=[^"]+)"',
                                     inventory_source.split("var resolvedInventoryCommonOverrides = []string{", 1)[1].split("}", 1)[0])
         self.assertEqual(len(image_overrides), 2)
-        for source in ["registry.example.com/release/charts", "registry.example.com:5000/release/charts/"]:
+        for source in ["registry.example.com/release/charts", "registry.example.com:5000/release/charts/", " nvcr.io/team/charts// \t"]:
             with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 qualifier = root / "tools/ci/qualify-openbao-ui-jwt-version"
@@ -2804,7 +2804,7 @@ class GithubReleaseTest(unittest.TestCase):
                 env = dict(os.environ, NVCF_RELEASE_HELM_REGISTRY=source, TEST_CAPTURE=str(capture))
                 subprocess.run(["bash", "-eu", "-c", script], cwd=root, env=env, check=True, capture_output=True)
                 args = json.loads(capture.read_text())
-                host, path = source.rstrip("/").split("/", 1)
+                host, path = source.strip().rstrip("/").split("/", 1)
                 for override in ["global.helm.sources.url=", f"global.helm.sources.registry={host}",
                                  f"global.helm.sources.repository={path}", *image_overrides]:
                     self.assertIn(override, args)
