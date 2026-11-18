@@ -400,7 +400,9 @@ func createWorkerClient(nvcfFqdn string, timeout time.Duration) (pb.WorkerClient
 
 func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string, nvcfTokenProvider *auth.SettableTokenSource, instanceId string, functionVersionId string) (*nats.Conn, error) {
 	const maxNatsReconnectDelay = 15 * time.Second
-	const maxNatsReconnects = 12
+	// Reconnect without limit. A closed connection is never re-created, so a limit would leave the worker
+	// disconnected for good after a long NATS outage.
+	const maxNatsReconnects = -1
 	// backoff is not thread-safe, so we need to lock it
 	expBackoffMutex := sync.Mutex{}
 	expBackoff := backoff.NewExponentialBackOff(

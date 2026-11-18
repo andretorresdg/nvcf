@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -40,7 +41,7 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 	t.Run("recovers after transient failures", func(t *testing.T) {
 		want := &consumer.GlobalNatsConsumer{}
 		attempts := 0
-		got, err := newNatsConsumerWithRetry(context.Background(), time.Minute, func() (*consumer.GlobalNatsConsumer, error) {
+		got, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
 			attempts++
 			if attempts < 3 {
 				return nil, errNatsDown
@@ -52,19 +53,34 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 		assert.Equal(t, 3, attempts)
 	})
 
-	t.Run("gives up after max elapsed time", func(t *testing.T) {
-		start := time.Now()
-		_, err := newNatsConsumerWithRetry(context.Background(), 500*time.Millisecond, func() (*consumer.GlobalNatsConsumer, error) {
+	t.Run("returns the last error when the backoff stops", func(t *testing.T) {
+		attempts := 0
+		_, err := newNatsConsumerWithRetry(context.Background(), backoff.WithMaxRetries(&backoff.ZeroBackOff{}, 2), func() (*consumer.GlobalNatsConsumer, error) {
+			attempts++
 			return nil, errNatsDown
 		})
 		require.ErrorIs(t, err, errNatsDown)
-		assert.Less(t, time.Since(start), 5*time.Second)
+		assert.Equal(t, 3, attempts)
+	})
+
+	t.Run("keeps retrying through a long outage until NATS is back", func(t *testing.T) {
+		attempts := 0
+		got, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
+			attempts++
+			if attempts < 500 {
+				return nil, errNatsDown
+			}
+			return &consumer.GlobalNatsConsumer{}, nil
+		})
+		require.NoError(t, err)
+		assert.NotNil(t, got)
+		assert.Equal(t, 500, attempts)
 	})
 
 	t.Run("stops when context is cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		attempts := 0
-		_, err := newNatsConsumerWithRetry(ctx, time.Minute, func() (*consumer.GlobalNatsConsumer, error) {
+		_, err := newNatsConsumerWithRetry(ctx, &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
 			attempts++
 			cancel()
 			return nil, errNatsDown
@@ -78,7 +94,7 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 			t.Run(code.String(), func(t *testing.T) {
 				rejected := fmt.Errorf("failed to create consumer for primary region ncp: %w", status.Error(code, "rejected"))
 				attempts := 0
-				_, err := newNatsConsumerWithRetry(context.Background(), time.Minute, func() (*consumer.GlobalNatsConsumer, error) {
+				_, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
 					attempts++
 					return nil, rejected
 				})
@@ -92,7 +108,7 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 		core, logs := observer.New(zap.WarnLevel)
 		t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
 		attempts := 0
-		_, err := newNatsConsumerWithRetry(context.Background(), time.Minute, func() (*consumer.GlobalNatsConsumer, error) {
+		_, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
 			attempts++
 			if attempts < 2 {
 				return nil, errNatsDown
@@ -103,11 +119,12 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 		entries := logs.FilterMessage("failed to set up nats consumer, retrying").All()
 		require.Len(t, entries, 1)
 		assert.Equal(t, "fn-1", entries[0].ContextMap()["function_id"])
+		assert.EqualValues(t, 1, entries[0].ContextMap()["failedAttempts"])
 	})
 
 	t.Run("retries unavailable provisioning", func(t *testing.T) {
 		attempts := 0
-		_, err := newNatsConsumerWithRetry(context.Background(), time.Minute, func() (*consumer.GlobalNatsConsumer, error) {
+		_, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
 			attempts++
 			if attempts < 2 {
 				return nil, status.Error(codes.Unavailable, "connection refused")
@@ -117,4 +134,61 @@ func TestNewNatsConsumerWithRetry(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, attempts)
 	})
+
+	t.Run("logs recovery after retrying", func(t *testing.T) {
+		core, logs := observer.New(zap.InfoLevel)
+		t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
+		attempts := 0
+		_, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
+			attempts++
+			if attempts < 3 {
+				return nil, errNatsDown
+			}
+			return &consumer.GlobalNatsConsumer{}, nil
+		}, zap.String("function_id", "fn-1"))
+		require.NoError(t, err)
+		entries := logs.FilterMessage("set up nats consumer after retrying").All()
+		require.Len(t, entries, 1)
+		assert.EqualValues(t, 2, entries[0].ContextMap()["failedAttempts"])
+		assert.Equal(t, "fn-1", entries[0].ContextMap()["function_id"])
+	})
+
+	t.Run("does not log recovery when the first attempt succeeds", func(t *testing.T) {
+		core, logs := observer.New(zap.InfoLevel)
+		t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
+		_, err := newNatsConsumerWithRetry(context.Background(), &backoff.ZeroBackOff{}, func() (*consumer.GlobalNatsConsumer, error) {
+			return &consumer.GlobalNatsConsumer{}, nil
+		})
+		require.NoError(t, err)
+		assert.Empty(t, logs.FilterMessage("set up nats consumer after retrying").All())
+	})
+}
+
+func TestNatsConsumerSetupBackOff(t *testing.T) {
+	now := time.Unix(0, 0)
+	b := newNatsConsumerSetupBackOff().(*phasedBackOff)
+	b.now = func() time.Time { return now }
+
+	maxFast := natsConsumerFastRetryMaxWait + natsConsumerFastRetryMaxWait/4
+	for now.Sub(time.Unix(0, 0)) < natsConsumerFastRetryPeriod {
+		wait := b.NextBackOff()
+		require.NotEqual(t, backoff.Stop, wait)
+		require.LessOrEqual(t, wait, maxFast, "fast phase at %s", now.Sub(time.Unix(0, 0)))
+		now = now.Add(wait)
+	}
+
+	maxSlow := natsConsumerSlowRetryMaxWait + natsConsumerSlowRetryMaxWait/4
+	sawSlow := false
+	for i := 0; i < 1000; i++ {
+		wait := b.NextBackOff()
+		require.NotEqual(t, backoff.Stop, wait, "the backoff must never stop on its own")
+		require.LessOrEqual(t, wait, maxSlow)
+		sawSlow = sawSlow || wait > maxFast
+		now = now.Add(wait)
+	}
+	assert.True(t, sawSlow, "waits grow beyond the fast limit after the fast period")
+	assert.Greater(t, now.Sub(time.Unix(0, 0)), 6*time.Hour)
+
+	b.Reset()
+	assert.LessOrEqual(t, b.NextBackOff(), maxFast, "Reset starts over with fast retries")
 }

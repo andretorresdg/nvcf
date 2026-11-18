@@ -557,7 +557,7 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 		// stop retrying setup when the worker starts shutting down
 		setupCtx, cancelSetup := context.WithCancel(ctx)
 		stopSetupAfterFunc := context.AfterFunc(w.shutdownCtx, cancelSetup)
-		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, natsConsumerSetupTimeout, func() (*consumer.GlobalNatsConsumer, error) {
+		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(), func() (*consumer.GlobalNatsConsumer, error) {
 			connectedRegion := *w.nvcfClient.ConnectedRegions.Load()
 			return consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
 				_, err := w.nvcfClient.Client.ProvisionRegionalWorker(ctx, &pb.ProvisionWorkerRequest{
@@ -644,23 +644,64 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 	}
 }
 
-// natsConsumerSetupTimeout bounds how long the worker waits for NATS to come
-// back before giving up on consumer setup and exiting. It covers a rolling
-// restart of the NATS cluster, where a member can be unreachable for tens of
-// seconds, and roughly matches how long the NATS client keeps reconnecting.
-const natsConsumerSetupTimeout = 2 * time.Minute
+// Consumer setup retries quickly at first, so the worker resumes within seconds after a short outage such as a
+// rolling restart of the NATS cluster. After natsConsumerFastRetryPeriod it retries less often, so workers that
+// wait out a long outage do not keep calling NVCF every few seconds.
+const (
+	natsConsumerFastRetryPeriod  = 2 * time.Minute
+	natsConsumerFastRetryMaxWait = 4 * time.Second
+	natsConsumerSlowRetryMaxWait = 30 * time.Second
+)
 
-// newNatsConsumerWithRetry retries consumer setup until it succeeds, ctx ends,
-// maxElapsed passes, or setup fails with an error that retrying cannot fix.
-// Without it, a NATS disconnect longer than the consumer lookup's own short
+// newNatsConsumerSetupBackOff returns the retry schedule for consumer setup. It never stops on its own: the worker
+// keeps waiting for NATS instead of exiting, because a restart does not bring an unreachable NATS back and each
+// restart counts toward replacing the whole instance. The 25% jitter keeps fast waits at or under 5s.
+func newNatsConsumerSetupBackOff() backoff.BackOff {
+	newExp := func(maxWait time.Duration) *backoff.ExponentialBackOff {
+		return backoff.NewExponentialBackOff(
+			backoff.WithMaxInterval(maxWait),
+			backoff.WithRandomizationFactor(0.25),
+			backoff.WithMaxElapsedTime(0),
+		)
+	}
+	return &phasedBackOff{
+		fast:    newExp(natsConsumerFastRetryMaxWait),
+		slow:    newExp(natsConsumerSlowRetryMaxWait),
+		fastFor: natsConsumerFastRetryPeriod,
+		now:     time.Now,
+	}
+}
+
+// phasedBackOff uses fast until fastFor has passed since the first wait, then slow.
+type phasedBackOff struct {
+	fast, slow backoff.BackOff
+	fastFor    time.Duration
+	now        func() time.Time
+	start      time.Time
+}
+
+func (b *phasedBackOff) NextBackOff() time.Duration {
+	if b.start.IsZero() {
+		b.start = b.now()
+	}
+	if b.now().Sub(b.start) < b.fastFor {
+		return b.fast.NextBackOff()
+	}
+	return b.slow.NextBackOff()
+}
+
+func (b *phasedBackOff) Reset() {
+	b.start = time.Time{}
+	b.fast.Reset()
+	b.slow.Reset()
+}
+
+// newNatsConsumerWithRetry retries consumer setup with b until it succeeds, ctx ends, b stops, or setup fails with
+// an error that retrying cannot fix. Without it, a NATS disconnect longer than the consumer lookup's own short
 // retry window exits the worker process.
-func newNatsConsumerWithRetry(ctx context.Context, maxElapsed time.Duration, create func() (*consumer.GlobalNatsConsumer, error), logFields ...zap.Field) (*consumer.GlobalNatsConsumer, error) {
-	// 4s +/- 25% jitter keeps every wait at or under 5s
-	b := backoff.NewExponentialBackOff(
-		backoff.WithMaxInterval(4*time.Second),
-		backoff.WithRandomizationFactor(0.25),
-		backoff.WithMaxElapsedTime(maxElapsed),
-	)
+func newNatsConsumerWithRetry(ctx context.Context, b backoff.BackOff, create func() (*consumer.GlobalNatsConsumer, error), logFields ...zap.Field) (*consumer.GlobalNatsConsumer, error) {
+	start := time.Now()
+	failures := 0
 	attempt := func() (*consumer.GlobalNatsConsumer, error) {
 		c, err := create()
 		if err != nil && isPermanentSetupError(err) {
@@ -668,10 +709,24 @@ func newNatsConsumerWithRetry(ctx context.Context, maxElapsed time.Duration, cre
 		}
 		return c, err
 	}
-	return backoff.RetryNotifyWithData(attempt, backoff.WithContext(b, ctx), func(err error, next time.Duration) {
-		fields := append([]zap.Field{zap.Error(err), zap.Duration("retryIn", next)}, logFields...)
+	c, err := backoff.RetryNotifyWithData(attempt, backoff.WithContext(b, ctx), func(err error, next time.Duration) {
+		failures++
+		fields := append([]zap.Field{
+			zap.Error(err),
+			zap.Duration("retryIn", next),
+			zap.Int("failedAttempts", failures),
+			zap.Duration("failingFor", time.Since(start)),
+		}, logFields...)
 		zap.L().Warn("failed to set up nats consumer, retrying", fields...)
 	})
+	if err == nil && failures > 0 {
+		fields := append([]zap.Field{
+			zap.Int("failedAttempts", failures),
+			zap.Duration("failingFor", time.Since(start)),
+		}, logFields...)
+		zap.L().Info("set up nats consumer after retrying", fields...)
+	}
+	return c, err
 }
 
 // isPermanentSetupError reports whether worker provisioning rejected the
