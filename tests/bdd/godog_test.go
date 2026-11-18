@@ -759,8 +759,22 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if !clusterGroups.called {
 		t.Fatal("init key retention scenario did not list cluster groups with the saved function API key")
 	}
-	if !initRanAfter(clusterGroups.runsBeforeCall, "--description bdd-init-keeps-api-keys") {
+	if !initRanAfter(clusterGroups.runsBeforeCall, "--description bdd-init-keeps-api-keys", "/usr/bin/nvcf-cli") {
 		t.Fatal("init key retention scenario must run init after generating its key and before listing cluster groups")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-cluster-groups",
+		"--scopes list_cluster_groups") {
+		t.Fatal("cluster groups scenario did not generate its scoped function API key")
+	}
+	// init prints the admin token and api-key generate prints the key, so
+	// every such command must drop stdout to keep secrets out of the logs.
+	for _, run := range suite.Runner.(*fakeRunner).runs {
+		prints := strings.HasSuffix(run, " init") || strings.Contains(run, " api-key generate ")
+		if strings.Contains(run, "/usr/bin/nvcf-cli --config ") && prints && !strings.Contains(run, `exec "$@" >/dev/null`) {
+			t.Fatalf("command prints a secret without dropping stdout: %s", run)
+		}
 	}
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"api-key generate --for function",
@@ -4812,21 +4826,36 @@ func (f *clusterGroupsHTTPFake) Do(ctx context.Context, method, rawURL string, h
 	return harness.HTTPResponse{Status: http.StatusOK, Body: `{"clusterGroups":[]}`}, nil
 }
 
-// initRanAfter reports whether an nvcf-cli init command ran after the first
-// command containing marker.
-func initRanAfter(runs []string, marker string) bool {
+// initRanAfter reports whether cli ran init, with the same --config, after the
+// first command containing marker.
+func initRanAfter(runs []string, marker, cli string) bool {
 	for i, run := range runs {
 		if !strings.Contains(run, marker) {
 			continue
 		}
+		config := cliConfigArg(run, cli)
+		if config == "" {
+			return false
+		}
+		want := cli + " --config " + config + " init"
 		for _, later := range runs[i+1:] {
-			if strings.HasSuffix(later, " init") {
+			if strings.HasSuffix(later, want) {
 				return true
 			}
 		}
 		return false
 	}
 	return false
+}
+
+// cliConfigArg returns the --config value that follows cli in command.
+func cliConfigArg(command, cli string) string {
+	_, rest, ok := strings.Cut(command, cli+" --config ")
+	if !ok {
+		return ""
+	}
+	config, _, _ := strings.Cut(rest, " ")
+	return config
 }
 
 func seedFunctionAPIKey(t *testing.T, home string) {

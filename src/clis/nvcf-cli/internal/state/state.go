@@ -19,6 +19,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,10 @@ import (
 
 	"nvcf-cli/internal/logging"
 )
+
+// ErrInvalidStateFile reports a state file that was read but could not be
+// parsed. Callers can tell it apart from a file that could not be read.
+var ErrInvalidStateFile = errors.New("failed to parse state file")
 
 // SelfHostedAuth caches the admin token and the control-plane fingerprint the
 // token was minted for. Persisted alongside the rest of State so that re-runs
@@ -165,7 +170,7 @@ func (sm *StateManager) Load() error {
 	// into the existing State so callers holding GetState() see the reload.
 	var loaded State
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		return fmt.Errorf("failed to parse state file: %w", err)
+		return fmt.Errorf("%w: %w", ErrInvalidStateFile, err)
 	}
 	*sm.state = loaded
 

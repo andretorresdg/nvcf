@@ -129,16 +129,15 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
     @nvca-registration
     Scenario: Operator registers the local cluster and installs the NVCA operator
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
       When I successfully run command:
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml self-hosted --control-plane-stack deploy/stacks/self-managed --env local-bdd control-plane profile export --cluster-name ncp-local
         """
       Then file "deploy/stacks/self-managed/out/control-plane-profile.yaml" should exist
 
-      When I successfully run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
-        """
+      When I successfully initialize the NVCF CLI
 
       When I successfully run command:
         """
@@ -185,10 +184,9 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
     # token. A repeated init keeps saved keys, so it cannot do this.
     @cluster-groups
     Scenario: Operator lists cluster groups with the admin token and with a scoped API key
-      When I successfully run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
-        """
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully initialize the NVCF CLI
       # init keeps a saved key for the same route, so clear any key left in
       # this fixture's state to make the first listing use the admin token.
       When I successfully run command:
@@ -202,10 +200,10 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       Then the command exit code should be 0
       And the command output should contain "Found"
 
-      When I successfully run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key generate --description bdd-cluster-groups --for function --scopes list_cluster_groups
-        """
+      When I successfully generate a function API key with CLI options:
+        | option        | value               |
+        | --description | bdd-cluster-groups  |
+        | --scopes      | list_cluster_groups |
       When I run command:
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml cluster list
@@ -225,19 +223,13 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
     Scenario: Operator keeps saved API keys when init runs again against the same deployment
       Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
 
-      When I successfully run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
-        """
+      When I successfully initialize the NVCF CLI
       When I successfully generate a function API key with CLI options:
         | option        | value                    |
         | --description | bdd-init-keeps-api-keys  |
         | --scopes      | list_cluster_groups      |
 
-      When I successfully run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
-        """
+      When I successfully initialize the NVCF CLI
       # The header step fails when init dropped the saved key, and the request
       # proves the key still works. The key never reaches argv or logs.
       Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "

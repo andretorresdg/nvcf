@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -102,12 +103,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 	// but keep each API key whose recorded route still matches: the keys are
 	// independent of the admin token, and dropping them makes later function
 	// and task commands fall back to the admin token and fail authorization.
-	// If the file cannot be read, keep no keys rather than restore an older
-	// copy, and still save the new token so init can repair a corrupt file.
+	// If the file is corrupt, keep no keys rather than restore an older copy,
+	// and still save the new token so init can repair it. Any other read error
+	// stops init before it changes the file.
 	sm := GetStateManagerForCurrentCommand()
 	prev := state.State{}
 	if err := sm.Load(); err != nil {
-		logging.Warning("Could not reload state, saved API keys are dropped: %v", err)
+		if !errors.Is(err, state.ErrInvalidStateFile) {
+			return fmt.Errorf("failed to reload state: %w", err)
+		}
+		logging.Warning("State file is corrupt, saved API keys are dropped: %v", err)
 	} else {
 		prev = *sm.GetState()
 	}
@@ -139,7 +144,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	sm.SetEndpoints(config.BaseHTTPURL, config.BaseInvokeURL, account)
 
 	if err := SaveStateForCurrentCommand(); err != nil {
-		logging.Warning("Failed to save state: %v", err)
+		return fmt.Errorf("failed to save state: %w", err)
 	}
 
 	logging.Success("Admin token generated and saved")

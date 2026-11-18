@@ -290,9 +290,9 @@ func TestInit_DoesNotRestoreKeysClearedDuringTokenRequest(t *testing.T) {
 	assert.Empty(t, got.EventLedgerAPIKey)
 }
 
-// If the state file cannot be reloaded after the token request, init must not
+// If the state file is corrupted during the token request, init must not
 // restore the keys it read earlier. It still saves the new admin token.
-func TestInit_DropsKeysWhenReloadFails(t *testing.T) {
+func TestInit_DropsKeysWhenStateFileIsCorruptedDuringTokenRequest(t *testing.T) {
 	statePath := ""
 	setupInitTest(t, func() {
 		if err := os.WriteFile(statePath, []byte("{not json"), 0o600); err != nil {
@@ -314,9 +314,9 @@ func TestInit_DropsKeysWhenReloadFails(t *testing.T) {
 	assert.Empty(t, got.EventLedgerAPIKey)
 }
 
-// A state file that is already unreadable must not block init, which is how
+// A state file that is already corrupt must not block init, which is how
 // an operator recovers from it.
-func TestInit_RepairsUnreadableStateFile(t *testing.T) {
+func TestInit_RepairsCorruptStateFile(t *testing.T) {
 	setupInitTest(t, nil)
 	statePath := filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state")
 	require.NoError(t, os.WriteFile(statePath, []byte("{not json"), 0o600))
@@ -329,6 +329,48 @@ func TestInit_RepairsUnreadableStateFile(t *testing.T) {
 	assert.Equal(t, "new-admin-token", saved.GetState().Token)
 }
 
+// A state file that exists but cannot be read is not corrupt: init must stop
+// before it changes the file, so the saved keys survive.
+func TestInit_StopsWhenStateFileIsUnreadable(t *testing.T) {
+	statePath := ""
+	setupInitTest(t, func() {
+		if err := os.Chmod(statePath, 0); err != nil {
+			t.Errorf("make state file unreadable: %v", err)
+		}
+	})
+	statePath = filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state")
+	t.Cleanup(func() { _ = os.Chmod(statePath, 0o600) })
+	seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig())
+
+	err := runInit(nil, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to reload state")
+	require.NoError(t, os.Chmod(statePath, 0o600))
+	saved := state.NewStateManager()
+	require.NoError(t, saved.Load())
+	assert.Equal(t, "old-admin-token", saved.GetState().Token, "init must not change the file")
+	assert.Equal(t, "function-key", saved.GetState().APIKey)
+}
+
+func TestInit_ReturnsErrorWhenSaveFails(t *testing.T) {
+	home := ""
+	setupInitTest(t, func() {
+		if err := os.Chmod(home, 0o500); err != nil {
+			t.Errorf("make home read-only: %v", err)
+		}
+	})
+	home = os.Getenv("HOME")
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+	applyRouteConfig(t, baseRouteConfig())
+
+	err := runInit(nil, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to save state")
+}
+
 func TestRefresh_ReplacesOnlyTheAdminToken(t *testing.T) {
 	setupInitTest(t, nil)
 	exp := seedKeys(t, baseRouteConfig(), true)
@@ -337,13 +379,65 @@ func TestRefresh_ReplacesOnlyTheAdminToken(t *testing.T) {
 
 	require.NoError(t, runRefresh(nil, nil))
 
-	got := state.DefaultStateManager.GetState()
+	saved := state.NewStateManager()
+	require.NoError(t, saved.Load())
+	got := saved.GetState()
 	assert.Equal(t, "new-admin-token", got.Token)
 	assert.Equal(t, "function-key", got.APIKey)
 	assert.True(t, exp.Equal(got.APIKeyExpiration))
 	assert.Equal(t, before.APIKeyBinding, got.APIKeyBinding)
 	assert.Equal(t, "task-key", got.NVCTAPIKey)
+	assert.True(t, exp.Equal(got.NVCTAPIKeyExpiration))
 	assert.Equal(t, before.NVCTAPIKeyBinding, got.NVCTAPIKeyBinding)
+	assert.Equal(t, "event-ledger-key", got.EventLedgerAPIKey)
+	assert.True(t, exp.Equal(got.EventLedgerAPIKeyExpiration))
+	assert.Equal(t, before.EventLedgerAPIKeyBinding, got.EventLedgerAPIKeyBinding)
+}
+
+// An api-key clear that saves while refresh waits for the admin token must not
+// be undone by refresh's final save.
+func TestRefresh_DoesNotRestoreKeysClearedDuringTokenRequest(t *testing.T) {
+	setupInitTest(t, func() {
+		other := state.NewStateManager()
+		if err := other.Load(); err != nil {
+			t.Errorf("load state in concurrent writer: %v", err)
+			return
+		}
+		other.ClearNVCTAPIKey()
+		other.SetTokens(other.GetState().Token, "", other.GetState().TokenExpiration, time.Time{})
+		if err := other.Save(); err != nil {
+			t.Errorf("save state in concurrent writer: %v", err)
+		}
+	})
+	seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runRefresh(nil, nil))
+
+	saved := state.NewStateManager()
+	require.NoError(t, saved.Load())
+	assert.Equal(t, "new-admin-token", saved.GetState().Token)
+	assert.Empty(t, saved.GetState().APIKey)
+	assert.Empty(t, saved.GetState().NVCTAPIKey)
+}
+
+func TestRefresh_FailsWithoutSavingWhenReloadFails(t *testing.T) {
+	statePath := ""
+	setupInitTest(t, func() {
+		if err := os.WriteFile(statePath, []byte("{not json"), 0o600); err != nil {
+			t.Errorf("corrupt state file: %v", err)
+		}
+	})
+	statePath = filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state")
+	seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig())
+
+	err := runRefresh(nil, nil)
+
+	require.Error(t, err)
+	data, readErr := os.ReadFile(statePath)
+	require.NoError(t, readErr)
+	assert.Equal(t, "{not json", string(data), "refresh must not save after a failed reload")
 }
 
 func assertKey(t *testing.T, keep bool, want, got string, exp time.Time) {
