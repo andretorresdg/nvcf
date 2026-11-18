@@ -20,6 +20,8 @@ package cmd
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -227,9 +229,12 @@ func TestInit_DropsOnlyKeysWhoseRouteChanged(t *testing.T) {
 		{"event_ledger_url", "http://events.other.test.local:9999", true, true, false},
 		{"event_ledger_host", "events.other.test", true, true, false},
 		{"client_id", "other-account", false, false, false},
+		// Clients trim trailing slashes, so these reach the same route.
+		{"base_nvct_url", "http://nvct.test.local:9999/", true, true, true},
+		{"event_ledger_url", "http://events.test.local:9999/", true, true, true},
 	}
 	for _, tc := range cases {
-		t.Run(tc.key, func(t *testing.T) {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
 			setupInitTest(t, nil)
 			seedKeys(t, baseRouteConfig().with(tc.key, tc.value), true)
 			applyRouteConfig(t, baseRouteConfig())
@@ -283,6 +288,62 @@ func TestInit_DoesNotRestoreKeysClearedDuringTokenRequest(t *testing.T) {
 	assert.Empty(t, got.APIKey)
 	assert.Empty(t, got.NVCTAPIKey)
 	assert.Empty(t, got.EventLedgerAPIKey)
+}
+
+// If the state file cannot be reloaded after the token request, init must not
+// restore the keys it read earlier. It still saves the new admin token.
+func TestInit_DropsKeysWhenReloadFails(t *testing.T) {
+	statePath := ""
+	setupInitTest(t, func() {
+		if err := os.WriteFile(statePath, []byte("{not json"), 0o600); err != nil {
+			t.Errorf("corrupt state file: %v", err)
+		}
+	})
+	statePath = filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state")
+	seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runInit(nil, nil))
+
+	saved := state.NewStateManager()
+	require.NoError(t, saved.Load(), "init must leave a readable state file")
+	got := saved.GetState()
+	assert.Equal(t, "new-admin-token", got.Token)
+	assert.Empty(t, got.APIKey)
+	assert.Empty(t, got.NVCTAPIKey)
+	assert.Empty(t, got.EventLedgerAPIKey)
+}
+
+// A state file that is already unreadable must not block init, which is how
+// an operator recovers from it.
+func TestInit_RepairsUnreadableStateFile(t *testing.T) {
+	setupInitTest(t, nil)
+	statePath := filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state")
+	require.NoError(t, os.WriteFile(statePath, []byte("{not json"), 0o600))
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runInit(nil, nil))
+
+	saved := state.NewStateManager()
+	require.NoError(t, saved.Load())
+	assert.Equal(t, "new-admin-token", saved.GetState().Token)
+}
+
+func TestRefresh_ReplacesOnlyTheAdminToken(t *testing.T) {
+	setupInitTest(t, nil)
+	exp := seedKeys(t, baseRouteConfig(), true)
+	before := *state.DefaultStateManager.GetState()
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runRefresh(nil, nil))
+
+	got := state.DefaultStateManager.GetState()
+	assert.Equal(t, "new-admin-token", got.Token)
+	assert.Equal(t, "function-key", got.APIKey)
+	assert.True(t, exp.Equal(got.APIKeyExpiration))
+	assert.Equal(t, before.APIKeyBinding, got.APIKeyBinding)
+	assert.Equal(t, "task-key", got.NVCTAPIKey)
+	assert.Equal(t, before.NVCTAPIKeyBinding, got.NVCTAPIKeyBinding)
 }
 
 func assertKey(t *testing.T, keep bool, want, got string, exp time.Time) {

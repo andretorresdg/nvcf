@@ -189,6 +189,12 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
         """
+      # init keeps a saved key for the same route, so clear any key left in
+      # this fixture's state to make the first listing use the admin token.
+      When I successfully run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key clear --force
+        """
       When I run command:
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml cluster list

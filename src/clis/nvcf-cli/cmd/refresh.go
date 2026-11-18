@@ -87,7 +87,7 @@ func runRefresh(cmd *cobra.Command, args []string) error {
 	}
 
 	// Update only the token, preserve function state
-	sm.SetTokens(token, currentState.APIKey, expiration, currentState.APIKeyExpiration)
+	sm.SetAdminToken(token, expiration)
 	sm.SetConfig("", config.KubeconfigPath, config.ClusterMode)
 
 	// Set endpoints - use cluster account if available, otherwise default

@@ -173,8 +173,14 @@ func eventLedgerKeyBinding(c *client.Config) string {
 	return keyBinding(c.ClientID, resolveEventLedgerURL(c.BaseHTTPURL), viper.GetString("event_ledger_host"))
 }
 
+// keyBinding ignores trailing slashes: the clients trim them before building
+// request URLs, so they do not change where a key is sent.
 func keyBinding(parts ...string) string {
-	return strings.Join(parts, "|")
+	trimmed := make([]string, len(parts))
+	for i, p := range parts {
+		trimmed[i] = strings.TrimRight(p, "/")
+	}
+	return strings.Join(trimmed, "|")
 }
 
 func runAPIKeyGenerate(cmd *cobra.Command, args []string) error {

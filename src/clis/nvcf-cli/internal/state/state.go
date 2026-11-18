@@ -161,12 +161,13 @@ func (sm *StateManager) Load() error {
 	}
 
 	// Decode into a fresh State so fields absent from the file, such as keys
-	// another command cleared, do not survive from an earlier Load.
-	loaded := &State{}
-	if err := json.Unmarshal(data, loaded); err != nil {
+	// another command cleared, do not survive from an earlier Load. Copy it
+	// into the existing State so callers holding GetState() see the reload.
+	var loaded State
+	if err := json.Unmarshal(data, &loaded); err != nil {
 		return fmt.Errorf("failed to parse state file: %w", err)
 	}
-	sm.state = loaded
+	*sm.state = loaded
 
 	return nil
 }
@@ -225,6 +226,13 @@ func (sm *StateManager) SetTokens(token, apiKey string, tokenExp, apiKeyExp time
 	sm.state.APIKey = apiKey
 	sm.state.TokenExpiration = tokenExp
 	sm.state.APIKeyExpiration = apiKeyExp
+}
+
+// SetAdminToken replaces only the admin token and its expiration. Saved API
+// keys, their expirations, and their bindings are left as loaded.
+func (sm *StateManager) SetAdminToken(token string, expiration time.Time) {
+	sm.state.Token = token
+	sm.state.TokenExpiration = expiration
 }
 
 // ClearTokens clears authentication tokens

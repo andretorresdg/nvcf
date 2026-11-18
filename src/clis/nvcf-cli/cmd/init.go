@@ -28,6 +28,7 @@ import (
 
 	"nvcf-cli/internal/client"
 	"nvcf-cli/internal/logging"
+	"nvcf-cli/internal/state"
 
 	"github.com/spf13/cobra"
 )
@@ -101,11 +102,15 @@ func runInit(cmd *cobra.Command, args []string) error {
 	// but keep each API key whose recorded route still matches: the keys are
 	// independent of the admin token, and dropping them makes later function
 	// and task commands fall back to the admin token and fail authorization.
+	// If the file cannot be read, keep no keys rather than restore an older
+	// copy, and still save the new token so init can repair a corrupt file.
 	sm := GetStateManagerForCurrentCommand()
+	prev := state.State{}
 	if err := sm.Load(); err != nil {
-		logging.Warning("Could not reload state: %v", err)
+		logging.Warning("Could not reload state, saved API keys are dropped: %v", err)
+	} else {
+		prev = *sm.GetState()
 	}
-	prev := *sm.GetState()
 	keepFunctionKey := keepKey(prev.APIKey, prev.APIKeyBinding, functionKeyBinding(config))
 	keepTaskKey := keepKey(prev.NVCTAPIKey, prev.NVCTAPIKeyBinding, taskKeyBinding(config))
 	keepEventLedgerKey := keepKey(prev.EventLedgerAPIKey, prev.EventLedgerAPIKeyBinding, eventLedgerKeyBinding(config))

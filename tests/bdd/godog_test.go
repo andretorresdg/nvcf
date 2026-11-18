@@ -696,7 +696,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	decisionRoutes.attach(runner, suite.Config.RepoRoot)
 	requestBody := newVanityRequestBodyFake("", vanityShadow)
 	requestBody.attach(runner)
-	clusterGroups := &clusterGroupsHTTPFake{next: requestBody}
+	clusterGroups := &clusterGroupsHTTPFake{next: requestBody, runner: runner}
 	suite.HTTP = clusterGroups
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile.feature")
@@ -758,6 +758,9 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	}
 	if !clusterGroups.called {
 		t.Fatal("init key retention scenario did not list cluster groups with the saved function API key")
+	}
+	if !initRanAfter(clusterGroups.runsBeforeCall, "--description bdd-init-keeps-api-keys") {
+		t.Fatal("init key retention scenario must run init after generating its key and before listing cluster groups")
 	}
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"api-key generate --for function",
@@ -4788,10 +4791,13 @@ func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 }
 
 // clusterGroupsHTTPFake answers the cluster group list for the seeded
-// function API key and passes every other request to next.
+// function API key and passes every other request to next. It records the
+// commands that ran before the list request so the test can check ordering.
 type clusterGroupsHTTPFake struct {
-	next   harness.HTTPClient
-	called bool
+	next           harness.HTTPClient
+	runner         *fakeRunner
+	called         bool
+	runsBeforeCall []string
 }
 
 func (f *clusterGroupsHTTPFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
@@ -4802,7 +4808,25 @@ func (f *clusterGroupsHTTPFake) Do(ctx context.Context, method, rawURL string, h
 		return harness.HTTPResponse{Status: http.StatusUnauthorized}, nil
 	}
 	f.called = true
+	f.runsBeforeCall = append([]string(nil), f.runner.runs...)
 	return harness.HTTPResponse{Status: http.StatusOK, Body: `{"clusterGroups":[]}`}, nil
+}
+
+// initRanAfter reports whether an nvcf-cli init command ran after the first
+// command containing marker.
+func initRanAfter(runs []string, marker string) bool {
+	for i, run := range runs {
+		if !strings.Contains(run, marker) {
+			continue
+		}
+		for _, later := range runs[i+1:] {
+			if strings.HasSuffix(later, " init") {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 func seedFunctionAPIKey(t *testing.T, home string) {
