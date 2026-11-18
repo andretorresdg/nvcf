@@ -48,7 +48,7 @@ import org.springframework.security.oauth2.core.OAuth2AuthenticationException;
 import org.springframework.security.oauth2.server.resource.InvalidBearerTokenException;
 import org.springframework.security.oauth2.server.resource.authentication.BearerTokenAuthenticationToken;
 
-// Closed JWKS ports: OAuth2AuthenticationException = routed, InvalidBearerTokenException = not.
+// Closed JWKS ports must produce temporarily_unavailable after issuer routing.
 class JwtAuthManagerConfigurationTest {
 
     private static final String PRIMARY_ISS = "http://api.nvcf.svc.cluster.local";
@@ -81,7 +81,9 @@ class JwtAuthManagerConfigurationTest {
         var resolver = resolver(properties());
 
         assertThatThrownBy(() -> authenticate(resolver, PRIMARY_ISS))
-                .isInstanceOf(OAuth2AuthenticationException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
     }
 
     @Test
@@ -89,9 +91,32 @@ class JwtAuthManagerConfigurationTest {
         var resolver = resolver(properties(trustedIssuer(EXTERNAL_ISS, EXTERNAL_JWKS)));
 
         assertThatThrownBy(() -> authenticate(resolver, EXTERNAL_ISS))
-                .isInstanceOf(OAuth2AuthenticationException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
         assertThatThrownBy(() -> authenticate(resolver, PRIMARY_ISS))
-                .isInstanceOf(OAuth2AuthenticationException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
+    }
+
+    @Test
+    void duplicatePrimaryIssuerNeverCreatesTheIgnoredDecoder() {
+        var resolver = resolver(properties(trustedIssuer(PRIMARY_ISS, "not a valid URI")));
+        assertThatThrownBy(() -> authenticate(resolver, PRIMARY_ISS))
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
+    }
+
+    @Test
+    void duplicateTrustedIssuerKeepsTheFirstDecoder() {
+        var resolver = resolver(properties(trustedIssuer(EXTERNAL_ISS, EXTERNAL_JWKS),
+                trustedIssuer(EXTERNAL_ISS, "not a valid URI")));
+        assertThatThrownBy(() -> authenticate(resolver, EXTERNAL_ISS))
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
     }
 
     @Test

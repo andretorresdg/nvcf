@@ -29,6 +29,7 @@ import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -63,6 +64,7 @@ class JwksJwtDecoderTest {
     private final AtomicReference<String> body = new AtomicReference<>();
     private volatile long delayMillis;
     private volatile boolean dripBody;
+    private volatile String errorBody;
     private final AtomicReference<String> traceParent = new AtomicReference<>();
 
     @BeforeAll
@@ -84,7 +86,8 @@ class JwksJwtDecoderTest {
                 Thread.sleep(delayMillis);
                 int code = failures.getAndUpdate(v -> Math.max(0, v - 1)) > 0
                         ? 503 : status.get();
-                byte[] payload = body.get().getBytes(StandardCharsets.UTF_8);
+                byte[] payload = (code >= 400 && errorBody != null ? errorBody : body.get())
+                        .getBytes(StandardCharsets.UTF_8);
                 exchange.sendResponseHeaders(code, payload.length);
                 if (dripBody) {
                     for (byte value : payload) {
@@ -358,23 +361,73 @@ class JwksJwtDecoderTest {
     }
 
     @Test
-    void oversizedKeySetIsRejectedWithoutRetry() throws Exception {
-        body.set(" ".repeat(256 * 1024 + 1));
-        String jwt = token(first);
+    void oversized503BodyDoesNotSuppressRecovery() throws Exception {
+        failures.set(1);
+        errorBody = "x".repeat(256 * 1024 + 1);
+        assertThat(decoder().decode(token(first)).getSubject()).isEqualTo("qa");
+        assertThat(calls).hasValue(2);
+    }
+
+    @Test
+    void stalled404BodyDoesNotTurnPermanentStatusIntoRetryableTimeout() throws Exception {
+        status.set(404);
+        dripBody = true;
         var decoder = decoder();
-        assertThatThrownBy(() -> decoder.decode(jwt)).isInstanceOf(JwtException.class);
+        String jwt = token(first);
+        assertThatThrownBy(() -> decoder.decode(jwt)).isInstanceOf(JwtException.class)
+                .satisfies(ex -> assertThat(JwksJwtDecoder.isUnavailable(ex)).isTrue());
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
+    void oversizedKeySetIsRejectedWithoutRetry() throws Exception {
+        String validKeySet = body.get();
+        String jwt = token(first);
+        assertThat(decoder().decode(jwt).getSubject()).isEqualTo("qa");
+        calls.set(0);
+        body.set(validKeySet + " ".repeat(256 * 1024 + 1));
+        var decoder = decoder();
+        assertThatThrownBy(() -> decoder.decode(jwt)).isInstanceOf(JwtException.class)
+                .satisfies(ex -> assertThat(JwksJwtDecoder.isUnavailable(ex)).isTrue());
         assertThat(calls).hasValue(1);
     }
     @Test
+    void defaultFactoriesLeaveGlobalTelemetryRegistrationUntouched() throws Exception {
+        var probe = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java")
+                .toString(), "-cp", System.getProperty("java.class.path"),
+                TelemetryFactoryProbe.class.getName()).redirectErrorStream(true).start();
+        try {
+            assertThat(probe.waitFor(15, TimeUnit.SECONDS)).isTrue();
+            assertThat(probe.exitValue())
+                    .withFailMessage(new String(probe.getInputStream().readAllBytes(),
+                            StandardCharsets.UTF_8)).isZero();
+        } finally {
+            probe.destroyForcibly();
+        }
+    }
+
+    public static class TelemetryFactoryProbe {
+        public static void main(String[] args) {
+            assertThat(GlobalOpenTelemetry.isSet()).isFalse();
+            String uri = "http://127.0.0.1:1/jwks";
+            JwksJwtDecoder.create(uri, SignatureAlgorithm.RS256);
+            JwksJwtDecoder.create(uri, SignatureAlgorithm.RS256, 1_000);
+            new RetryingJwksRetriever();
+            assertThat(GlobalOpenTelemetry.isSet()).isFalse();
+            try (var sdk = OpenTelemetrySdk.builder().buildAndRegisterGlobal()) {
+                assertThat(GlobalOpenTelemetry.isSet()).isTrue();
+            }
+        }
+    }
+
+    @Test
     void recordsBoundedMetricsAndPropagatesTraceContext() throws Exception {
-        GlobalOpenTelemetry.resetForTest();
         var spans = InMemorySpanExporter.create();
         var metrics = new SimpleMeterRegistry();
         try (var sdk = OpenTelemetrySdk.builder()
                 .setTracerProvider(SdkTracerProvider.builder()
                         .addSpanProcessor(SimpleSpanProcessor.create(spans)).build())
                 .build()) {
-            GlobalOpenTelemetry.set(sdk);
             failures.set(1);
             var decoder = JwksJwtDecoder.create("http://127.0.0.1:"
                     + server.getAddress().getPort() + "/jwks", SignatureAlgorithm.RS256,
@@ -396,8 +449,6 @@ class JwksJwtDecoderTest {
                     .mapToDouble(counter -> counter.count()).sum()).isEqualTo(2);
             assertThat(metrics.find("nvcf_jwks_fetch_duration").timers().stream()
                     .mapToLong(timer -> timer.count()).sum()).isEqualTo(2);
-        } finally {
-            GlobalOpenTelemetry.resetForTest();
         }
     }
 

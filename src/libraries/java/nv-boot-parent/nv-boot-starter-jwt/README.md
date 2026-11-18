@@ -121,8 +121,10 @@ activate signing or encryption auto-configuration. NVCF API and SIS use this
 client for their trusted static issuers. Other decoder implementations remain
 unchanged.
 
-Each key fetch has at most three attempts within a 2.5-second budget, including
-response-body reads. Connection failures, timeouts and HTTP 429/500/502/503/504
+Each key fetch has at most three retriever attempts within a 2.5-second budget,
+including response-body reads. Redirect hops and transport retries inside an
+attempt can generate additional HTTP requests. Fetch metrics count retriever
+attempts and can differ from origin request logs. Connection failures, timeouts and HTTP 429/500/502/503/504
 can retry with exponential backoff and jitter. Other HTTP failures, certificate
 errors, oversized responses and malformed key sets do not retry. Normal
 redirects remain supported within the fetch budget; HTTPS-to-HTTP downgrades

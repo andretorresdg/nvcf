@@ -56,7 +56,7 @@ final class RetryingJwksRetriever implements ResourceRetriever {
     RetryingJwksRetriever() { this(CLIENT); }
 
     RetryingJwksRetriever(HttpClient client) {
-        this(client, GlobalOpenTelemetry.get(), new SimpleMeterRegistry());
+        this(client, GlobalOpenTelemetry.getOrNoop(), new SimpleMeterRegistry());
     }
 
     RetryingJwksRetriever(OpenTelemetry telemetry, MeterRegistry metrics) {
@@ -84,7 +84,7 @@ final class RetryingJwksRetriever implements ResourceRetriever {
         long deadline = started + BUDGET_NANOS;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
-                return fetch(url, Math.min(ATTEMPT_NANOS, deadline - System.nanoTime()));
+                return fetch(url, deadline);
             } catch (IOException ex) {
                 failure = ex;
                 if (ex instanceof PermanentFailure || ex instanceof SSLException
@@ -99,6 +99,9 @@ final class RetryingJwksRetriever implements ResourceRetriever {
                 }
                 LOG.warn("JWKS fetch retry attempt={} failure_type={}",
                         attempt, ex.getClass().getSimpleName());
+                if (deadline - System.nanoTime() <= delay) {
+                    break;
+                }
                 try {
                     TimeUnit.NANOSECONDS.sleep(delay);
                 } catch (InterruptedException interrupted) {
@@ -108,15 +111,23 @@ final class RetryingJwksRetriever implements ResourceRetriever {
                 }
             }
         }
-        lastFailure = failure;
-        retryNotBefore = System.nanoTime() + FAILURE_COOLDOWN_NANOS;
+        if (!Thread.currentThread().isInterrupted()) {
+            lastFailure = failure;
+            retryNotBefore = System.nanoTime() + FAILURE_COOLDOWN_NANOS;
+        }
         throw failure;
     }
 
-    private Resource fetch(URL url, long timeoutNanos) throws IOException {
-        if (timeoutNanos <= 0) {
+    private static long remainingNanos(long deadline) throws HttpTimeoutException {
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) {
             throw new HttpTimeoutException("Signing key retrieval deadline exceeded");
         }
+        return remaining;
+    }
+
+    private Resource fetch(URL url, long fetchDeadline) throws IOException {
+        long deadline = System.nanoTime() + Math.min(ATTEMPT_NANOS, remainingNanos(fetchDeadline));
         var span = telemetry.getTracer("com.nvidia.boot.jwt").spanBuilder("jwks.fetch")
                 .setSpanKind(SpanKind.CLIENT)
                 .setAttribute("http.request.method", "GET")
@@ -128,20 +139,24 @@ final class RetryingJwksRetriever implements ResourceRetriever {
         CompletableFuture<HttpResponse<byte[]>> pending = null;
         try (var ignored = span.makeCurrent()) {
             var request = HttpRequest.newBuilder(url.toURI())
-                    .timeout(Duration.ofNanos(timeoutNanos))
+                    .timeout(Duration.ofNanos(remainingNanos(deadline)))
                     .header("Accept", "application/json, application/jwk-set+json").GET();
             W3CTraceContextPropagator.getInstance().inject(Context.current(), request,
                     (builder, name, value) -> builder.header(name, value));
-            pending = client.sendAsync(request.build(), ignoredInfo -> new LimitedBody());
-            var response = pending.get(timeoutNanos, TimeUnit.NANOSECONDS);
+            pending = client.sendAsync(request.build(), info -> {
+                int status = info.statusCode();
+                span.setAttribute("http.response.status_code", status);
+                return status >= 200 && status < 300 ? new LimitedBody() : new ErrorBody(status);
+            });
+            var response = pending.get(remainingNanos(deadline), TimeUnit.NANOSECONDS);
             int status = response.statusCode();
             span.setAttribute("http.response.status_code", status);
             if (status < 200 || status >= 300) {
-                if (status == 429 || status == 500 || status == 502 || status == 503 || status == 504) {
-                    throw new IOException("Signing key service returned HTTP " + status);
+                var failure = httpFailure(status, null);
+                if (failure instanceof PermanentFailure) {
+                    outcome = "permanent_error";
                 }
-                outcome = "permanent_error";
-                throw new PermanentFailure("Signing key service returned HTTP " + status);
+                throw failure;
             }
             lastFailure = null;
             outcome = "success";
@@ -161,6 +176,7 @@ final class RetryingJwksRetriever implements ResourceRetriever {
                 }
                 throw io;
             }
+            outcome = "permanent_error";
             throw new PermanentFailure("Signing key retrieval failed", ex.getCause());
         } catch (java.net.URISyntaxException ex) {
             outcome = "permanent_error";
@@ -178,6 +194,37 @@ final class RetryingJwksRetriever implements ResourceRetriever {
             }
             span.end();
         }
+    }
+
+    private static IOException httpFailure(int status, Throwable cause) {
+        String message = "Signing key service returned HTTP " + status;
+        return switch (status) {
+            case 429, 500, 502, 503, 504 -> new IOException(message, cause);
+            default -> new PermanentFailure(message, cause);
+        };
+    }
+
+    private static final class ErrorBody implements HttpResponse.BodySubscriber<byte[]> {
+        private final CompletableFuture<byte[]> body = new CompletableFuture<>();
+        private final int status;
+
+        private ErrorBody(int status) { this.status = status; }
+
+        @Override
+        public CompletionStage<byte[]> getBody() { return body; }
+        @Override
+        public void onSubscribe(Flow.Subscription subscription) {
+            subscription.cancel();
+            body.completeExceptionally(httpFailure(status, null));
+        }
+        @Override
+        public void onNext(List<ByteBuffer> buffers) {}
+        @Override
+        public void onError(Throwable error) {
+            body.completeExceptionally(httpFailure(status, error));
+        }
+        @Override
+        public void onComplete() { body.completeExceptionally(httpFailure(status, null)); }
     }
 
     private static final class PermanentFailure extends IOException {

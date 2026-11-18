@@ -24,7 +24,7 @@ public final class JwksJwtDecoder {
     private JwksJwtDecoder() {}
 
     public static NimbusJwtDecoder create(String uri, SignatureAlgorithm algorithm) {
-        return create(uri, algorithm, GlobalOpenTelemetry.get(), new SimpleMeterRegistry());
+        return create(uri, algorithm, GlobalOpenTelemetry.getOrNoop(), new SimpleMeterRegistry());
     }
 
     public static NimbusJwtDecoder create(String uri, SignatureAlgorithm algorithm,
@@ -35,7 +35,7 @@ public final class JwksJwtDecoder {
 
     static NimbusJwtDecoder create(String uri, SignatureAlgorithm algorithm, long cacheMillis) {
         return create(uri, algorithm, cacheMillis,
-                GlobalOpenTelemetry.get(), new SimpleMeterRegistry());
+                GlobalOpenTelemetry.getOrNoop(), new SimpleMeterRegistry());
     }
 
     static NimbusJwtDecoder create(String uri, SignatureAlgorithm algorithm, long cacheMillis,
