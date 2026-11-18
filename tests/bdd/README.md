@@ -199,7 +199,7 @@ member becomes NotReady and is excluded from the client Service EndpointSlices,
 resumes unsealing, checks routing recovery, and upgrades with a changed Job
 annotation. Cluster identity and bootstrap credential digests must remain
 unchanged. Only digests are written; credentials stay out of command text and
-output. The monitor hold also expires after 90 seconds if a later assertion
+output. The monitor hold also expires after 240 seconds if a later assertion
 fails. Stop the isolated environment after collecting diagnostics.
 This scenario does not replace the full `TestSingleClusterHA` suite.
 

@@ -37,7 +37,7 @@ Feature: Bootstrap OpenBao with strict readiness and preserve initialized state
       | openbao-server-2 | true        | false  |
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get secret openbao-server-root-token -o jsonpath='"'"'{.data.bootstrap_state}'"'"' | base64 -d' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      /bin/bash -e -o pipefail -c 'state=$(kubectl --context "$1" -n "$2" get secret openbao-server-root-token -o jsonpath='"'"'{.data.bootstrap_state}'"'"' | jq -Rer '"'"'select(@base64d == "complete")'"'"' ); test -n "$state" && printf complete' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the command output should contain "complete"
     When I successfully run command:

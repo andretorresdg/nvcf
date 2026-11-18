@@ -36,6 +36,7 @@ test "$(yq -r "$wait_job | .metadata.annotations.\"helm.sh/hook-weight\"" "$rend
 test "$(yq -r "$wait_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_WAIT_ONLY\") | .value" "$rendered")" = true
 test "$(yq -r "$wait_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_ONLY\") | .value" "$rendered")" = false
 for job in "$bootstrap_job" "$init_job" "$wait_job"; do
+    test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_JOB_NAME\") | .value" "$rendered")" = "$(yq -r "$bootstrap_job | .metadata.name" "$rendered")"
     script_map=$(yq -r "$job | .spec.template.spec.volumes[] | select(.name == \"init-script\") | .configMap.name" "$rendered")
     utils_map=$(yq -r "$job | .spec.template.spec.volumes[] | select(.name == \"utils-script\") | .configMap.name" "$rendered")
     test -n "$script_map" && test "$script_map" != null
@@ -49,6 +50,25 @@ script_map=$(yq -r "$init_job | .spec.template.spec.volumes[] | select(.name == 
 utils_map=$(yq -r "$init_job | .spec.template.spec.volumes[] | select(.name == \"utils-script\") | .configMap.name" "$rendered")
 expected_credential_timeout=$(yq -r '.openbao.hooks.initializeCluster.credentialTimeoutSeconds' "$project_dir/helm/values.yaml")
 test "$(yq -r "$bootstrap_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_CREDENTIAL_TIMEOUT_SECONDS\") | .value" "$rendered")" = "$expected_credential_timeout"
+# Zero must reach script validation; only an absent key uses the default.
+for key in credential api; do
+    expected_default=$(yq -r ".openbao.hooks.initializeCluster.${key}TimeoutSeconds" "$chart_dir/values.yaml")
+    helm template openbao "$test_root"/*.tgz --namespace test \
+        -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
+        --set "openbao.hooks.initializeCluster.${key}TimeoutSeconds=0" > "$test_root/timeout.yaml"
+    env_name=OPENBAO_CREDENTIAL_TIMEOUT_SECONDS
+    if [ "$key" = api ]; then env_name=OPENBAO_API_TIMEOUT_SECONDS; fi
+    for job in "$bootstrap_job" "$init_job" "$wait_job"; do
+        test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"$env_name\") | .value" "$test_root/timeout.yaml")" = 0
+    done
+    yq -i "del(.openbao.hooks.initializeCluster.${key}TimeoutSeconds)" "$chart_dir/values.yaml"
+    helm template openbao "$chart_dir" --namespace test \
+        -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" > "$test_root/timeout.yaml"
+    for job in "$bootstrap_job" "$init_job" "$wait_job"; do
+        test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"$env_name\") | .value" "$test_root/timeout.yaml")" = "$expected_default"
+    done
+done
+test "$(yq -r 'select(.kind == "Role") | .rules[] | select(.apiGroups[0] == "batch" and .resources[0] == "jobs") | .verbs[0]' "$rendered")" = get
 helm template openbao "$test_root"/*.tgz --namespace test \
     -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
     --set 'openbao.hooks.initializeCluster.schedulingGates[0].name=example.com/hold' > "$test_root/gated.yaml"

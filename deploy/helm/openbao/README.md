@@ -31,7 +31,8 @@ successor Pods from starting before the primary is initialized.
 With the default `OnDelete` strategy, Helm 3 `--wait` does not wait for the
 StatefulSet's Pods to become Ready. Adding `--wait-for-jobs` waits for the
 regular bootstrap Job. Independently of those flags, the post-install hook
-waits for initialized, unsealed members and the saved root token before JWT
+waits for the current bootstrap Job to succeed, initialized, unsealed members
+and the saved root token before JWT
 setup. A wait-only post-upgrade hook runs before catalog refresh and migrations.
 These hooks never initialize members. `initializeCluster.schedulingGates`
 applies only to the post-install JWT Job. An external controller must release
@@ -49,6 +50,7 @@ sequenceDiagram
         Kubernetes->>Helm: Bootstrap Job completes
     end
     Helm->>Barrier: Run post-install or post-upgrade hook
+    Barrier->>Kubernetes: Wait for current bootstrap Job success
     Barrier->>OpenBao: Wait for all current members
     Barrier->>Kubernetes: Check root token and bootstrap completion
     Barrier->>Helm: Continue JWT setup or catalog refresh and migrations
@@ -70,15 +72,33 @@ concurrent restore causes a conflict and a reread instead of an overwrite.
 The completion check also rereads the desired replica count before releasing
 the next hook.
 
-New root-token Secrets include `bootstrap_state=pending` until both bootstrap
-credentials are verified. If recovery-key persistence fails in auto-unseal
-mode, the saved root token remains available for recovery, but retries and
-hooks reject the pending state. Restore the matching recovery-key Secret before
-retrying; initialization is never repeated. A retry can mark pending state
-complete after verifying both saved credentials. Once `bootstrap_state` is
-`complete`, recovery keys can be exported and the recovery-key Secret deleted.
-Do not delete the completion field from the root-token Secret. Resolve pending
-credentials before rolling back to a chart that does not check this field.
+New root-token Secrets atomically save `bootstrap_state=pending` and a digest
+of the original unseal key or recovery shares. A retry must match that digest
+before marking completion. Completion uses a version check on the root Secret,
+then rereads the secondary Secret's UID, version and data. A concurrent change
+revokes completion. A separate `bootstrap_verified=true` receipt is saved only
+after this reread. Retries, including later release revisions, must finish
+verification when the receipt is missing. Hooks require this receipt and wait
+for the current bootstrap Job to succeed.
+
+If recovery-key persistence fails in auto-unseal mode, the saved root token
+remains available for recovery, but retries and hooks reject pending state.
+Restore the matching recovery-key Secret only if the original shares were
+saved or exported. A root token or KMS access cannot reconstruct lost shares.
+For an unused fresh cluster with no application data, an operator can explicitly
+choose to remove that cluster's data and bootstrap Secrets and initialize a
+replacement. Never apply this procedure to an existing deployment with data.
+Preserve its data, saved credentials and seal-provider configuration, and use
+the supported recovery procedure or verified backups. Resolve missing shares
+with the deployment's recovery owner before retrying. Initialization is never
+automatically repeated. Pending Secrets without the original digest require
+operator recovery; a retry cannot certify arbitrary recovery shares.
+
+Once `bootstrap_state=complete` and `bootstrap_verified=true`, recovery keys can
+be exported and the recovery-key Secret deleted.
+Do not delete the completion, digest or verification fields from the root-token
+Secret. Resolve pending credentials before rolling back to a chart that does
+not check these fields.
 
 Existing root-token Secrets without this field retain the legacy credential
 checks. Before upgrading a previously failed auto-unseal installation, verify

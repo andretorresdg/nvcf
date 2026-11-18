@@ -3,6 +3,7 @@
 
 """Bootstrap must use the local API while Kubernetes readiness is false."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -67,8 +68,17 @@ if 'exec' in a and 'cat' in a:
 if 'exec' in a and 'curl' in a:
  if 'Authorization: Bearer test-service-token' not in a: done('', 1)
  done(json.dumps({'keys':[{'kty':'RSA','n':'test','e':'AQAB'}]}))
+if 'job' in a and 'get' in a:
+ s['job_reads'] = s.get('job_reads', 0) + 1
+ if s.get('job_delay', 0):
+  s['job_delay'] -= 1; done(json.dumps({'status':{}}))
+ condition = s.get('job_state', 'Complete')
+ done(json.dumps({'status':{'conditions':[{'type':condition, 'status':'True'}]}}))
 if 'secret' in a and 'get' in a:
  name = a[a.index('secret') + 1]
+ failures = s.get('read_failures', {})
+ if failures.get(name, 0):
+  failures[name] -= 1; done('ServiceUnavailable', 1)
  if name.endswith('-root-token') and s.get('root_delay', 0):
   s['root_delay'] -= 1
   if not s['root_delay']: s['secrets'][name] = {'root_token':'test-root'}
@@ -80,7 +90,7 @@ if 'secret' in a and 'get' in a:
  if a[-1] == 'name': done(name)
  version = s.setdefault('secret_versions', {}).setdefault(name, 1)
  encoded = {k:base64.b64encode(v.encode()).decode() for k,v in data.items()}
- if a[-1] == 'json': done(json.dumps({'metadata':{'name':name, 'resourceVersion':str(version)}, 'data':encoded}))
+ if a[-1] == 'json': done(json.dumps({'metadata':{'name':name, 'uid':s.get('secret_uids', {}).get(name, name+'-uid'), 'resourceVersion':str(version)}, 'data':encoded}))
  match = re.fullmatch(r'jsonpath=\{\.data\.([^}]+)\}', a[-1])
  if match: done(encoded.get(match[1], ''))
  done('', 1)
@@ -94,6 +104,7 @@ if 'secret' in a and ('patch' in a or 'create' in a):
  versions = s.setdefault('secret_versions', {})
  if 'patch' in a:
   patch = json.loads(a[a.index('--patch') + 1])
+  if s.get('fail_verification') and base64.b64decode(patch['data'].get('bootstrap_verified', '')).decode() == 'true': done('', 1)
   if s.get('restore_before_patch') and name.endswith('-unseal'):
    s['restore_before_patch'] = False
    s['secrets'][name]['unseal_key'] = 'restored-key'
@@ -103,9 +114,20 @@ if 'secret' in a and ('patch' in a or 'create' in a):
    s['secrets'][name]['root_token'] = 'restored-root'
    versions[name] = versions.get(name, 1) + 1
   if name not in s['secrets']: done('', 1)
-  if patch.get('metadata', {}).get('resourceVersion') != str(versions.get(name, 1)): done('Conflict', 1)
+  supplied = patch.get('metadata', {}).get('resourceVersion')
+  if supplied is not None and supplied != str(versions.get(name, 1)): done('Conflict', 1)
+  if s.get('secondary_change_at_completion') and name.endswith('-root-token') and base64.b64decode(patch['data'].get('bootstrap_state', '')).decode() == 'complete':
+   change = s.pop('secondary_change_at_completion')
+   secondary = 'bao-recovery-keys'
+   if change == 'delete': del s['secrets'][secondary]
+   elif change == 'replace': s['secrets'][secondary]['recovery_keys_b64'] = '["foreign-recovery"]'
+   else: s.setdefault('secret_uids', {})[secondary] = 'replacement-uid'
+   versions[secondary] = versions.get(secondary, 1) + 1 if change != 'recreate' else 1
   s['secrets'][name].update({k:base64.b64decode(v).decode() for k,v in patch['data'].items()})
  else:
+  if s.get('restore_before_create') and name.endswith('-recovery-keys'):
+   s['restore_before_create'] = False
+   s['secrets'][name] = {'recovery_keys_b64':'["foreign-recovery"]'}
   if name in s['secrets']: done('', 1)
   # Split field=value after the flag, preserving '=' in the literal value.
   s['secrets'][name] = dict(x[len('--from-literal='):].split('=', 1) for x in a if x.startswith('--from-literal='))
@@ -151,7 +173,7 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.state_file = self.path / "state.json"
 
     def invoke(self, function="initialize_cluster", standalone=False, success=True, api_timeout="5", mode="shamir",
-               credential_timeout="120", arguments="test bao", process_timeout=8):
+               credential_timeout="120", arguments="test bao", process_timeout=8, bootstrap_source=None, bootstrap_job=""):
         self.state_file.write_text(json.dumps(self.state))
         source = REPO / "deploy/helm/openbao/deploy.sh" if standalone else CHART / "deploy.sh"
         content = source.read_text()
@@ -159,7 +181,7 @@ class BootstrapReadinessTest(unittest.TestCase):
             r"^" + function + r"\(\) \{.*?^\}", content, re.M | re.S)[0]
         if function == "get_and_save_jwt_signing_key":
             body = body.replace("/tmp/cluster.jwks", str(self.path / "cluster.jwks")).replace("/tmp/jwt.pem", str(self.path / "jwt.pem"))
-        helper = CHART / "utils/bootstrap.sh"
+        helper = bootstrap_source or CHART / "utils/bootstrap.sh"
         preamble = '\n'.join([
             'log_info() { :; }; log_error() { echo "$*" >&2; }; log_success() { :; }; log_warn() { :; }; log_section() { :; }',
             f'resolve_seal_mode() {{ RESOLVED_SEAL_MODE={mode}; }}',
@@ -171,7 +193,7 @@ class BootstrapReadinessTest(unittest.TestCase):
         ])
         env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ["PATH"],
                    BOOTSTRAP_TEST_STATE=str(self.state_file), OPENBAO_API_TIMEOUT_SECONDS=api_timeout,
-                   OPENBAO_CREDENTIAL_TIMEOUT_SECONDS=credential_timeout)
+                   OPENBAO_CREDENTIAL_TIMEOUT_SECONDS=credential_timeout, OPENBAO_BOOTSTRAP_JOB_NAME=bootstrap_job)
         process = subprocess.Popen(["bash", "-c", preamble], env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
@@ -187,16 +209,25 @@ class BootstrapReadinessTest(unittest.TestCase):
             self.assertNotEqual(process.returncode, 0, stdout)
         return stderr
 
+    @staticmethod
+    def root_secret(root="test-root", state="complete", mode="shamir", verified=True):
+        value = '["test-recovery"]' if mode == "auto" else "test-key"
+        result = {"root_token": root, "bootstrap_state": state,
+                  "bootstrap_credential_digest": hashlib.sha256(f"{mode}:{value}".encode()).hexdigest()}
+        if state == "complete":
+            result["bootstrap_verified"] = str(verified).lower()
+        return result
+
     def test_uninitialized_not_ready_members_can_be_initialized(self):
         self.invoke()
         self.assertEqual(self.state["init_calls"], 1)
-        self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": {"root_token": "test-root", "bootstrap_state": "complete"}})
+        self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": self.root_secret()})
         self.assertFalse(any("containerStatuses" in " ".join(c) for c in self.state["calls"]))
 
     def test_standalone_initializes_members_without_readiness(self):
         self.invoke(standalone=True)
         self.assertEqual(self.state["init_calls"], 1)
-        self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": {"root_token": "test-root", "bootstrap_state": "complete"}})
+        self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": self.root_secret()})
         self.assertFalse(any("containerStatuses" in " ".join(c) for c in self.state["calls"]))
 
     def test_initialized_members_reuse_saved_credentials(self):
@@ -322,8 +353,10 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.assertEqual(self.state["init_calls"], 0)
 
     def test_invalid_api_timeout_fails_before_calling_kubernetes(self):
-        self.invoke(success=False, api_timeout="0")
-        self.assertEqual(self.state["calls"], [])
+        for value in ("0", "", "-1", "invalid"):
+            with self.subTest(value=value):
+                self.invoke(success=False, api_timeout=value)
+                self.assertEqual(self.state["calls"], [])
 
     def run_script(self, standalone=False, **overrides):
         stage = self.path / "stage"
@@ -387,15 +420,15 @@ class BootstrapReadinessTest(unittest.TestCase):
                 self.state["secrets"] = {"bao-unseal": {"unseal_key": ""}}
                 self.state["write_failures"] = {"bao-unseal": 1, "bao-root-token": 1}
                 self.invoke(standalone=standalone)
-                self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": {"root_token": "test-root", "bootstrap_state": "complete"}})
+                self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": self.root_secret()})
         self.assertEqual(self.state["init_calls"], 2)
 
     def test_lost_write_responses_are_verified_without_reinitializing(self):
         self.state["lost_write_response"] = True
         self.invoke()
         self.assertEqual(self.state["init_calls"], 1)
-        self.assertEqual(self.state["writes"], 3)
-        self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": {"root_token": "test-root", "bootstrap_state": "complete"}})
+        self.assertEqual(self.state["writes"], 4)
+        self.assertEqual(self.state["secrets"], {"bao-unseal": {"unseal_key": "test-key"}, "bao-root-token": self.root_secret()})
 
     def test_root_is_saved_even_if_key_writes_keep_failing(self):
         self.state["write_failures"] = {"bao-unseal": 100}
@@ -472,6 +505,113 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.assertEqual(self.state["secrets"]["bao-unseal"]["unseal_key"], "test-key")
         self.assertEqual(self.state["writes"], 1)
 
+    def test_standalone_unseal_allows_slow_credential_read_within_phase_budget(self):
+        self.state["secret_read_delay"] = 6
+        self.state["secrets"]["bao-unseal"] = {"unseal_key": "test-key"}
+        for member in self.state["members"]:
+            member.update(initialized=True, sealed=False)
+        self.invoke(function="unseal_cluster", standalone=True, api_timeout="15", process_timeout=20)
+        self.assertTrue(self.state_file.with_suffix(".secret-read").exists())
+
+    def test_completion_retries_transient_secret_reads(self):
+        for name in ("bao-root-token", "bao-recovery-keys"):
+            with self.subTest(name=name):
+                self.state["secrets"] = {
+                    "bao-root-token": self.root_secret(state="pending", mode="auto"),
+                    "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
+                }
+                self.state["read_failures"] = {name: 1}
+                self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root")
+                self.assertEqual(self.state["read_failures"][name], 0)
+                self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "complete")
+
+    def test_pending_retry_rejects_foreign_recovery_keys_created_during_init(self):
+        self.state["secrets"].clear()
+        self.state["restore_before_create"] = True
+        self.invoke(mode="auto", success=False)
+        self.assertEqual(self.state["secrets"]["bao-root-token"], self.root_secret(state="pending", mode="auto"))
+        for member in self.state["members"]:
+            member.update(initialized=True, sealed=False, recovery_seal=True)
+        self.invoke(mode="auto", success=False)
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "pending")
+        self.assertEqual(self.state["init_calls"], 1)
+
+    def test_pending_retry_requires_original_digest(self):
+        self.state["secrets"] = {
+            "bao-root-token": {"root_token": "test-root", "bootstrap_state": "pending"},
+            "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
+        }
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root", success=False)
+        self.assertEqual(self.state["writes"], 0)
+
+    def test_secondary_delete_replace_and_recreate_revoke_completion(self):
+        for change in ("delete", "replace", "recreate"):
+            with self.subTest(change=change):
+                self.state["secrets"] = {
+                    "bao-root-token": self.root_secret(state="pending", mode="auto"),
+                    "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
+                }
+                self.state["secret_versions"] = {}
+                self.state["secret_uids"] = {}
+                self.state["secondary_change_at_completion"] = change
+                self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root", success=False)
+                self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "pending")
+
+    def test_later_job_retry_cannot_skip_failed_post_write_verification(self):
+        self.state["secrets"] = {
+            "bao-root-token": self.root_secret(mode="auto", verified=False),
+            "bao-recovery-keys": {"recovery_keys_b64": '["foreign-recovery"]'},
+        }
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root",
+                    bootstrap_job="bootstrap-2", success=False)
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "pending")
+
+    def test_failed_receipt_write_blocks_hooks_and_requires_reverification(self):
+        self.state["secrets"].clear()
+        self.state["fail_verification"] = True
+        self.invoke(mode="auto", success=False, bootstrap_job="bootstrap-1")
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "complete")
+        self.assertNotEqual(self.state["secrets"]["bao-root-token"].get("bootstrap_verified"), "true")
+        for member in self.state["members"]:
+            member.update(initialized=True, sealed=False, recovery_seal=True)
+        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-1", api_timeout="2", success=False)
+        self.state["fail_verification"] = False
+        self.state["secrets"]["bao-recovery-keys"]["recovery_keys_b64"] = '["foreign-recovery"]'
+        self.invoke(mode="auto", bootstrap_job="bootstrap-2", success=False)
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "pending")
+        self.assertEqual(self.state["init_calls"], 1)
+
+    def test_hook_waits_for_current_bootstrap_job_and_rejects_failed_job(self):
+        for member in self.state["members"]:
+            member.update(initialized=True, sealed=False)
+        self.state["secrets"]["bao-root-token"] = {"root_token": "test-root"}
+        self.state["job_state"] = "Pending"
+        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2", api_timeout="2", success=False)
+        self.state["job_state"] = "Failed"
+        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2", success=False)
+        self.state["job_state"] = "Complete"
+        self.state["job_delay"] = 1
+        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2")
+        self.assertEqual(self.state["job_delay"], 0)
+        self.assertEqual(self.state["writes"], 0)
+        self.assertTrue(all(call[call.index("job") + 1] == "bootstrap-2"
+                            for call in self.state["calls"] if "job" in call))
+
+    def test_fake_allows_unconditional_merge_and_detects_missing_cas_guards(self):
+        mutated = self.path / "bootstrap-without-cas.sh"
+        source = (CHART / "utils/bootstrap.sh").read_text()
+        mutated.write_text(source.replace('{metadata: {resourceVersion: $version}, data:', '{data:'))
+        self.state["restore_before_patch"] = True
+        self.invoke(bootstrap_source=mutated)
+        self.assertEqual(self.state["secrets"]["bao-unseal"]["unseal_key"], "test-key")
+        # Removing only the root CAS must also violate the restored pending state.
+        self.state["members"][0]["initialized"] = False
+        self.state["secrets"] = {"bao-unseal": {"unseal_key": ""}}
+        self.state["restore_root_before_complete"] = True
+        self.invoke(bootstrap_source=mutated, success=False)
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["root_token"], "restored-root")
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "complete")
+
     def test_credential_persistence_budget_is_bounded(self):
         self.state["secret_read_delay"] = 10
         started = time.monotonic()
@@ -482,8 +622,10 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.assertEqual(self.state["writes"], 0)
 
     def test_invalid_credential_timeout_fails_before_init(self):
-        self.invoke(credential_timeout="0", success=False)
-        self.assertEqual(self.state["init_calls"], 0)
+        for value in ("0", "", "-1", "invalid"):
+            with self.subTest(value=value):
+                self.invoke(credential_timeout=value, success=False)
+                self.assertEqual(self.state["init_calls"], 0)
 
     def test_secret_compare_and_swap_preserves_a_concurrent_restore(self):
         self.state["restore_before_patch"] = True
@@ -496,14 +638,14 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.state["restore_root_before_complete"] = True
         self.invoke(success=False)
         self.assertEqual(self.state["secrets"]["bao-root-token"],
-                         {"root_token": "restored-root", "bootstrap_state": "pending"})
+                         self.root_secret(root="restored-root", state="pending"))
 
     def test_auto_seal_missing_recovery_keys_blocks_retry_and_hook(self):
         self.state["secrets"].clear()
         self.state["write_failures"] = {"bao-recovery-keys": 100}
         self.invoke(mode="auto", success=False)
         self.assertEqual(self.state["secrets"]["bao-root-token"],
-                         {"root_token": "test-root", "bootstrap_state": "pending"})
+                         self.root_secret(state="pending", mode="auto"))
         for member in self.state["members"]:
             member.update(initialized=True, sealed=False, recovery_seal=True)
         self.invoke(mode="auto", success=False)
@@ -515,16 +657,16 @@ class BootstrapReadinessTest(unittest.TestCase):
         for member in self.state["members"]:
             member.update(initialized=True, sealed=False, recovery_seal=True)
         self.state["secrets"] = {
-            "bao-root-token": {"root_token": "test-root", "bootstrap_state": "pending"},
+            "bao-root-token": self.root_secret(state="pending", mode="auto"),
             "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
         }
-        self.invoke(mode="auto")
+        self.invoke(mode="auto", bootstrap_job="bootstrap-1")
         self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "complete")
         del self.state["secrets"]["bao-recovery-keys"]
-        self.invoke(mode="auto")
+        self.invoke(mode="auto", bootstrap_job="bootstrap-2")
         self.invoke(function="wait_for_openbao_bootstrap")
         self.assertEqual(self.state["init_calls"], 0)
-        self.assertEqual(self.state["writes"], 1)
+        self.assertEqual(self.state["writes"], 2)
 
     def test_hook_checks_members_added_after_the_initial_snapshot(self):
         for member in self.state["members"]:
@@ -584,7 +726,7 @@ kill() {
     fi
 }
 sleep() {
-    if test "$1" = 90; then : > "$MONITOR_TEST_DIR/watchdog"; fi
+    if test "$1" = 240; then : > "$MONITOR_TEST_DIR/watchdog"; fi
 }
 """
 sys.exit(subprocess.run(['sh', '-ec', prefix + script, 'qa-monitor', a[-1]]).returncode)
@@ -616,6 +758,9 @@ class BootstrapFeatureAssertionsTest(unittest.TestCase):
 import json, os, sys
 if 'endpointslices' in sys.argv:
  print(os.environ['FEATURE_ENDPOINTS'])
+elif 'secret' in sys.argv:
+ print(os.environ['FEATURE_BOOTSTRAP_STATE'], end='')
+ print(os.environ.get('FEATURE_STDERR', ''), file=sys.stderr)
 elif 'secrets' in sys.argv:
  print(json.dumps({'items': []}))
 else:
@@ -635,15 +780,28 @@ else:
                               env=env, capture_output=True, text=True, timeout=5)
 
     def test_both_cluster_snapshots_reject_missing_or_invalid_ids(self):
-        for status in ({}, {"cluster_id": ""}, {"cluster_id": 123}):
+        # Match the invalid baseline and credential hash so cmp cannot hide a
+        # missing validation in the after-snapshot command.
+        credential_digest = hashlib.sha256(b"[]\n").hexdigest() + "  -\n"
+        for status, baseline in (({}, "null\n"), ({"cluster_id": ""}, "\n"), ({"cluster_id": 123}, "123\n")):
             for snapshot in ("cluster-id-before", "cluster-id-after"):
                 with self.subTest(status=status, snapshot=snapshot):
+                    (self.path / "cluster-id-before").write_text(baseline)
+                    (self.path / "credentials-before").write_text(credential_digest)
                     result = self.run_feature_command(snapshot, FEATURE_STATUS=json.dumps(status))
                     self.assertNotEqual(result.returncode, 0)
                     self.assertNotIn("state=preserved", result.stdout)
         for snapshot in ("cluster-id-before", "cluster-id-after"):
             result = self.run_feature_command(snapshot, FEATURE_STATUS='{"cluster_id":"test-cluster"}')
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_completion_assertion_rejects_every_state_except_complete(self):
+        import base64
+        for state in ("pending", "incomplete", "", "complete\n", "complete"):
+            with self.subTest(state=state):
+                result = self.run_feature_command("bootstrap_state", FEATURE_BOOTSTRAP_STATE=base64.b64encode(state.encode()).decode(),
+                                                  FEATURE_STDERR="complete")
+                self.assertEqual(result.returncode == 0, state == "complete", result.stderr)
 
     def test_exclusion_requires_another_ready_openbao_member(self):
         def endpoint(name, ready):

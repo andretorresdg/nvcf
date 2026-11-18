@@ -35,7 +35,7 @@ kubectl --context "$context" -n "$namespace" exec "$pod" -c auto-unseal-sidecar 
                     continue
                 fi
                 # Recover even when a later scenario assertion fails.
-                (sleep 90; kill -CONT "$pid" 2>/dev/null || true) </dev/null >/dev/null 2>&1 &
+                (sleep 240; kill -CONT "$pid" 2>/dev/null || true) </dev/null >/dev/null 2>&1 &
             else
                 kill -CONT "$pid" 2>/dev/null || continue
             fi

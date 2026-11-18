@@ -21,6 +21,15 @@
 # - jq
 # - jwker
 {{- $serverFullname := include "nvcf-openbao.serverFullname" . }}
+{{- $bootstrapJobName := printf "%s-bootstrap-%d" ($serverFullname | trunc 40 | trimSuffix "-") .Release.Revision }}
+{{- $credentialTimeout := 120 }}
+{{- if hasKey .Values.openbao.hooks.initializeCluster "credentialTimeoutSeconds" }}
+{{- $credentialTimeout = .Values.openbao.hooks.initializeCluster.credentialTimeoutSeconds }}
+{{- end }}
+{{- $apiTimeout := 600 }}
+{{- if hasKey .Values.openbao.hooks.initializeCluster "apiTimeoutSeconds" }}
+{{- $apiTimeout = .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds }}
+{{- end }}
 {{- $root := . }}
 {{- if ne .Values.openbao.server.podManagementPolicy "Parallel" }}
 {{- fail "OpenBao bootstrap requires openbao.server.podManagementPolicy=Parallel" }}
@@ -32,7 +41,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ if $bootstrapOnly }}{{ printf "%s-bootstrap-%d" ($serverFullname | trunc 40 | trimSuffix "-") .Release.Revision }}{{ else if $waitOnly }}{{ $serverFullname }}-wait-bootstrap{{ else }}{{ $serverFullname }}-initialize-cluster{{ end }}
+  name: {{ if $bootstrapOnly }}{{ $bootstrapJobName }}{{ else if $waitOnly }}{{ $serverFullname }}-wait-bootstrap{{ else }}{{ $serverFullname }}-initialize-cluster{{ end }}
   namespace: {{ include "nvcf-openbao.namespace" . }}
   labels:
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -83,12 +92,14 @@ spec:
             {{- include "nvcf-openbao.kubectlEnv" . | nindent 12 }}
             - name: OPENBAO_BOOTSTRAP_ONLY
               value: {{ $bootstrapOnly | quote }}
+            - name: OPENBAO_BOOTSTRAP_JOB_NAME
+              value: {{ $bootstrapJobName | quote }}
             - name: OPENBAO_WAIT_ONLY
               value: {{ $waitOnly | quote }}
             - name: OPENBAO_API_TIMEOUT_SECONDS
-              value: {{ .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds | default 600 | quote }}
+              value: {{ $apiTimeout | quote }}
             - name: OPENBAO_CREDENTIAL_TIMEOUT_SECONDS
-              value: {{ .Values.openbao.hooks.initializeCluster.credentialTimeoutSeconds | default 120 | quote }}
+              value: {{ $credentialTimeout | quote }}
             - name: JWT_PLUGIN_LIFECYCLE_MODE
               value: {{ include "nvcf-openbao.jwtLifecycleMode" . | quote }}
             - name: AUTO_UNSEAL
