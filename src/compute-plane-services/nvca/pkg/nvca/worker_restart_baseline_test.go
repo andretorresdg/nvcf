@@ -19,6 +19,7 @@ package nvca
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -26,8 +27,10 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	fakek8sclient "k8s.io/client-go/kubernetes/fake"
 	listersv1 "k8s.io/client-go/listers/core/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
@@ -99,5 +102,50 @@ func TestRecordWorkerRestartBaselines(t *testing.T) {
 		got, err := client.CoreV1().Pods("nvcf-backend").Get(context.Background(), "crashed", metav1.GetOptions{})
 		require.NoError(t, err)
 		assert.Equal(t, "3", got.Annotations[k8sutil.WorkerRestartCountBaselineAnnotationKey])
+	})
+
+	t.Run("failed patch keeps the baseline after a short run replaces the long one", func(t *testing.T) {
+		pod := newPod("patch-fails", reqLabels, 2, time.Minute)
+		pod.UID = "patch-fails-uid"
+		pod.CreationTimestamp = metav1.NewTime(now.Add(-3 * time.Hour))
+		t.Cleanup(func() { k8sutil.ForgetWorkerRestartBaseline(pod.UID) })
+		pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+		}
+		pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   2,
+				StartedAt:  metav1.NewTime(now.Add(-2 * time.Hour)),
+				FinishedAt: metav1.NewTime(now.Add(-time.Minute)),
+			},
+		}
+		client := fakek8sclient.NewSimpleClientset(pod)
+		client.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("webhook unavailable")
+		})
+
+		recordWorkerRestartBaseline(context.Background(), client, pod, now)
+
+		// The next run crashes quickly, so only that short run is left in the termination state.
+		crashed := pod.DeepCopy()
+		crashed.Status.ContainerStatuses[0].RestartCount = 4
+		crashed.Status.ContainerStatuses[0].LastTerminationState.Terminated.StartedAt = metav1.NewTime(now.Add(-time.Minute))
+		cfg := (&k8sutil.TimeConfig{WorkerContainerRestartCountToFailInstance: 3}).Complete()
+		assert.False(t, k8sutil.IsContainerInRestartLoop(crashed, crashed.Status.ContainerStatuses[0], cfg))
+
+		client.ReactionChain = client.ReactionChain[1:]
+		recordWorkerRestartBaseline(context.Background(), client, crashed, now)
+		got, err := client.CoreV1().Pods("nvcf-backend").Get(context.Background(), "patch-fails", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "2", got.Annotations[k8sutil.WorkerRestartCountBaselineAnnotationKey])
+
+		// Once the Pod shows the recorded baseline, the retained one is dropped and the annotation is used.
+		recorded := crashed.DeepCopy()
+		recorded.Annotations = got.Annotations
+		_, ok := k8sutil.WorkerRestartCountBaselineToRecord(recorded, now)
+		assert.False(t, ok)
+		assert.False(t, k8sutil.IsContainerInRestartLoop(recorded, recorded.Status.ContainerStatuses[0], cfg))
+		recorded.Annotations = nil
+		assert.True(t, k8sutil.IsContainerInRestartLoop(recorded, recorded.Status.ContainerStatuses[0], cfg))
 	})
 }

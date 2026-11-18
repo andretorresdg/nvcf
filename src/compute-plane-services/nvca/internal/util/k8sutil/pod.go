@@ -22,12 +22,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apitypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 )
@@ -335,6 +337,9 @@ func WorkerRestartCountBaselineToRecord(pod *corev1.Pod, now time.Time) (int32, 
 		}
 		recorded, present := parseWorkerRestartCountBaseline(pod)
 		healthy, ok := healthyWorkerRestartCount(pod.Status, cs, now)
+		if pending, pok := pendingWorkerRestartBaselines.get(pod, cs.RestartCount); pok && (!ok || pending > healthy) {
+			healthy, ok = pending, true
+		}
 		if present && recorded > cs.RestartCount {
 			if !ok {
 				healthy = 0
@@ -359,7 +364,68 @@ func workerRestartCountBaseline(pod *corev1.Pod, cs corev1.ContainerStatus, now 
 	if healthy, ok := healthyWorkerRestartCount(pod.Status, cs, now); ok && healthy > baseline {
 		baseline = healthy
 	}
+	if pending, ok := pendingWorkerRestartBaselines.get(pod, cs.RestartCount); ok && pending > baseline {
+		baseline = pending
+	}
 	return baseline
+}
+
+// pendingWorkerRestartBaselines holds the worker restart baselines that NVCA detected but has not yet seen recorded
+// on their Pod. A failed or delayed annotation patch then does not lose a baseline when the next restart replaces the
+// termination state it was detected from.
+var pendingWorkerRestartBaselines = &workerRestartBaselineStore{baselines: map[apitypes.UID]int32{}}
+
+type workerRestartBaselineStore struct {
+	mu        sync.Mutex
+	baselines map[apitypes.UID]int32
+}
+
+// RetainWorkerRestartBaseline keeps the worker restart baseline detected for a Pod until the Pod shows it recorded in
+// WorkerRestartCountBaselineAnnotationKey, the worker's RestartCount drops below it, or the Pod is deleted.
+func RetainWorkerRestartBaseline(pod *corev1.Pod, baseline int32) {
+	pendingWorkerRestartBaselines.retain(pod.UID, baseline)
+}
+
+// ForgetWorkerRestartBaseline drops the retained worker restart baseline of a deleted Pod.
+func ForgetWorkerRestartBaseline(uid apitypes.UID) {
+	pendingWorkerRestartBaselines.forget(uid)
+}
+
+func (s *workerRestartBaselineStore) retain(uid apitypes.UID, baseline int32) {
+	if uid == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if baseline > s.baselines[uid] {
+		s.baselines[uid] = baseline
+	}
+}
+
+func (s *workerRestartBaselineStore) forget(uid apitypes.UID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.baselines, uid)
+}
+
+// get returns the retained baseline for the Pod, and drops it once the Pod has it recorded or the worker's
+// RestartCount is below it.
+func (s *workerRestartBaselineStore) get(pod *corev1.Pod, restartCount int32) (int32, bool) {
+	if pod.UID == "" {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	baseline, ok := s.baselines[pod.UID]
+	if !ok {
+		return 0, false
+	}
+	if recorded, present := parseWorkerRestartCountBaseline(pod); baseline > restartCount ||
+		(present && recorded >= baseline && recorded <= restartCount) {
+		delete(s.baselines, pod.UID)
+		return 0, false
+	}
+	return baseline, true
 }
 
 // parseWorkerRestartCountBaseline returns the baseline recorded on the Pod, and false when it is missing or invalid.

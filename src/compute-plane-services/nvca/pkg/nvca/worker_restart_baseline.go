@@ -87,8 +87,9 @@ func recordWorkerRestartBaselines(ctx context.Context, client kubernetes.Interfa
 }
 
 // recordWorkerRestartBaseline records the worker restart baseline on a function Pod when it changed. It is also
-// called on every Pod update, so a healthy run that just ended is recorded before the next restart replaces its
-// termination state.
+// called on every Pod update, so a healthy run that just ended is detected before the next restart replaces its
+// termination state. The detected baseline is retained in memory until the Pod shows it, so the restart check uses
+// it and later calls retry the patch with it even if the patch fails.
 func recordWorkerRestartBaseline(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, now time.Time) {
 	reqID, ok := pod.Labels[nvcatypes.ICMSRequestIDKey]
 	if !ok {
@@ -98,6 +99,7 @@ func recordWorkerRestartBaseline(ctx context.Context, client kubernetes.Interfac
 	if !ok {
 		return
 	}
+	k8sutil.RetainWorkerRestartBaseline(pod, baseline)
 	log := core.GetLogger(ctx).WithFields(logrus.Fields{
 		"icms_request_id": reqID,
 		"namespace":       pod.Namespace,

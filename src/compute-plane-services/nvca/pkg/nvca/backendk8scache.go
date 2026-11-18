@@ -699,6 +699,14 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 					}
 					recordWorkerRestartBaseline(ctx, k8sClient, newPod, time.Now())
 				},
+				DeleteFunc: func(obj any) {
+					if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+						obj = tombstone.Obj
+					}
+					if pod, ok := obj.(*corev1.Pod); ok {
+						k8sutil.ForgetWorkerRestartBaseline(pod.UID)
+					}
+				},
 			})
 			if err != nil {
 				log.WithError(err).Errorf("failed to add event handler for all Pods")
