@@ -698,6 +698,7 @@ func TestISuccessfullyRunCommandDocPreservesOutput(t *testing.T) {
 func TestISuccessfullyRunExecutablePreservesArguments(t *testing.T) {
 	sc, fake := newScenarioContext(t)
 	t.Setenv("EXECUTABLE", `/tmp/tool "quoted"`)
+	t.Setenv("LITERAL", "unexpected-second-expansion")
 	t.Setenv("QUOTED_PATH", `/tmp/release\candidate 'quoted' "value" ${LITERAL}`)
 	table := &godog.Table{Rows: []*messages.PickleTableRow{
 		{Cells: []*messages.PickleTableCell{{Value: "argument"}}},
@@ -717,11 +718,14 @@ func TestISuccessfullyRunExecutablePreservesArguments(t *testing.T) {
 	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
 		t.Fatal("accepted command failure")
 	}
+	fake.result.ExitCode = 0
+	calls := len(fake.runs)
 	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", nil); err == nil {
 		t.Fatal("accepted missing argument table")
 	}
-	fake.result.ExitCode = 0
-	calls := len(fake.runs)
+	if len(fake.runs) != calls {
+		t.Fatal("missing argument table invoked runner")
+	}
 	table.Rows[0].Cells[0].Value = "wrong-header"
 	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
 		t.Fatal("accepted wrong argument header")

@@ -290,9 +290,11 @@ tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed "$HELMFILE_EN
 ```
 
 The check resolves effective state values once with native Helmfile path and
-template-include rules, then shares that snapshot across both releases. It freezes each selected chart and its
-embedded values before rendering;
-changes to external values files cannot redirect its chart credentials.
+template-include rules, then shares that snapshot across both releases. Unused
+state references do not block a disabled-UI check. Qualification leaves the
+supplied stack unchanged, including symlinked paths. It freezes each selected
+chart and its embedded values before rendering. Changes to external values
+files cannot redirect its chart credentials.
 It renders the selected published charts, reads the target from the
 selected server image and exercises the selected migration image's mount
 helper without a server connection. Missing, empty or mismatched UI versions
@@ -302,9 +304,11 @@ workflow checks the published artifacts with the optional UI enabled before
 publishing release notes and inventory assets. Dry runs skip this check.
 CI uses `NVCF_RELEASE_NGC_API_KEY` for NGC authentication with temporary Helm
 and Docker configurations. The chart origin must match
-`NVCF_RELEASE_HELM_REGISTRY`. NGC origins support the default HTTPS port or
-explicit port 443. For manual runs, other private OCI origins use the operator's Helm or Docker
-credentials, including native credential helpers. Helm's chart pull decides
+`NVCF_RELEASE_HELM_REGISTRY`. NGC chart origins support the default HTTPS port or
+explicit port 443. OCI registry settings accept a bare host or one `oci://`
+prefix; installation and qualification use the same normalization. For manual
+runs, other private OCI origins use the operator's Helm or Docker credentials,
+including native credential helpers. Helm's chart pull decides
 whether authentication succeeds and reports host-specific login guidance on
 failure. The bundled release job supplies only NGC credentials. A private
 non-NGC CI origin needs a separate authentication step before qualification;

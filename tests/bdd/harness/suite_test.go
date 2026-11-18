@@ -66,12 +66,14 @@ func TestSignalSafeStepsPreserveNormalContinuation(t *testing.T) {
 
 func TestSuiteRestoresGeneratedSecretOnSignals(t *testing.T) {
 	for _, testCase := range []struct {
-		name     string
-		signal   os.Signal
-		exitCode int
+		name      string
+		signal    os.Signal
+		exitCode  int
+		failWrite bool
 	}{
 		{name: "SIGINT", signal: os.Interrupt, exitCode: 130},
 		{name: "SIGTERM", signal: syscall.SIGTERM, exitCode: 143},
+		{name: "SIGTERM-fixture-write-failure", signal: syscall.SIGTERM, exitCode: 143, failWrite: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			testDir := t.TempDir()
@@ -83,6 +85,7 @@ func TestSuiteRestoresGeneratedSecretOnSignals(t *testing.T) {
 				"NVCF_BDD_SIGNAL_HELPER=1",
 				"NVCF_BDD_SIGNAL_SECRET="+secretPath,
 				"NVCF_BDD_SIGNAL_READY="+readyPath,
+				fmt.Sprintf("NVCF_BDD_SIGNAL_FAIL_WRITE=%t", testCase.failWrite),
 			)
 			cmd.Stdout = &output
 			cmd.Stderr = &output
@@ -164,6 +167,7 @@ func TestSuiteSignalCleanupHelper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin signal-safe step: %v", err)
 	}
+	defer suite.EndSignalSafeStep(stepContext)
 	if err := os.WriteFile(secretPath, []byte("registryCredential: generated\n"), 0o600); err != nil {
 		t.Fatalf("write generated secret: %v", err)
 	}
@@ -180,6 +184,11 @@ func TestSuiteSignalCleanupHelper(t *testing.T) {
 	// cleanup must wait for this active step, then restore the absent snapshot.
 	if err := os.WriteFile(secretPath, []byte("registryCredential: recreated-after-cancel\n"), 0o600); err != nil {
 		t.Fatalf("rewrite generated secret after cancellation: %v", err)
+	}
+	if os.Getenv("NVCF_BDD_SIGNAL_FAIL_WRITE") == "true" {
+		if err := os.RemoveAll(suite.tempWorkspace); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(suite.tempWorkspace, "copied-secret"), []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
@@ -266,7 +275,39 @@ func TestNewSuiteWithoutCLIUsesOwnedWorkspace(t *testing.T) {
 }
 
 func TestTempWorkspaceResolvesRelativeBase(t *testing.T) {
-	root := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err = filepath.Abs(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("initial-absolute-base", testTempWorkspaceResolvesRelativeBase)
+	t.Run("initial-relative-base", func(t *testing.T) {
+		t.Setenv("TMPDIR", relative)
+		testTempWorkspaceResolvesRelativeBase(t)
+	})
+}
+
+func testTempWorkspaceResolvesRelativeBase(t *testing.T) {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.Abs(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
 	childDir := t.TempDir()
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -309,5 +350,56 @@ func TestTempWorkspaceResolvesRelativeBase(t *testing.T) {
 	}
 	if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("workspace remained: %v", err)
+	}
+}
+
+func TestTempWorkspacePreservesSymlinkTraversal(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := filepath.Join(root, "physical")
+	if err := os.MkdirAll(filepath.Join(physical, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	expected := filepath.Join(physical, "tmp")
+	if err := os.Mkdir(expected, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(physical, "child"), filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	// Keep link/.. uncleaned: the filesystem traverses the link before its parent.
+	selected := root + "/link/../tmp"
+	t.Setenv("TMPDIR", selected)
+	suite := &Suite{Ledger: NewLedger(root), EnvLedger: NewEnvLedger()}
+	if err := suite.createTempWorkspace(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := suite.Teardown(); err != nil {
+			t.Errorf("fallback teardown: %v", err)
+		}
+	})
+	got, err := os.Stat(filepath.Dir(suite.tempWorkspace))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.Stat(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(got, want) {
+		t.Fatalf("TMPDIR selected the wrong parent: %s", suite.tempWorkspace)
+	}
+	if err := suite.Teardown(); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("TMPDIR") != selected {
+		t.Fatal("original TMPDIR spelling was not restored")
 	}
 }

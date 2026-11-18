@@ -152,6 +152,9 @@ TEST_HELMFILE_BIN=$(command -v helmfile)
 export TEST_UI_CHART="$chart" TEST_SERVER_CHART="$work/server-chart"
 export TEST_REAL_HELM TEST_AUTH_HELM="$work/auth-helm" TEST_AUTH_LOG="$work/auth-log"
 TEST_REAL_HELM=$(command -v helm)
+export TEST_SERVER_CHART_VERSION TEST_UI_CHART_VERSION
+TEST_SERVER_CHART_VERSION=$(HELMFILE_ENV=$environment "$TEST_HELMFILE_BIN" -f "$work/stack/helmfile.d/01-dependencies.yaml.gotmpl" -l name=openbao-server list --skip-charts --output json | yq -r '.[0].version')
+TEST_UI_CHART_VERSION=$(HELMFILE_ENV=$environment "$TEST_HELMFILE_BIN" -f "$work/stack/helmfile.d/02-core.yaml.gotmpl" -l name=nvcf-ui list --skip-charts --output json | yq -r '.[0].version')
 cat > "$TEST_AUTH_HELM" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -173,9 +176,13 @@ if [[ $1 == pull ]]; then
   host=${reference#oci://}; host=${host%%/*}
   chart_name=${reference##*/}
   shift 2
-  destination=''
+  destination='' requested_version=''
   while (($#)); do
-    if [[ $1 == --destination ]]; then destination=$2; shift; fi
+    case "$1" in
+      --destination) destination=$2; shift ;;
+      --version) requested_version=$2; shift ;;
+      --version=*) requested_version=${1#*=} ;;
+    esac
     shift
   done
   [[ -n $destination ]]
@@ -183,7 +190,7 @@ if [[ $1 == pull ]]; then
     nvcr.io|nvcr.io:443)
       [[ $HELM_REGISTRY_CONFIG != "$TEST_OPERATOR_HELM_REGISTRY_CONFIG" ]]
       [[ $(TEST_REGISTRY_HOST=$host yq -r '.auths[strenv(TEST_REGISTRY_HOST)].auth' "$HELM_REGISTRY_CONFIG") == fixture-logged-in ]] ;;
-    registry.example.com|'[2001:db8::1]:5000') : ;;
+    registry.example.com|'[2001:db8::1]:5000'|123) : ;;
     private.example.com)
       helper=fixture
       if [[ ${TEST_IMPLICIT_STORE:-false} == true ]]; then helper=pass; fi
@@ -191,8 +198,8 @@ if [[ $1 == pull ]]; then
     *) exit 1 ;;
   esac
   case "$chart_name" in
-    helm-nvcf-openbao-server) fixture=$TEST_SERVER_CHART ;;
-    helm-nvcf-ui) fixture=$TEST_UI_CHART ;;
+    helm-nvcf-openbao-server) fixture=$TEST_SERVER_CHART; [[ $requested_version == "$TEST_SERVER_CHART_VERSION" ]] ;;
+    helm-nvcf-ui) fixture=$TEST_UI_CHART; [[ $requested_version == "$TEST_UI_CHART_VERSION" ]] ;;
     *) exit 1 ;;
   esac
   mkdir -p "$destination"
@@ -238,6 +245,18 @@ YAML
 cat > "$work/bin/helmfile" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n ${TEST_REMOTE_VALUES:-} ]]; then
+  remote_args=()
+  for arg in "$@"; do
+    if [[ $arg == "$TEST_REMOTE_VALUES" ]]; then
+      remote_args+=("$TEST_REMOTE_VALUES_FIXTURE")
+      echo "remote-values-preserved $arg" >> "$TEST_AUTH_LOG"
+    else
+      remote_args+=("$arg")
+    fi
+  done
+  set -- "${remote_args[@]}"
+fi
 for arg in "$@"; do
   if [[ $arg == list && ${TEST_CHART_OUTSIDE_ORIGIN:-false} == true ]]; then
     "$TEST_HELMFILE_BIN" "$@" | yq -o=json '.[].chart = "different/chart"'
@@ -276,7 +295,7 @@ exec "$TEST_HELMFILE_BIN" "$@"
 BASH
 chmod +x "$work/bin/helmfile"
 qualify() {
-  NVCF_RELEASE_NGC_API_KEY=${TEST_NGC_API_KEY:-} "$repo_root/tools/ci/qualify-openbao-ui-jwt-version" "$work/stack" "$environment" \
+  NVCF_RELEASE_NGC_API_KEY=${TEST_NGC_API_KEY:-} "$repo_root/tools/ci/qualify-openbao-ui-jwt-version" "${TEST_STACK_PATH:-$work/stack}" "$environment" \
     --state-values-set ingress.gatewayApi.gateways.shared.name=shared-gw \
     --state-values-set ingress.gatewayApi.gateways.shared.namespace=envoy-gateway-system \
     --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
@@ -290,6 +309,25 @@ test "$(grep -c '^login nvcr.io ' "$TEST_DOCKER_CALLS")" = 1
 mv "$DOCKER_CONFIG/contexts" "$work/shared-contexts"
 ln -s ../shared-contexts "$DOCKER_CONFIG/contexts"
 TEST_NGC_API_KEY=fixture-registry-key qualify
+# Resolving a source-stack symlink must never rewrite the operator's files.
+cp "$work/stack/helmfile.d/01-dependencies.yaml.gotmpl" "$work/original-dependencies"
+cp "$work/stack/helmfile.d/02-core.yaml.gotmpl" "$work/original-core"
+ln -s stack "$work/stack-link"
+# The function's source can be overridden only by these ownership fixtures.
+TEST_STACK_PATH="$work/stack-link" qualify
+cmp "$work/original-dependencies" "$work/stack/helmfile.d/01-dependencies.yaml.gotmpl"
+cmp "$work/original-core" "$work/stack/helmfile.d/02-core.yaml.gotmpl"
+mv "$work/stack/helmfile.d" "$work/shared-helmfile.d"
+ln -s ../shared-helmfile.d "$work/stack/helmfile.d"
+qualify
+cmp "$work/original-dependencies" "$work/shared-helmfile.d/01-dependencies.yaml.gotmpl"
+cmp "$work/original-core" "$work/shared-helmfile.d/02-core.yaml.gotmpl"
+rm "$work/stack/helmfile.d"
+mv "$work/shared-helmfile.d" "$work/stack/helmfile.d"
+# Both entry points must work with a relative TMPDIR and an active CDPATH.
+mkdir "$work/temp-parent"
+(cd "$work"; TMPDIR=temp-parent CDPATH=. TEST_NGC_API_KEY=fixture-registry-key qualify)
+(cd "$work"; TMPDIR=temp-parent CDPATH=. NVCF_RELEASE_NGC_API_KEY=fixture-registry-key check)
 # Pin distinct fixture image references to detect incorrect release selection.
 yq -i '.global.image.registry = "mirror.example.com" |
   .global.image.repository = "selected" |
@@ -328,6 +366,9 @@ if TEST_MUTATE_VALUES_FILE="$work/switch-version.yaml" TEST_MUTATE_VERSION=true 
 fi
 grep -Fq "expected $target" "$work/result"
 # Native resolution preserves relative operands and sibling template includes.
+TEST_OLD_VERSION=$old yq -i '.addons.nvcfUi.openbaoMigrations.jwtPluginVersion = strenv(TEST_OLD_VERSION)' "$work/stack/environments/$environment.yaml"
+if qualify > "$work/result" 2>&1; then fail 'stale saved version unexpectedly qualified'; fi
+grep -Fq "expected $target" "$work/result"
 printf 'addons:\n  nvcfUi:\n    openbaoMigrations:\n      jwtPluginVersion: %s\n' "$target" > "$work/stack/environments/relative-values.yaml"
 printf '{{ readFile "relative-values.yaml" }}\n' > "$work/stack/environments/relative-values.yaml.gotmpl"
 qualify --state-values-file ../environments/relative-values.yaml
@@ -343,8 +384,15 @@ test "$(yq -r '.addons.nvcfUi.openbaoMigrations.jwtPluginVersion' "$work/externa
 qualify --state-values-file "$work/external values/overrides.yaml.gotmpl" \
   --state-values-set "addons.nvcfUi.openbaoMigrations.jwtPluginVersion=$target"
 # Relative operands may also point outside the stack, from helmfile.d.
-qualify --state-values-file "../../external values/overrides.yaml.gotmpl" \
-  --state-values-set "addons.nvcfUi.openbaoMigrations.jwtPluginVersion=$target"
+cp "$work/stack/environments/relative-values.yaml" "$work/external values/jwt-values.yaml"
+qualify --state-values-file "../../external values/overrides.yaml.gotmpl"
+# Remote references must reach the Helmfile loader without a local prefix.
+for reference in https://config.example.com/qualification.yaml git::https://config.example.com/repo@qualification.yaml; do
+  TEST_REMOTE_VALUES=$reference TEST_REMOTE_VALUES_FIXTURE="$work/stack/environments/relative-values.yaml" \
+    qualify --state-values-file "$reference"
+  grep -Fq "remote-values-preserved $reference" "$TEST_AUTH_LOG"
+done
+TEST_TARGET_VERSION=$target yq -i '.addons.nvcfUi.openbaoMigrations.jwtPluginVersion = strenv(TEST_TARGET_VERSION)' "$work/stack/environments/$environment.yaml"
 # Release qualification must match the inventory's OCI chart origin.
 TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify \
   --state-values-set global.helm.sources.url= \
@@ -361,6 +409,18 @@ if TEST_CHART_OUTSIDE_ORIGIN=true NVCF_RELEASE_HELM_REGISTRY=registry.example.co
   fail 'accepted chart outside the release inventory origin'
 fi
 grep -Fq 'qualified chart origin differs' "$work/result"
+# Numeric YAML values remain valid text in OCI source URLs in every state.
+TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY=123/123 qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=123 \
+  --state-values-set global.helm.sources.repository=123
+grep -Fq 'oci-pulled oci://123/123/helm-nvcf-ui' "$TEST_AUTH_LOG"
+HELMFILE_ENV=$environment "$TEST_HELMFILE_BIN" -f "$work/stack/helmfile.d/03-observability.yaml.gotmpl" \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=123 \
+  --state-values-set global.helm.sources.repository=123 \
+  --chart "$TEST_SERVER_CHART" --allow-no-matching-release build > "$work/numeric-observability.yaml"
+test "$(yq -r '.repositories[] | select(.name == "nvcf") | .url' "$work/numeric-observability.yaml")" = 123/123
 # Normalize all trailing slashes and support the NGC TLS port explicitly.
 TEST_OCI_RENDER=true TEST_EXPECT_NGC_CONFIG=nvcr.io:443 NVCF_RELEASE_HELM_REGISTRY=' nvcr.io:443/team/charts// ' TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url= \
@@ -373,6 +433,13 @@ TEST_OCI_RENDER=true TEST_EXPECT_NGC_CONFIG=nvcr.io:443 NVCF_RELEASE_HELM_REGIST
   --state-values-set global.helm.sources.registry=oci://nvcr.io:443 \
   --state-values-set global.helm.sources.repository=team/charts
 test "$(grep -c '^oci-rendered nvcr.io:443$' "$TEST_AUTH_LOG")" = 4
+# A malformed repeated scheme must not qualify while a normal install fails.
+if qualify --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=oci://oci://nvcr.io:443 \
+  --state-values-set global.helm.sources.repository=team/charts > "$work/result" 2>&1; then
+  fail 'accepted repeated OCI scheme'
+fi
+grep -Fq 'bare host or a single oci:// prefix' "$work/result"
 # Bracketed IPv6 is accepted by the publisher, native pull path, and renderer.
 TEST_OCI_RENDER=true NVCF_RELEASE_HELM_REGISTRY='[2001:db8::1]:5000/team/charts' qualify \
   --state-values-set global.helm.sources.url= \
@@ -468,9 +535,9 @@ mv "$work/image/openbao/jwt-plugin-versions.env" "$work/manifest.env"
 check
 
 # A disabled UI requires neither registry access nor images.
-printf 'addons:\n  nvcfUi:\n    enabled: false\n' > "$work/stack/environments/$environment.yaml"
+printf 'unused: ref+file:///this-file-must-not-exist\naddons:\n  nvcfUi:\n    enabled: false\n' > "$work/stack/environments/$environment.yaml"
 : > "$TEST_DOCKER_CALLS"
-NVCF_RELEASE_NGC_API_KEY='' "$repo_root/tools/ci/qualify-openbao-ui-jwt-version" "$work/stack" "$environment"
+NVCF_RELEASE_NGC_API_KEY='' "$repo_root/tools/ci/qualify-openbao-ui-jwt-version" "${TEST_STACK_PATH:-$work/stack}" "$environment"
 test ! -s "$TEST_DOCKER_CALLS"
 
 echo 'openbao-ui-jwt-version-wiring: all checks passed (simulated images)'

@@ -157,7 +157,11 @@ func (s *Suite) snapshotCLIStatePath(path string) error {
 }
 
 func (s *Suite) createTempWorkspace() error {
-	base, err := filepath.Abs(os.TempDir())
+	resolved, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("resolve temporary base symlinks: %w", err)
+	}
+	base, err := filepath.Abs(resolved)
 	if err != nil {
 		return fmt.Errorf("resolve temporary base: %w", err)
 	}

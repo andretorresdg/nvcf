@@ -19,7 +19,7 @@ isolation=(--rm --pull always --network none --read-only --cap-drop ALL --securi
 # stores into the temporary NGC config. Mirror pulls retain the original config.
 if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
   umask 077
-  temp_base=$(cd "${TMPDIR:-/tmp}" && pwd)
+  temp_base=$(CDPATH='' cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
   NVCF_RELEASE_NGC_DOCKER_CONFIG=$(mktemp -d "$temp_base/openbao-ui-jwt-docker.XXXXXX")
   export NVCF_RELEASE_NGC_DOCKER_CONFIG
   trap 'rm -rf "$NVCF_RELEASE_NGC_DOCKER_CONFIG"' EXIT

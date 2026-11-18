@@ -6,8 +6,8 @@
 set -euo pipefail
 fail() { echo "qualify-openbao-ui-jwt-version: $*" >&2; exit 1; }
 [[ $# -ge 2 ]] || fail 'usage: qualify-openbao-ui-jwt-version STACK_DIR ENVIRONMENT [HELMFILE_GLOBAL_ARGS...]'
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-stack=$(cd "$1" && pwd) environment=$2
+script_dir=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+stack=$(CDPATH='' cd -P -- "$1" && pwd -P) environment=$2
 shift 2
 release_registry=${NVCF_RELEASE_HELM_REGISTRY:-}
 release_registry="${release_registry#"${release_registry%%[![:space:]]*}"}"
@@ -20,9 +20,10 @@ if [[ -n ${NVCF_RELEASE_HELM_REGISTRY:-} ]]; then
   esac
 fi
 export NVCF_RELEASE_HELM_REGISTRY=$release_registry
-temp_base=$(cd "${TMPDIR:-/tmp}" && pwd)
+temp_base=$(CDPATH='' cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
 work=$(mktemp -d "$temp_base/openbao-ui-jwt.XXXXXX")
 trap 'rm -rf "$work"' EXIT
+export TMPDIR=$work
 umask 077
 # Let Helmfile resolve state operands relative to its state directory, including
 # template includes. Resolve them once and share the resulting values.
@@ -38,7 +39,10 @@ while (($#)); do
         values_file=${1#*=}
       fi
       # Match the original state's base directory, even outside the stack.
-      [[ $values_file == /* ]] || values_file="$stack/helmfile.d/$values_file"
+      case "$values_file" in
+        /*|*://*|*::*) : ;;
+        *) values_file="$stack/helmfile.d/$values_file" ;;
+      esac
       state_args+=(--state-values-file "$values_file") ;;
     --state-values-set|--state-values-set-string)
       (($# >= 2)) || fail "$1 requires a value"
@@ -52,8 +56,11 @@ while (($#)); do
 done
 set --
 if ((${#args[@]})); then set -- "${args[@]}"; fi
-cp -R "$stack" "$work/stack"
+# Materialize source symlinks so no later write can reach the operator's tree.
+cp -RL "$stack" "$work/stack"
 stack="$work/stack"
+state_dir=$(CDPATH='' cd -P -- "$stack/helmfile.d" && pwd -P)
+[[ $state_dir == "$work/"* ]] || fail 'copied Helmfile state directory is outside the qualification workspace'
 [[ -f $stack/environments/$environment.yaml ]] || fail "environment $environment does not exist"
 # Render-only qualification needs no application credentials. Retain supplied
 # secrets when present because they can affect the selected release values.
@@ -77,21 +84,17 @@ fi
 helmfile_safe() {
   HELMFILE_DEBUG=false helmfile "$@" --debug=false --log-level warn
 }
-# A chart-free Helmfile values render preserves native template include paths.
-mkdir -p "$stack/.qualification-chart"
-printf 'apiVersion: v2\nname: qualification-values\nversion: 0.0.0\n' > "$stack/.qualification-chart/Chart.yaml"
-snapshot="$stack/helmfile.d/qualification-values.yaml.gotmpl"
-awk '/^---[[:space:]]*$/ { exit } { print }' "$stack/helmfile.d/02-core.yaml.gotmpl" > "$snapshot"
-cat >> "$snapshot" <<'HELMFILE'
----
-releases:
-  - name: qualification-values
-    chart: ../.qualification-chart
-    values:
-      - {{ .Values | toYaml | nindent 8 }}
-HELMFILE
-helmfile_safe --environment default -f "$snapshot" "${state_args[@]}" \
-  write-values --output-file-template "$work/effective-values.yaml" >/dev/null
+# Build serializes the merged state without evaluating it as release values.
+# Unused vals references must remain unresolved, particularly when UI is off.
+snapshot=$(mktemp "$state_dir/qualification-values.XXXXXX")
+mv "$snapshot" "$snapshot.yaml.gotmpl"
+snapshot="$snapshot.yaml.gotmpl"
+awk '/^---[[:space:]]*$/ { exit } { print }' "$state_dir/02-core.yaml.gotmpl" > "$snapshot"
+printf '\n---\nreleases: []\n' >> "$snapshot"
+helmfile_safe --environment default --allow-no-matching-release -f "$snapshot" "${state_args[@]}" \
+  build > "$work/state-values.yaml"
+yq -e '.renderedvalues | tag == "!!map"' "$work/state-values.yaml" >/dev/null || fail 'Helmfile build did not return merged state values'
+yq '.renderedvalues' "$work/state-values.yaml" > "$work/effective-values.yaml"
 # Prevent either original environment header from re-reading mutable inputs.
 for state in 01-dependencies.yaml.gotmpl 02-core.yaml.gotmpl; do
   {
@@ -128,12 +131,11 @@ render_release() {
      .releases[].chart = strenv(OPENBAO_UI_JWT_CHART)' "$frozen"
   origin=$(yq -r '.repositories[] | select(.name == "nvcf") | .url' "$frozen")
   oci=$(yq -r '.repositories[] | select(.name == "nvcf") | .oci' "$frozen")
-  if [[ $oci == true ]]; then
-    origin=${origin#oci://}
-    OPENBAO_UI_JWT_ORIGIN=$origin yq -i '(.repositories[] | select(.name == "nvcf") | .url) = strenv(OPENBAO_UI_JWT_ORIGIN)' "$frozen"
+  if [[ $oci == true && $origin == *://* ]]; then
+    fail 'OCI registry must use a bare host or a single oci:// prefix in global.helm.sources.registry'
   fi
   if [[ -n $release_registry ]]; then
-    [[ $chart == nvcf/* && $oci == true && ${origin#oci://} == "$release_registry" ]] || \
+    [[ $chart == nvcf/* && $oci == true && $origin == "$release_registry" ]] || \
       fail 'qualified chart origin differs from NVCF_RELEASE_HELM_REGISTRY'
   fi
   if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
@@ -143,8 +145,8 @@ render_release() {
       NVCF_USERNAME=\$oauthtoken NVCF_PASSWORD=$NVCF_RELEASE_NGC_API_KEY \
         helmfile_safe -f "$frozen" -l "name=$release" template
       return
-    elif [[ $oci == true && ( $origin == nvcr.io/* || $origin == nvcr.io:443/* || $origin == oci://nvcr.io/* || $origin == oci://nvcr.io:443/* ) ]]; then
-      local host=${origin#oci://}
+    elif [[ $oci == true && ( $origin == nvcr.io/* || $origin == nvcr.io:443/* ) ]]; then
+      local host=$origin
       host=${host%%/*}
       local ngc_config="$work/helm-ngc-${host//:/_}.json"
       if [[ ! -f $ngc_config ]]; then
