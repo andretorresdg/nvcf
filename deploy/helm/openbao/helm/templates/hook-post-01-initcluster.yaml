@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Bootstrap runs before readiness; post-install configures JWT after readiness.
+# Bootstrap runs before readiness. Hooks wait before JWT setup or migrations.
 
 # The script runs in an image that must contain:
 # - bash
@@ -22,19 +22,24 @@
 # - jwker
 {{- $serverFullname := include "nvcf-openbao.serverFullname" . }}
 {{- $root := . }}
-{{- range $bootstrapOnly := list true false }}
+{{- if ne .Values.openbao.server.podManagementPolicy "Parallel" }}
+{{- fail "OpenBao bootstrap requires openbao.server.podManagementPolicy=Parallel" }}
+{{- end }}
+{{- range $phase := list "bootstrap" "initialize" "wait" }}
+{{- $bootstrapOnly := eq $phase "bootstrap" }}
+{{- $waitOnly := eq $phase "wait" }}
 {{- with $root }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ if $bootstrapOnly }}{{ printf "%s-bootstrap-%d" ($serverFullname | trunc 40 | trimSuffix "-") .Release.Revision }}{{ else }}{{ $serverFullname }}-initialize-cluster{{ end }}
+  name: {{ if $bootstrapOnly }}{{ printf "%s-bootstrap-%d" ($serverFullname | trunc 40 | trimSuffix "-") .Release.Revision }}{{ else if $waitOnly }}{{ $serverFullname }}-wait-bootstrap{{ else }}{{ $serverFullname }}-initialize-cluster{{ end }}
   namespace: {{ include "nvcf-openbao.namespace" . }}
   labels:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: {{ if $bootstrapOnly }}openbao-bootstrap{{ else }}openbao-initialize{{ end }}
   {{- if not $bootstrapOnly }}
   annotations:
-    helm.sh/hook: post-install
+    helm.sh/hook: {{ if $waitOnly }}post-upgrade{{ else }}post-install{{ end }}
     helm.sh/hook-weight: "-5"
   {{- end }}
 spec:
@@ -56,9 +61,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if eq $phase "initialize" }}
       {{- with .Values.openbao.hooks.initializeCluster.schedulingGates }}
       schedulingGates:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- end }}
       containers:
         - name: bao-init
@@ -76,6 +83,8 @@ spec:
             {{- include "nvcf-openbao.kubectlEnv" . | nindent 12 }}
             - name: OPENBAO_BOOTSTRAP_ONLY
               value: {{ $bootstrapOnly | quote }}
+            - name: OPENBAO_WAIT_ONLY
+              value: {{ $waitOnly | quote }}
             - name: OPENBAO_API_TIMEOUT_SECONDS
               value: {{ .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds | default 600 | quote }}
             - name: JWT_PLUGIN_LIFECYCLE_MODE

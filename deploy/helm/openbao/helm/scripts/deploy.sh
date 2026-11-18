@@ -58,7 +58,7 @@ fi
 # Helper function to get root token
 get_root_token() {
     local namespace=$1 statefulset=$2 encoded
-    encoded=$(kubectl get secret "$statefulset-root-token" -n "$namespace" \
+    encoded=$(bootstrap_kubectl get secret "$statefulset-root-token" -n "$namespace" \
         -o jsonpath='{.data.root_token}') || return 1
     printf '%s' "$encoded" | base64 -d
 }
@@ -277,22 +277,8 @@ initialize_cluster() {
             log_error "Initialization did not return recovery keys (.recovery_keys_b64 is null). Aborting."
             return 1
         fi
-        local persisted=false
-        for attempt in 1 2 3; do
-            if kubectl create secret generic ${statefulset}-recovery-keys \
-                -n ${namespace} \
-                --from-literal=recovery_keys_b64="${recovery_keys}" \
-                --dry-run=client -o yaml | kubectl apply -f -; then
-                persisted=true
-                break
-            fi
-            log_warn "Could not persist recovery keys (attempt ${attempt}/3); retrying..."
-            sleep 3
-        done
-        if [ "${persisted}" != "true" ]; then
-            log_error "Failed to store recovery keys in Secret '${statefulset}-recovery-keys'. The server is initialized but the keys are not saved, so break-glass recovery is impossible. Tear down with cleanup.sh and reinitialize."
-            return 1
-        fi
+        persist_bootstrap_credentials "$namespace" "$statefulset" recovery-keys recovery_keys_b64 \
+            "$recovery_keys" "$root_token" create || return 1
         log_warn "Recovery keys stored in Secret '${statefulset}-recovery-keys'. Export them to a break-glass store and delete this Secret."
     else
         # Shamir seal: a single unseal key, stored for the auto-unseal sidecar.
@@ -310,26 +296,18 @@ initialize_cluster() {
             log_error "Failed to get unseal key from initialization output"
             return 1
         fi
-        if ! kubectl patch secret ${statefulset}-unseal \
-            --patch "data:
-    unseal_key: $(echo -n "${unseal_key}" | base64)" \
-            -n ${namespace}; then
-            log_error "Failed to store unseal key in Secret '${statefulset}-unseal'. The server is initialized but the unseal key is not saved; tear down with cleanup.sh and reinitialize."
+        if [ -z "$root_token" ] || [ "$root_token" = null ]; then
+            log_error "Failed to get root token from initialization output"
             return 1
         fi
-        log_info "Updated Kubernetes secret '${statefulset}-unseal' with unseal key"
+        persist_bootstrap_credentials "$namespace" "$statefulset" unseal unseal_key \
+            "$unseal_key" "$root_token" patch || return 1
     fi
-
-    # Store root token in a new secret
-    log_info "Creating secret '${statefulset}-root-token' with root token..."
-    kubectl create secret generic ${statefulset}-root-token \
-        -n ${namespace} \
-        --from-literal=root_token=${root_token}
 }
 
 get_unseal_key() {
     local namespace=$1 statefulset=$2 encoded
-    encoded=$(kubectl get secret "$statefulset-unseal" -n "$namespace" \
+    encoded=$(bootstrap_kubectl get secret "$statefulset-unseal" -n "$namespace" \
         -o jsonpath='{.data.unseal_key}') || return 1
     printf '%s' "$encoded" | base64 -d
 }
@@ -440,7 +418,7 @@ else
     wait_for_openbao_bootstrap "$namespace" "$statefulset" || exit 1
 fi
 
-if [ "${OPENBAO_BOOTSTRAP_ONLY:-false}" = true ]; then
+if [ "${OPENBAO_BOOTSTRAP_ONLY:-false}" = true ] || [ "${OPENBAO_WAIT_ONLY:-false}" = true ]; then
     exit 0
 fi
 

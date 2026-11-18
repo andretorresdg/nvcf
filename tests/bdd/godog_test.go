@@ -29,6 +29,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -3269,6 +3270,9 @@ func TestOpenBaoBootstrapReadiness(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
+	if os.Getenv("BDD_CLEANUP_MODE") != "" {
+		t.Fatal("TestOpenBaoBootstrapReadiness requires BDD_CLEANUP_MODE to be unset")
+	}
 	runLiveFeature(t, "openbao-bootstrap-readiness.feature")
 }
 
@@ -4793,19 +4797,55 @@ func seedFunctionAPIKey(t *testing.T, home string) {
 	}
 }
 
+func TestOpenBaoBootstrapReadinessRejectsCleanupBeforeSuiteSetup(t *testing.T) {
+	bin := t.TempDir()
+	for _, name := range []string{"go", "make", "kubectl", "k3d"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\necho unexpected-suite-setup >&2\nexit 1\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	for _, mode := range []string{"topology-single", "topology-multi", "stack-single", "stack-multi", "unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("BDD_CLEANUP_MODE", mode)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestOpenBaoBootstrapReadiness$")
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "requires BDD_CLEANUP_MODE to be unset") || strings.Contains(string(out), "unexpected-suite-setup") {
+				t.Fatalf("cleanup mode %q was not rejected before suite setup: %v\n%s", mode, err, out)
+			}
+		})
+	}
+}
+
 func TestOpenBaoBootstrapReadinessFeatureFileWiresToSteps(t *testing.T) {
 	values := map[string]string{
 		"OPENBAO_TEST_CONTEXT":   "qa-context",
 		"OPENBAO_TEST_NAMESPACE": "qa-openbao",
 		"OPENBAO_TEST_RELEASE":   "qa-release",
-		"OPENBAO_TEST_CHART":     "chart",
-		"OPENBAO_TEST_VALUES":    "values.yaml",
-		"OPENBAO_TEST_ARTIFACTS": "out/qa-openbao",
+		"OPENBAO_TEST_CHART":     "chart with spaces",
+		"OPENBAO_TEST_VALUES":    "values with spaces.yaml",
+		"OPENBAO_TEST_ARTIFACTS": "out/qa openbao",
 	}
 	for key, value := range values {
 		t.Setenv(key, value)
 	}
 	runner := &fakeRunner{results: map[string]harness.Result{}}
+	runner.onRun = func(command string) error {
+		argv, err := shlex.Split(command)
+		if err != nil {
+			return err
+		}
+		if argv[0] == "helm" {
+			if !slices.Contains(argv, values["OPENBAO_TEST_CHART"]) || !slices.Contains(argv, values["OPENBAO_TEST_VALUES"]) {
+				return fmt.Errorf("Helm paths were split: %q", argv)
+			}
+		} else if argv[0] == "/bin/bash" && !slices.Contains(argv, values["OPENBAO_TEST_ARTIFACTS"]) {
+			return fmt.Errorf("artifact path was split: %q", argv)
+		}
+		return nil
+	}
 	runner.respond = func(command string) (harness.Result, bool) {
 		switch {
 		case strings.Contains(command, "get statefulset"):
@@ -4817,6 +4857,10 @@ func TestOpenBaoBootstrapReadinessFeatureFileWiresToSteps(t *testing.T) {
 				return harness.Result{Stdout: "monitor=pause"}, true
 			}
 			return harness.Result{Stdout: "monitor=resume"}, true
+		case strings.Contains(command, "endpoint=excluded"):
+			return harness.Result{Stdout: "endpoint=excluded"}, true
+		case strings.Contains(command, "endpoint=included"):
+			return harness.Result{Stdout: "endpoint=included"}, true
 		case strings.Contains(command, "state=preserved"):
 			return harness.Result{Stdout: "state=preserved"}, true
 		}

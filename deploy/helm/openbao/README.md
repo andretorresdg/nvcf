@@ -22,12 +22,20 @@ routing. The self-managed HA values set this flag; standalone installs must
 set it explicitly. Keep the internal headless Service publishing NotReady
 addresses so Raft peers can discover one another during bootstrap.
 
-With `--wait`, Helm waits for StatefulSet readiness before running post-install
-hooks. The chart therefore creates a regular bootstrap Job with the StatefulSet. It
-uses each member's local API while the member is NotReady, initializes the
-primary, saves credentials and joins/unseals peers. The post-install Job then
-waits for bootstrap completion and configures JWT support before migrations
-run. It never initializes members, including installs without Helm `--wait`.
+The chart creates a regular bootstrap Job with the StatefulSet. It uses each
+member's local API while the member is NotReady, initializes the primary,
+saves credentials and joins/unseals peers. Bootstrap requires
+`openbao.server.podManagementPolicy=Parallel`; `OrderedReady` would prevent
+successor Pods from starting before the primary is initialized.
+
+With the default `OnDelete` strategy, Helm 3 `--wait` does not wait for the
+StatefulSet's Pods to become Ready. Adding `--wait-for-jobs` waits for the
+regular bootstrap Job. Independently of those flags, the post-install hook
+waits for initialized, unsealed members and the saved root token before JWT
+setup. A wait-only post-upgrade hook runs before catalog refresh and migrations.
+These hooks never initialize members. `initializeCluster.schedulingGates`
+applies only to the post-install JWT Job. An external controller must release
+those gates; bootstrap and the upgrade barrier are ungated.
 
 ```mermaid
 sequenceDiagram
@@ -36,12 +44,17 @@ sequenceDiagram
     Bootstrap->>OpenBao: Initialize primary and persist credentials
     Bootstrap->>OpenBao: Join and unseal members
     OpenBao->>Kubernetes: Members become Ready
-    Kubernetes->>Helm: Resource readiness and bootstrap completion
-    Helm->>OpenBao: Post-install JWT setup and migrations
+    opt Helm --wait --wait-for-jobs
+        Kubernetes->>Helm: Bootstrap Job completes
+    end
+    Helm->>Barrier: Run post-install or post-upgrade hook
+    Barrier->>OpenBao: Wait for all members and saved root token
+    Barrier->>Helm: Continue JWT setup or catalog refresh and migrations
 ```
 
 Bootstrap waits up to `openbao.hooks.initializeCluster.apiTimeoutSeconds`
-(default 600 seconds) for member APIs. It reads the StatefulSet replica count
+(default 600 seconds) per API/bootstrap wait phase. Kubernetes calls are also bounded by the remaining
+wait budget. It reads the StatefulSet replica count
 and selects the `openbao` container by name. A new Job name on each release
 revision avoids immutable Job-template errors on upgrade. Existing initialized
 members reuse saved credentials. Inconsistent state or missing credentials
@@ -62,8 +75,24 @@ helm upgrade openbao-server helm --namespace vault-system \
 Retain your image, namespace and migration overrides when upgrading. With an
 `OnDelete` StatefulSet strategy, the probe change reaches each Pod only after
 that Pod is recreated. Roll one member at a time and verify recovery and Raft
-quorum before continuing. After rollback to an older chart, that chart's
-readiness defaults apply again.
+quorum before continuing. Rollback also restores only the StatefulSet template.
+After rolling back to an older chart, replace Pods one at a time to restore
+that chart's probe on running members. Verify recovery and quorum before
+replacing the next Pod.
+
+For a failed standalone installation whose data and saved bootstrap Secrets
+are intact, resume against the existing resources from this directory:
+
+```bash
+bash deploy.sh vault-system openbao-server helm
+```
+
+Use the original namespace and StatefulSet name. This existing-resources mode
+requires `kubectl`, `jq` and `jwker`, skips Helm installation and reuses saved
+credentials before joining/unsealing remaining members and configuring JWT.
+The default `script` mode remains for fresh installations. Missing credentials
+or mismatched data require recovery before retrying; do not delete resources
+as a routine retry step.
 
 ## JWT plugin lifecycle
 

@@ -55,7 +55,7 @@ fi
 # Helper function to get root token
 get_root_token() {
     local namespace=$1 statefulset=$2 encoded
-    encoded=$(kubectl get secret "$statefulset-root-token" -n "$namespace" \
+    encoded=$(bootstrap_kubectl get secret "$statefulset-root-token" -n "$namespace" \
         -o jsonpath='{.data.root_token}') || return 1
     printf '%s' "$encoded" | base64 -d
 }
@@ -142,27 +142,13 @@ initialize_cluster() {
         return 1
     fi
 
-    # Update the secret with the new unseal key
-    if ! kubectl patch secret ${statefulset}-unseal \
-        --patch "data:
-    unseal_key: $(echo -n "${unseal_key}" | base64)" \
-        -n ${namespace}; then
-        log_error "Failed to persist the OpenBao unseal key"
-        return 1
-    fi
-
-    log_info "Updated Kubernetes secret '${statefulset}-unseal' with unseal key"
-
-    # Store root token in a new secret
-    log_info "Creating secret '${statefulset}-root-token' with root token..."
-    kubectl create secret generic ${statefulset}-root-token \
-        -n ${namespace} \
-        --from-literal=root_token=${root_token}
+    persist_bootstrap_credentials "$namespace" "$statefulset" unseal unseal_key \
+        "$unseal_key" "$root_token" patch
 }
 
 get_unseal_key() {
     local namespace=$1 statefulset=$2 encoded
-    encoded=$(kubectl get secret "$statefulset-unseal" -n "$namespace" \
+    encoded=$(bootstrap_kubectl get secret "$statefulset-unseal" -n "$namespace" \
         -o jsonpath='{.data.unseal_key}') || return 1
     printf '%s' "$encoded" | base64 -d
 }

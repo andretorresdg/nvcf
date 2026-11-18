@@ -30,6 +30,25 @@ test "$(yq -r "$bootstrap_job | .spec.template.spec.containers[0].env[] | select
 for name in bootstrap-script bootstrap-utils; do
     test "$(yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"openbao-server-$name\") | .metadata.annotations.\"helm.sh/hook\"" "$rendered")" = null
 done
+wait_job='select(.kind == "Job" and .metadata.name == "openbao-server-wait-bootstrap")'
+test "$(yq -r "$wait_job | .metadata.annotations.\"helm.sh/hook\"" "$rendered")" = post-upgrade
+test "$(yq -r "$wait_job | .metadata.annotations.\"helm.sh/hook-weight\"" "$rendered")" = -5
+test "$(yq -r "$wait_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_WAIT_ONLY\") | .value" "$rendered")" = true
+test "$(yq -r "$wait_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_ONLY\") | .value" "$rendered")" = false
+helm template openbao "$test_root"/*.tgz --namespace test \
+    -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
+    --set 'openbao.hooks.initializeCluster.schedulingGates[0].name=example.com/hold' > "$test_root/gated.yaml"
+test "$(yq -r "$init_job | .spec.template.spec.schedulingGates[0].name" "$test_root/gated.yaml")" = example.com/hold
+for job in "$bootstrap_job" "$wait_job"; do
+    test "$(yq -r "$job | .spec.template.spec.schedulingGates" "$test_root/gated.yaml")" = null
+done
+if helm template openbao "$test_root"/*.tgz --namespace test \
+    -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
+    --set openbao.server.podManagementPolicy=OrderedReady > "$test_root/ordered.log" 2>&1; then
+    echo 'OrderedReady unexpectedly passed bootstrap validation' >&2
+    exit 1
+fi
+grep -q 'bootstrap requires openbao.server.podManagementPolicy=Parallel' "$test_root/ordered.log"
 probe_path=$(yq -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[] | select(.name == "openbao") | .readinessProbe.httpGet.path' "$rendered")
 test "$probe_path" = '/v1/sys/health?standbyok=true'
 
@@ -82,16 +101,22 @@ for source_dir in "$project_dir" "$project_dir/helm/scripts"; do
 
     # This checks prerequisites, not successful initialization. The fake API
     # rejects later operations, so no cluster is contacted.
-    if PATH="$bin_dir" "$BASH" "$stage/deploy.sh" "${hook_args[@]}" > "$test_root/hook.log" 2>&1; then
-        echo 'Hook unexpectedly succeeded against the rejecting fake API' >&2
-        exit 1
-    fi
-    grep -q 'jwker available' "$test_root/hook.log"
-    test -s "$KUBECTL_CALLS"
-    if grep -q 'helm check failed' "$test_root/hook.log"; then
-        echo 'Hook mode still requires Helm' >&2
-        exit 1
-    fi
+    for bootstrap_only in false true; do
+        : > "$KUBECTL_CALLS"
+        if OPENBAO_BOOTSTRAP_ONLY="$bootstrap_only" PATH="$bin_dir" "$BASH" "$stage/deploy.sh" "${hook_args[@]}" > "$test_root/hook.log" 2>&1; then
+            echo 'Hook unexpectedly succeeded against the rejecting fake API' >&2
+            exit 1
+        fi
+        grep -q 'jwker available' "$test_root/hook.log"
+        test -s "$KUBECTL_CALLS"
+        if [ "$bootstrap_only" = true ]; then
+            grep -q 'Initializing OpenBao nodes' "$test_root/hook.log"
+        fi
+        if grep -q 'helm check failed' "$test_root/hook.log"; then
+            echo 'Hook mode still requires Helm' >&2
+            exit 1
+        fi
+    done
 
     rm "$bin_dir/jwker"
     : > "$KUBECTL_CALLS"

@@ -17,18 +17,18 @@ Feature: Bootstrap OpenBao with strict readiness and preserve initialized state
   Scenario: Install, seal, recover and upgrade a three-member OpenBao cluster
     When I successfully run command:
       """
-      helm upgrade --install ${OPENBAO_TEST_RELEASE} ${OPENBAO_TEST_CHART} --kube-context ${OPENBAO_TEST_CONTEXT} --namespace ${OPENBAO_TEST_NAMESPACE} --create-namespace --values ${OPENBAO_TEST_VALUES} --wait --wait-for-jobs --timeout 15m
+      helm upgrade --install "${OPENBAO_TEST_RELEASE}" "${OPENBAO_TEST_CHART}" --kube-context "${OPENBAO_TEST_CONTEXT}" --namespace "${OPENBAO_TEST_NAMESPACE}" --create-namespace --values "${OPENBAO_TEST_VALUES}" --wait --wait-for-jobs --timeout 15m --set openbao.server.service.publishNotReadyAddresses=false
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} get statefulset openbao-server -o json | jq -c '"'"'[.spec.template.spec.containers[] | select(.name == "openbao") | {name, path: .readinessProbe.httpGet.path}]'"'"''
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get statefulset openbao-server -o json | jq -c '"'"'[.spec.template.spec.containers[] | select(.name == "openbao") | {name, path: .readinessProbe.httpGet.path}]'"'"'' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the json output should contain rows:
       | name    | path                               |
       | openbao | /v1/sys/health?standbyok=true       |
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'for pod in openbao-server-0 openbao-server-1 openbao-server-2; do kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} exec "$pod" -c openbao -- bao status -format=json | jq -c --arg pod "$pod" '"'"'{pod: $pod, initialized, sealed}'"'"' || exit; done | jq -sc .'
+      /bin/bash -e -o pipefail -c 'for pod in openbao-server-0 openbao-server-1 openbao-server-2; do kubectl --context "$1" -n "$2" exec "$pod" -c openbao -- bao status -format=json | jq -c --arg pod "$pod" '"'"'{pod: $pod, initialized, sealed}'"'"' || exit; done | jq -sc .' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the json output should contain rows:
       | pod              | initialized | sealed |
@@ -37,46 +37,54 @@ Feature: Bootstrap OpenBao with strict readiness and preserve initialized state
       | openbao-server-2 | true        | false  |
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'mkdir -p ${OPENBAO_TEST_ARTIFACTS}; kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} exec openbao-server-0 -c openbao -- bao status -format=json | jq -r .cluster_id > ${OPENBAO_TEST_ARTIFACTS}/cluster-id-before; kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > ${OPENBAO_TEST_ARTIFACTS}/credentials-before'
+      /bin/bash -e -o pipefail -c 'mkdir -p "$3"; kubectl --context "$1" -n "$2" exec openbao-server-0 -c openbao -- bao status -format=json | jq -r .cluster_id > "$3/cluster-id-before"; kubectl --context "$1" -n "$2" get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > "$3/credentials-before"' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'for pod in openbao-server-0 openbao-server-1 openbao-server-2; do if kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} exec "$pod" -c openbao -- bao read -format=json sys/leader | jq -e .data.is_self >/dev/null; then printf "%s" "$pod" > ${OPENBAO_TEST_ARTIFACTS}/sealed-member; exit 0; fi; done; exit 1'
+      /bin/bash -e -o pipefail -c 'for pod in openbao-server-0 openbao-server-1 openbao-server-2; do if kubectl --context "$1" -n "$2" exec "$pod" -c openbao -- bao read -format=json sys/leader | jq -e .data.is_self >/dev/null; then printf "%s" "$pod" > "$3/sealed-member"; exit 0; fi; done; exit 1' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'bash tests/bdd/scripts/openbao-unseal-monitor.sh ${OPENBAO_TEST_CONTEXT} ${OPENBAO_TEST_NAMESPACE} "$(cat ${OPENBAO_TEST_ARTIFACTS}/sealed-member)" pause'
+      /bin/bash -e -o pipefail -c 'bash tests/bdd/scripts/openbao-unseal-monitor.sh "$1" "$2" "$(cat "$3/sealed-member")" pause' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the command output should contain "monitor=pause"
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'bash tests/bdd/scripts/openbao-admin.sh ${OPENBAO_TEST_CONTEXT} ${OPENBAO_TEST_NAMESPACE} "$(cat ${OPENBAO_TEST_ARTIFACTS}/sealed-member)" operator seal'
+      /bin/bash -e -o pipefail -c 'bash tests/bdd/scripts/openbao-admin.sh "$1" "$2" "$(cat "$3/sealed-member")" operator seal' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} wait "pod/$(cat ${OPENBAO_TEST_ARTIFACTS}/sealed-member)" --for=condition=Ready=false --timeout=45s'
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" wait "pod/$(cat "$3/sealed-member")" --for=condition=Ready=false --timeout=45s' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      """
+    When I poll command for up to 45 seconds until output contains "endpoint=excluded":
+      """
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get endpointslices -l kubernetes.io/service-name=openbao-server -o json | jq -e --arg pod "$(cat "$3/sealed-member")" '"'"'(.items | length > 0) and ([.items[].endpoints[]? | select(.targetRef.name == $pod and .conditions.ready == true)] | length == 0)'"'"' >/dev/null && echo endpoint=excluded' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'bash tests/bdd/scripts/openbao-unseal-monitor.sh ${OPENBAO_TEST_CONTEXT} ${OPENBAO_TEST_NAMESPACE} "$(cat ${OPENBAO_TEST_ARTIFACTS}/sealed-member)" resume'
+      /bin/bash -e -o pipefail -c 'bash tests/bdd/scripts/openbao-unseal-monitor.sh "$1" "$2" "$(cat "$3/sealed-member")" resume' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the command output should contain "monitor=resume"
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} wait "pod/$(cat ${OPENBAO_TEST_ARTIFACTS}/sealed-member)" --for=condition=Ready --timeout=120s'
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" wait "pod/$(cat "$3/sealed-member")" --for=condition=Ready --timeout=120s' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      """
+    When I poll command for up to 45 seconds until output contains "endpoint=included":
+      """
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get endpointslices -l kubernetes.io/service-name=openbao-server -o json | jq -e --arg pod "$(cat "$3/sealed-member")" '"'"'any(.items[].endpoints[]?; .targetRef.name == $pod and .conditions.ready == true)'"'"' >/dev/null && echo endpoint=included' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
-      helm upgrade --install ${OPENBAO_TEST_RELEASE} ${OPENBAO_TEST_CHART} --kube-context ${OPENBAO_TEST_CONTEXT} --namespace ${OPENBAO_TEST_NAMESPACE} --create-namespace --values ${OPENBAO_TEST_VALUES} --wait --wait-for-jobs --timeout 15m --set-string openbao.hooks.initializeCluster.podAnnotations.qa=upgrade
+      helm upgrade --install "${OPENBAO_TEST_RELEASE}" "${OPENBAO_TEST_CHART}" --kube-context "${OPENBAO_TEST_CONTEXT}" --namespace "${OPENBAO_TEST_NAMESPACE}" --create-namespace --values "${OPENBAO_TEST_VALUES}" --wait --wait-for-jobs --timeout 15m --set-string openbao.hooks.initializeCluster.podAnnotations.qa=upgrade --set openbao.server.service.publishNotReadyAddresses=false
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} exec openbao-server-0 -c openbao -- bao status -format=json | jq -r .cluster_id > ${OPENBAO_TEST_ARTIFACTS}/cluster-id-after; kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > ${OPENBAO_TEST_ARTIFACTS}/credentials-after; cmp ${OPENBAO_TEST_ARTIFACTS}/cluster-id-before ${OPENBAO_TEST_ARTIFACTS}/cluster-id-after && cmp ${OPENBAO_TEST_ARTIFACTS}/credentials-before ${OPENBAO_TEST_ARTIFACTS}/credentials-after && echo state=preserved'
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" exec openbao-server-0 -c openbao -- bao status -format=json | jq -r .cluster_id > "$3/cluster-id-after"; kubectl --context "$1" -n "$2" get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > "$3/credentials-after"; cmp "$3/cluster-id-before" "$3/cluster-id-after" && cmp "$3/credentials-before" "$3/credentials-after" && echo state=preserved' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the command output should contain "state=preserved"
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'for pod in openbao-server-0 openbao-server-1 openbao-server-2; do kubectl --context ${OPENBAO_TEST_CONTEXT} -n ${OPENBAO_TEST_NAMESPACE} exec "$pod" -c openbao -- bao status -format=json | jq -c --arg pod "$pod" '"'"'{pod: $pod, initialized, sealed}'"'"' || exit; done | jq -sc .'
+      /bin/bash -e -o pipefail -c 'for pod in openbao-server-0 openbao-server-1 openbao-server-2; do kubectl --context "$1" -n "$2" exec "$pod" -c openbao -- bao status -format=json | jq -c --arg pod "$pod" '"'"'{pod: $pod, initialized, sealed}'"'"' || exit; done | jq -sc .' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the json output should contain rows:
       | pod              | initialized | sealed |
