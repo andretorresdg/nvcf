@@ -1256,9 +1256,9 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
      * driver ends the session at the deadline with an "abort" verdict, the
      * same attempt on every node; this node's own deadline, a minute later,
      * only covers a driver that never answers. */
-    /* --timeout-ms 0 waits forever on one node; across nodes the driver's
-     * own deadline still ends the session. */
-    double deadline = timeout_ms || fabric_dir ? now_ms() + timeout_ms + (fabric_dir ? 60000 : 0) : 1e300;
+    /* --timeout-ms 0 waits forever, on one node only: main refuses it with
+     * --fabric-map. */
+    double deadline = timeout_ms ? now_ms() + timeout_ms + (fabric_dir ? 60000 : 0) : 1e300;
     int catchup = 1, holding = 0, nudge = 0;
     for (int tries = 0;; tries++) {
         int r = -3;
@@ -1704,7 +1704,7 @@ static void usage(const char *prog)
         "         probe        (is the one visible GPU usable? prints ok or the failing\n"
         "                       step and CUDA error; exit 0, 2 on a failure, 1 if it cannot ask)\n"
         "--libcuda PATH: (probe) the driver library to load (default libcuda.so.1)\n"
-        "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever)\n"
+        "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever; not with --fabric-map)\n"
         "--gpu-map FILE: restore GPUs listed in FILE onto the GPUs visible here\n"
         "--store S --ckpt-dir C: (suspend) libnvsnap_gpushare processes save GPU memory\n"
         "         to chunk store S; C lists the chunks of this checkpoint\n"
@@ -1754,6 +1754,14 @@ int main(int argc, char **argv)
     }
     if (!store_dir != !ckpt_dir) {
         fprintf(stderr, "--store and --ckpt-dir go together\n");
+        return 1;
+    }
+    /* A node that votes must give up shortly after the driver does. With no
+     * deadline it would hold its ranks forever if the driver never answers;
+     * with one shorter than the driver's, it would roll back while the driver
+     * can still send "go" to the other nodes. */
+    if (fabric_dir && timeout_ms == 0) {
+        fprintf(stderr, "--fabric-map needs --timeout-ms above 0\n");
         return 1;
     }
 

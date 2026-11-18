@@ -304,6 +304,18 @@ class Deadlines(QuiesceDeadline):
         out = p.communicate()[0]
         self.assertTrue(alive, "gave up with --timeout-ms 0:\n" + out)
 
+    def test_fabric_refuses_timeout_zero(self):
+        # Across nodes every node needs its own deadline: with none it holds
+        # its ranks forever if the driver never answers. Refused before it
+        # talks to any rank or writes a vote.
+        fabric = tempfile.mkdtemp(dir=self.tmp)
+        p, took = self.run_tool("--timeout-ms", "0", "--fabric-map", fabric, "suspend", str(self.pid),
+                                timeout=30)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("--fabric-map needs --timeout-ms above 0", p.stderr)
+        self.assertEqual(os.listdir(fabric), [])
+        self.assertLess(took, 2, p.stdout + p.stderr)
+
     test_timeout_is_wall_clock = None
     test_fabric_abort_ends_the_suspend = None
 
