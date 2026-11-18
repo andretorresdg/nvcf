@@ -193,6 +193,9 @@ func TestNatsConsumerSetupBackOff(t *testing.T) {
 		advance(wait)
 	}
 
+	minFirstSlow := natsConsumerFastRetryMaxWait - natsConsumerFastRetryMaxWait/4
+	assert.GreaterOrEqual(t, b.NextBackOff(), minFirstSlow, "waits do not shrink when the slow phase starts")
+
 	maxSlow := natsConsumerSlowRetryMaxWait + natsConsumerSlowRetryMaxWait/4
 	sawSlow := false
 	for i := 0; i < 1000; i++ {
@@ -290,20 +293,27 @@ func TestPublishNatsConsumer(t *testing.T) {
 	c := &consumer.GlobalNatsConsumer{}
 	trigger := func() {}
 
+	newWorker := func(connected *nvcf.ConnectionRegions) *NVCFWorker {
+		w := &NVCFWorker{nvcfClient: &nvcf.Client{}}
+		w.nvcfClient.ConnectedRegions.Store(connected)
+		w.natsConsumerSetupFailing.Store(true)
+		return w
+	}
+
 	t.Run("regions unchanged", func(t *testing.T) {
-		client := &nvcf.Client{}
-		client.ConnectedRegions.Store(r("a", "b"))
-		assert.True(t, publishNatsConsumer(client, c, r("a", "b"), &trigger))
-		assert.Same(t, c, client.CurrentNatsConsumer.Load())
-		assert.Same(t, &trigger, client.TriggerNewNatsConsumer.Load())
+		w := newWorker(r("a", "b"))
+		assert.True(t, w.publishNatsConsumer(c, r("a", "b"), &trigger))
+		assert.Same(t, c, w.nvcfClient.CurrentNatsConsumer.Load())
+		assert.Same(t, &trigger, w.nvcfClient.TriggerNewNatsConsumer.Load())
+		assert.False(t, w.natsConsumerSetupFailing.Load(), "an accepted consumer clears the readiness failure")
 	})
 
 	t.Run("regions changed after the consumer was built", func(t *testing.T) {
-		client := &nvcf.Client{}
-		client.ConnectedRegions.Store(r("b", "a"))
-		assert.False(t, publishNatsConsumer(client, c, r("a", "b"), &trigger))
-		assert.Same(t, c, client.CurrentNatsConsumer.Load(), "stored so a later region reload can trigger it")
-		assert.Same(t, &trigger, client.TriggerNewNatsConsumer.Load())
+		w := newWorker(r("b", "a"))
+		assert.False(t, w.publishNatsConsumer(c, r("a", "b"), &trigger))
+		assert.Same(t, c, w.nvcfClient.CurrentNatsConsumer.Load(), "stored so a later region reload can trigger it")
+		assert.Same(t, &trigger, w.nvcfClient.TriggerNewNatsConsumer.Load())
+		assert.True(t, w.natsConsumerSetupFailing.Load(), "a rejected consumer keeps the readiness failure")
 	})
 }
 

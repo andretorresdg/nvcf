@@ -579,7 +579,9 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 				}, auth.GrpcTokenFromSource(w.nvcfClient.NvcfTokenProvider))
 				return err
 			}, w.config.FunctionVersionId, connectedRegion.Primary, connectedRegion.Secondaries, w.config.MaxRequestConcurrency)
-			w.natsConsumerSetupFailing.Store(err != nil)
+			if err != nil {
+				w.natsConsumerSetupFailing.Store(true)
+			}
 			return c, err
 		}, zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
 		stopSetupAfterFunc()
@@ -600,8 +602,9 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 			cancelFetch()
 		}
 
-		if !publishNatsConsumer(w.nvcfClient, globalNatsConsumer, connectedRegion, &wrappedCancelFetch) {
-			zap.L().Info("connected regions changed during nats consumer setup, setting it up again")
+		if !w.publishNatsConsumer(globalNatsConsumer, connectedRegion, &wrappedCancelFetch) {
+			zap.L().Info("connected regions changed during nats consumer setup, setting it up again",
+				zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
 			wrappedCancelFetch()
 			continue
 		}
@@ -676,8 +679,9 @@ func newNatsConsumerSetupBackOff() backoff.BackOff {
 }
 
 func newNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *phasedBackOff {
-	newExp := func(maxWait time.Duration) *backoff.ExponentialBackOff {
+	newExp := func(firstWait, maxWait time.Duration) *backoff.ExponentialBackOff {
 		return backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(firstWait),
 			backoff.WithMaxInterval(maxWait),
 			backoff.WithRandomizationFactor(0.25),
 			backoff.WithMaxElapsedTime(0),
@@ -685,8 +689,9 @@ func newNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *phasedBackOff {
 		)
 	}
 	return &phasedBackOff{
-		fast:    newExp(natsConsumerFastRetryMaxWait),
-		slow:    newExp(natsConsumerSlowRetryMaxWait),
+		fast: newExp(backoff.DefaultInitialInterval, natsConsumerFastRetryMaxWait),
+		// The slow phase starts where the fast phase capped, so waits do not shrink at the switch.
+		slow:    newExp(natsConsumerFastRetryMaxWait, natsConsumerSlowRetryMaxWait),
 		fastFor: natsConsumerFastRetryPeriod,
 		now:     clock.Now,
 	}
@@ -751,13 +756,18 @@ func newNatsConsumerWithRetry(ctx context.Context, b backoff.BackOff, create fun
 
 // publishNatsConsumer stores the consumer and the trigger that ends its work stream, then reports whether the
 // regions it was built for are still the connected regions. The region reload stores the new regions before it
-// loads the consumer and trigger, so a region change is either seen here or triggers this consumer.
-func publishNatsConsumer(client *nvcf.Client, c *consumer.GlobalNatsConsumer, builtFor *nvcf.ConnectionRegions,
+// loads the consumer and trigger, so a region change is either seen here or triggers this consumer. A consumer setup
+// failure stops being reported for readiness only once a consumer is accepted.
+func (w *NVCFWorker) publishNatsConsumer(c *consumer.GlobalNatsConsumer, builtFor *nvcf.ConnectionRegions,
 	trigger *func(),
 ) bool {
-	client.CurrentNatsConsumer.Store(c)
-	client.TriggerNewNatsConsumer.Store(trigger)
-	return sameRegions(builtFor, client.ConnectedRegions.Load())
+	w.nvcfClient.CurrentNatsConsumer.Store(c)
+	w.nvcfClient.TriggerNewNatsConsumer.Store(trigger)
+	if !sameRegions(builtFor, w.nvcfClient.ConnectedRegions.Load()) {
+		return false
+	}
+	w.natsConsumerSetupFailing.Store(false)
+	return true
 }
 
 func sameRegions(a, b *nvcf.ConnectionRegions) bool {
