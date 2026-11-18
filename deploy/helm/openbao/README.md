@@ -24,7 +24,7 @@ addresses so Raft peers can discover one another during bootstrap.
 
 The chart creates a regular bootstrap Job with the StatefulSet. It uses each
 member's local API while the member is NotReady, initializes the primary,
-saves credentials and joins/unseals peers. Bootstrap requires
+saves and verifies credentials, marks bootstrap complete and joins/unseals peers. Bootstrap requires
 `openbao.server.podManagementPolicy=Parallel`; `OrderedReady` would prevent
 successor Pods from starting before the primary is initialized.
 
@@ -41,25 +41,49 @@ those gates; bootstrap and the upgrade barrier are ungated.
 sequenceDiagram
     Helm->>Kubernetes: Create StatefulSet, bootstrap scripts and bootstrap Job
     Note over Kubernetes: Members expose APIs and remain NotReady
-    Bootstrap->>OpenBao: Initialize primary and persist credentials
+    Bootstrap->>OpenBao: Initialize primary and persist both credentials
+    Bootstrap->>Kubernetes: Mark credential bootstrap complete
     Bootstrap->>OpenBao: Join and unseal members
     OpenBao->>Kubernetes: Members become Ready
     opt Helm --wait --wait-for-jobs
         Kubernetes->>Helm: Bootstrap Job completes
     end
     Helm->>Barrier: Run post-install or post-upgrade hook
-    Barrier->>OpenBao: Wait for all members and saved root token
+    Barrier->>OpenBao: Wait for all current members
+    Barrier->>Kubernetes: Check root token and bootstrap completion
     Barrier->>Helm: Continue JWT setup or catalog refresh and migrations
 ```
 
 Bootstrap waits up to `openbao.hooks.initializeCluster.apiTimeoutSeconds`
-(default 600 seconds) per API/bootstrap wait phase. Kubernetes calls are also bounded by the remaining
-wait budget. It reads the StatefulSet replica count
+(default 600 seconds) per API/bootstrap wait phase. Status calls have a
+five-second cap. Credential persistence has a separate
+`openbao.hooks.initializeCluster.credentialTimeoutSeconds` budget (default
+120 seconds) per Secret operation. Standalone scripts accept the equivalent
+`OPENBAO_CREDENTIAL_TIMEOUT_SECONDS` setting. Slow credential reads do not use
+the status polling cap. It reads the StatefulSet replica count
 and selects the `openbao` container by name. A new Job name on each release
 revision avoids immutable Job-template errors on upgrade. Existing initialized
 members reuse saved credentials. Inconsistent state or missing credentials
 fails closed instead of initializing again; restore the matching data and
-credentials before retrying.
+credentials before retrying. Secret patches include the version read, so a
+concurrent restore causes a conflict and a reread instead of an overwrite.
+The completion check also rereads the desired replica count before releasing
+the next hook.
+
+New root-token Secrets include `bootstrap_state=pending` until both bootstrap
+credentials are verified. If recovery-key persistence fails in auto-unseal
+mode, the saved root token remains available for recovery, but retries and
+hooks reject the pending state. Restore the matching recovery-key Secret before
+retrying; initialization is never repeated. A retry can mark pending state
+complete after verifying both saved credentials. Once `bootstrap_state` is
+`complete`, recovery keys can be exported and the recovery-key Secret deleted.
+Do not delete the completion field from the root-token Secret. Resolve pending
+credentials before rolling back to a chart that does not check this field.
+
+Existing root-token Secrets without this field retain the legacy credential
+checks. Before upgrading a previously failed auto-unseal installation, verify
+that its recovery shares were saved or exported; an unsealed server and a root
+token alone do not prove this. The chart cannot reconstruct lost recovery shares.
 
 When upgrading with `--reuse-values`, explicitly replace the old readiness
 path, which otherwise remains in the reused values:
@@ -79,6 +103,59 @@ quorum before continuing. Rollback also restores only the StatefulSet template.
 After rolling back to an older chart, replace Pods one at a time to restore
 that chart's probe on running members. Verify recovery and quorum before
 replacing the next Pod.
+
+### Upgrading an existing OrderedReady StatefulSet
+
+`podManagementPolicy` cannot be changed in place. Keep the existing Pods,
+PVCs and bootstrap Secrets while replacing only the StatefulSet controller.
+Run this procedure from `deploy/helm/openbao` with the candidate dependencies
+built. Use the original release, namespace and StatefulSet names. Do not combine
+this procedure with image, storage, selector, Service name or replica changes.
+Verify all members are initialized, unsealed and have Raft quorum first.
+
+Save the current StatefulSet manifest and the Pod/PVC UIDs for comparison.
+Render the candidate with the same overrides and check that selectors, Service
+name and volume-claim templates still match. Keep existing image, migration
+and JWT lifecycle settings through `--reuse-values` and your original overrides.
+
+```bash
+namespace=vault-system
+release=openbao-server
+statefulset=openbao-server
+kubectl -n "$namespace" get statefulset "$statefulset" -o yaml > orderedready-statefulset.yaml
+kubectl -n "$namespace" get pods -o json > orderedready-pods.json
+kubectl -n "$namespace" get pvc -o json > orderedready-pvcs.json
+
+kubectl -n "$namespace" patch statefulset "$statefulset" --type=merge \
+  -p '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenDeleted":"Retain","whenScaled":"Retain"}}}'
+```
+
+Wait for any PVC owner references to the old StatefulSet or its Pods to be
+removed by the retention-policy reconciliation. Then orphan its dependents.
+Do not delete Pods, PVCs or Secrets.
+
+```bash
+kubectl -n "$namespace" delete statefulset "$statefulset" --cascade=orphan --wait=true
+helm upgrade "$release" helm --namespace "$namespace" --reuse-values \
+  --set openbao.server.podManagementPolicy=Parallel \
+  --set openbao.server.updateStrategyType=OnDelete \
+  --set openbao.server.persistentVolumeClaimRetentionPolicy.whenDeleted=Retain \
+  --set openbao.server.persistentVolumeClaimRetentionPolicy.whenScaled=Retain \
+  --set openbao.server.service.publishNotReadyAddresses=false \
+  --set-string 'openbao.server.readinessProbe.path=/v1/sys/health?standbyok=true' \
+  --wait --wait-for-jobs --timeout 20m
+```
+
+Confirm the replacement StatefulSet uses `Parallel` and has adopted the same
+Pods. Their controller owner reference must use the replacement StatefulSet
+UID. Compare Pod and PVC UIDs with the saved snapshots, verify quorum and check
+that saved credentials and cluster identity are unchanged. `OnDelete` keeps
+existing Pods running during adoption. Replace them one at a time later to
+apply the strict probe, verifying recovery and quorum between replacements.
+Keep PVC retention set to `Retain` during this procedure. Restore a different
+retention or rollout policy only after adoption and recovery checks pass.
+
+### Resuming a standalone installation
 
 For a failed standalone installation whose data and saved bootstrap Secrets
 are intact, resume against the existing resources from this directory:

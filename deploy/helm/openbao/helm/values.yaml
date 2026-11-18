@@ -39,6 +39,7 @@ openbao:
   hooks:
     initializeCluster:
       apiTimeoutSeconds: 600
+      credentialTimeoutSeconds: 120
       podAnnotations: {}
       schedulingGates: []
       resources:

@@ -35,6 +35,20 @@ test "$(yq -r "$wait_job | .metadata.annotations.\"helm.sh/hook\"" "$rendered")"
 test "$(yq -r "$wait_job | .metadata.annotations.\"helm.sh/hook-weight\"" "$rendered")" = -5
 test "$(yq -r "$wait_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_WAIT_ONLY\") | .value" "$rendered")" = true
 test "$(yq -r "$wait_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_ONLY\") | .value" "$rendered")" = false
+for job in "$bootstrap_job" "$init_job" "$wait_job"; do
+    script_map=$(yq -r "$job | .spec.template.spec.volumes[] | select(.name == \"init-script\") | .configMap.name" "$rendered")
+    utils_map=$(yq -r "$job | .spec.template.spec.volumes[] | select(.name == \"utils-script\") | .configMap.name" "$rendered")
+    test -n "$script_map" && test "$script_map" != null
+    test -n "$utils_map" && test "$utils_map" != null
+    test "$(yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"$script_map\") | .data | has(\"deploy.sh\")" "$rendered")" = true
+    for script in utils log jwt-plugin bootstrap; do
+        test "$(yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"$utils_map\") | .data | has(\"$script.sh\")" "$rendered")" = true
+    done
+done
+script_map=$(yq -r "$init_job | .spec.template.spec.volumes[] | select(.name == \"init-script\") | .configMap.name" "$rendered")
+utils_map=$(yq -r "$init_job | .spec.template.spec.volumes[] | select(.name == \"utils-script\") | .configMap.name" "$rendered")
+expected_credential_timeout=$(yq -r '.openbao.hooks.initializeCluster.credentialTimeoutSeconds' "$project_dir/helm/values.yaml")
+test "$(yq -r "$bootstrap_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_CREDENTIAL_TIMEOUT_SECONDS\") | .value" "$rendered")" = "$expected_credential_timeout"
 helm template openbao "$test_root"/*.tgz --namespace test \
     -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
     --set 'openbao.hooks.initializeCluster.schedulingGates[0].name=example.com/hold' > "$test_root/gated.yaml"
@@ -84,9 +98,9 @@ for source_dir in "$project_dir" "$project_dir/helm/scripts"; do
         mkdir -p "$stage/helm/scripts/utils"
         cp "$project_dir/helm/scripts/utils/"{jwt-plugin,bootstrap}.sh "$stage/helm/scripts/utils/"
     else
-        yq -r 'select(.kind == "ConfigMap" and .metadata.name == "openbao-server-bootstrap-script") | .data."deploy.sh"' "$rendered" > "$stage/deploy.sh"
+        yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"$script_map\") | .data.\"deploy.sh\"" "$rendered" > "$stage/deploy.sh"
         for script in utils log jwt-plugin bootstrap; do
-            yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"openbao-server-bootstrap-utils\") | .data.\"$script.sh\"" "$rendered" > "$stage/utils/$script.sh"
+            yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"$utils_map\") | .data.\"$script.sh\"" "$rendered" > "$stage/utils/$script.sh"
         done
         hook_args=("${chart_command[@]:1}")
     fi

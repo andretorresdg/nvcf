@@ -5,11 +5,12 @@
 # Bound the whole kubectl process, including exec setup, without changing
 # client flags that can disable service-account authentication in-cluster.
 bootstrap_kubectl() {
-    local remaining=5 command_pid watchdog_pid rc=0
+    local limit=${bootstrap_request_timeout:-5} remaining command_pid watchdog_pid rc=0
+    remaining=$limit
     if [ -n "${bootstrap_deadline:-}" ]; then
         remaining=$((bootstrap_deadline - SECONDS))
         [ "$remaining" -gt 0 ] || return 1
-        [ "$remaining" -le 5 ] || remaining=5
+        [ "$remaining" -le "$limit" ] || remaining=$limit
     fi
     kubectl "$@" &
     command_pid=$!
@@ -40,6 +41,17 @@ bootstrap_start_wait() {
         return 1
     fi
     bootstrap_deadline=${bootstrap_deadline:-$((SECONDS + timeout))}
+}
+
+# Credential reads and writes need a separate budget after operator init.
+bootstrap_start_persistence() {
+    local timeout=${OPENBAO_CREDENTIAL_TIMEOUT_SECONDS:-120}
+    if ! [[ $timeout =~ ^[1-9][0-9]*$ ]]; then
+        log_error "OPENBAO_CREDENTIAL_TIMEOUT_SECONDS must be a positive integer"
+        return 1
+    fi
+    bootstrap_deadline=$((SECONDS + timeout))
+    bootstrap_request_timeout=$timeout
 }
 
 bootstrap_pause() {
@@ -98,11 +110,16 @@ wait_for_openbao_api() {
 # different saved credential or retry operator init to recover a lost value.
 persist_bootstrap_secret() {
     local namespace=$1 name=$2 field=$3 value=$4 action=$5
-    local encoded existing attempt
+    local encoded existing attempt snapshot version
+    local bootstrap_deadline bootstrap_request_timeout
+    bootstrap_start_persistence || return 1
     encoded=$(printf '%s' "$value" | base64 | tr -d '\n') || return 1
     for attempt in 1 2 3; do
-        if existing=$(bootstrap_kubectl get secret "$name" -n "$namespace" \
-            --ignore-not-found -o "jsonpath={.data.$field}" 2>/dev/null); then
+        if snapshot=$(bootstrap_kubectl get secret "$name" -n "$namespace" \
+            --ignore-not-found -o json 2>/dev/null); then
+            snapshot=${snapshot:-'{}'}
+            existing=$(printf '%s' "$snapshot" | jq -er --arg field "$field" '.data[$field] // ""') || existing=""
+            version=$(printf '%s' "$snapshot" | jq -r '.metadata.resourceVersion // ""') || return 1
             if [ "$existing" = "$encoded" ]; then
                 return 0
             fi
@@ -111,19 +128,26 @@ persist_bootstrap_secret() {
                 return 1
             fi
             if [ "$action" = patch ]; then
-                bootstrap_kubectl patch secret "$name" -n "$namespace" --type=merge \
-                    --patch "$(jq -cn --arg field "$field" --arg value "$encoded" '{data: {($field): $value}}')" \
-                    >/dev/null 2>&1 || true
+                if [ -n "$version" ]; then
+                    bootstrap_kubectl patch secret "$name" -n "$namespace" --type=merge \
+                        --patch "$(jq -cn --arg field "$field" --arg value "$encoded" --arg version "$version" \
+                            '{metadata: {resourceVersion: $version}, data: {($field): $value}}')" \
+                        >/dev/null 2>&1 || true
+                fi
             else
+                local state_args=()
+                if [ "$field" = root_token ]; then
+                    state_args=(--from-literal=bootstrap_state=pending)
+                fi
                 bootstrap_kubectl create secret generic "$name" -n "$namespace" \
-                    --from-literal="$field=$value" >/dev/null 2>&1 || true
+                    --from-literal="$field=$value" "${state_args[@]}" >/dev/null 2>&1 || true
             fi
             existing=$(bootstrap_kubectl get secret "$name" -n "$namespace" \
                 -o "jsonpath={.data.$field}" 2>/dev/null) || existing=""
             [ "$existing" != "$encoded" ] || return 0
         fi
         log_warn "Could not verify bootstrap Secret '$name' (attempt $attempt/3)"
-        if [ "$attempt" -lt 3 ]; then sleep 2; fi
+        if [ "$attempt" -lt 3 ]; then bootstrap_pause || true; fi
     done
     log_error "Failed to persist bootstrap Secret '$name'; restore the saved credentials before retrying"
     return 1
@@ -134,13 +158,74 @@ persist_bootstrap_credentials() {
     persist_bootstrap_secret "$namespace" "$statefulset-$suffix" "$field" "$value" "$action" || rc=1
     # Attempt both writes while the original init output is still in memory.
     persist_bootstrap_secret "$namespace" "$statefulset-root-token" root_token "$root" create || rc=1
-    return "$rc"
+    [ "$rc" = 0 ] || return "$rc"
+    local mode=shamir
+    [ "$suffix" != recovery-keys ] || mode=auto
+    complete_bootstrap_credentials "$namespace" "$statefulset" "$mode" "$root" "$value"
+}
+
+# Older installations have no state field. New root Secrets are created with
+# pending atomically, so exporting recovery keys is safe only after complete.
+bootstrap_credentials_ready() {
+    local namespace=$1 statefulset=$2 expected=${3:-} snapshot
+    snapshot=$(bootstrap_kubectl get secret "$statefulset-root-token" -n "$namespace" -o json 2>/dev/null) || return 1
+    printf '%s' "$snapshot" | jq -e --arg expected "$expected" '
+        ($expected == "" or .data.root_token == $expected) and
+        (.data.root_token | type == "string" and length > 0) and
+        ((.data.bootstrap_state // "" | @base64d) as $state |
+        $state == "" or $state == "complete")' >/dev/null 2>&1
+}
+
+complete_bootstrap_credentials() {
+    local namespace=$1 statefulset=$2 mode=$3 root=$4 expected=${5:-}
+    local bootstrap_deadline bootstrap_request_timeout
+    bootstrap_start_persistence || return 1
+    local attempt snapshot state version saved field suffix encoded
+    encoded=$(printf '%s' "$root" | base64 | tr -d '\n') || return 1
+    for attempt in 1 2 3; do
+        snapshot=$(bootstrap_kubectl get secret "$statefulset-root-token" -n "$namespace" -o json) || return 1
+        saved=$(printf '%s' "$snapshot" | jq -r '.data.root_token // ""') || return 1
+        if [ -z "$encoded" ] || [ "$saved" != "$encoded" ]; then
+            log_error "Saved root token changed before bootstrap completion; refusing to mark complete"
+            return 1
+        fi
+        state=$(printf '%s' "$snapshot" | jq -r '.data.bootstrap_state // "" | @base64d') || return 1
+        case "$state" in
+            ""|complete) return 0 ;;
+            pending) ;;
+            *) log_error "Unknown bootstrap credential state"; return 1 ;;
+        esac
+        suffix=unseal field=unseal_key
+        if [ "$mode" = auto ]; then suffix=recovery-keys field=recovery_keys_b64; fi
+        saved=$(bootstrap_kubectl get secret "$statefulset-$suffix" -n "$namespace" -o "jsonpath={.data.$field}" 2>/dev/null) || return 1
+        saved=$(printf '%s' "$saved" | base64 -d) || return 1
+        if [ -z "$saved" ] || { [ -n "$expected" ] && [ "$saved" != "$expected" ]; }; then
+            log_error "Bootstrap credentials are incomplete; restore the matching '$statefulset-$suffix' Secret"
+            return 1
+        fi
+        if [ "$mode" = auto ] && ! printf '%s' "$saved" | jq -e \
+            'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' >/dev/null; then
+            log_error "Saved recovery keys are invalid; refusing to mark bootstrap complete"
+            return 1
+        fi
+        version=$(printf '%s' "$snapshot" | jq -er '.metadata.resourceVersion') || return 1
+        bootstrap_kubectl patch secret "$statefulset-root-token" -n "$namespace" --type=merge \
+            --patch "$(jq -cn --arg version "$version" --arg state "$(printf complete | base64 | tr -d '\n')" \
+                '{metadata: {resourceVersion: $version}, data: {bootstrap_state: $state}}')" >/dev/null 2>&1 || true
+        # Reread after success or a lost response, including on the last attempt.
+        if bootstrap_credentials_ready "$namespace" "$statefulset" "$encoded"; then return 0; fi
+        if [ "$attempt" -lt 3 ]; then bootstrap_pause || true; fi
+    done
+    log_error "Could not record bootstrap credential completion"
+    return 1
 }
 
 # BOOTSTRAP_INITIALIZED is read by the deployment script.
 # shellcheck disable=SC2034
 check_bootstrap_credentials() {
     local namespace=$1 statefulset=$2 mode=$3 status root key existing
+    local bootstrap_deadline bootstrap_request_timeout
+    bootstrap_start_persistence || return 1
     BOOTSTRAP_INITIALIZED=false
     status=$(openbao_status "$namespace" "$statefulset-0") || return 1
     if [ "$(printf '%s' "$status" | jq -r '.initialized')" = true ]; then
@@ -156,13 +241,14 @@ check_bootstrap_credentials() {
                 return 1
             fi
         fi
+        complete_bootstrap_credentials "$namespace" "$statefulset" "$mode" "$root" || return 1
         BOOTSTRAP_INITIALIZED=true
         log_info "OpenBao is initialized; reusing saved bootstrap credentials"
         return 0
     fi
     local suffix
     for suffix in root-token recovery-keys; do
-        existing=$(kubectl get secret "$statefulset-$suffix" \
+        existing=$(bootstrap_kubectl get secret "$statefulset-$suffix" \
             -n "$namespace" --ignore-not-found -o name) || return 1
         if [ -n "$existing" ]; then
             log_error "OpenBao is uninitialized but bootstrap credentials exist; restore the matching data"
@@ -220,23 +306,31 @@ unseal_openbao_members() {
 }
 
 wait_for_openbao_members() {
-    local namespace=$1 statefulset=$2 require_root=$3 i status complete root
+    local namespace=$1 statefulset=$2 require_root=$3 i status complete replicas confirmed
     while :; do
         complete=true
+        replicas=$(bootstrap_kubectl get statefulset "$statefulset" -n "$namespace" -o jsonpath='{.spec.replicas}') || replicas=""
+        if [[ $replicas =~ ^[1-9][0-9]*$ ]]; then
+            OPENBAO_REPLICAS=$replicas
+        else
+            complete=false
+        fi
         for ((i = 0; i < OPENBAO_REPLICAS; i++)); do
+            [ "$complete" = true ] || break
             status=$(openbao_status "$namespace" "$statefulset-$i") || status=""
             if [ -z "$status" ] || ! printf '%s' "$status" | jq -e '.initialized and (.sealed | not)' >/dev/null; then
                 complete=false
                 break
             fi
         done
-        root=""
         if [ "$complete" = true ] && [ "$require_root" = true ]; then
-            root=$(get_root_token "$namespace" "$statefulset" 2>/dev/null) || root=""
-            [ -n "$root" ] && [ "$root" != null ] || complete=false
+            bootstrap_credentials_ready "$namespace" "$statefulset" || complete=false
         fi
-        if [ "$complete" = true ] && [ "$SECONDS" -lt "$bootstrap_deadline" ]; then
-            return 0
+        if [ "$complete" = true ]; then
+            confirmed=$(bootstrap_kubectl get statefulset "$statefulset" -n "$namespace" -o jsonpath='{.spec.replicas}') || confirmed=""
+            if [ "$confirmed" = "$replicas" ] && [ "$SECONDS" -lt "$bootstrap_deadline" ]; then
+                return 0
+            fi
         fi
         if [ "$SECONDS" -ge "$bootstrap_deadline" ]; then
             log_error "Timed out waiting for OpenBao bootstrap to finish"

@@ -37,7 +37,12 @@ Feature: Bootstrap OpenBao with strict readiness and preserve initialized state
       | openbao-server-2 | true        | false  |
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'mkdir -p "$3"; kubectl --context "$1" -n "$2" exec openbao-server-0 -c openbao -- bao status -format=json | jq -r .cluster_id > "$3/cluster-id-before"; kubectl --context "$1" -n "$2" get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > "$3/credentials-before"' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get secret openbao-server-root-token -o jsonpath='"'"'{.data.bootstrap_state}'"'"' | base64 -d' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      """
+    Then the command output should contain "complete"
+    When I successfully run command:
+      """
+      /bin/bash -e -o pipefail -c 'mkdir -p "$3"; kubectl --context "$1" -n "$2" exec openbao-server-0 -c openbao -- bao status -format=json | jq -er '"'"'.cluster_id | strings | select(length > 0)'"'"' > "$3/cluster-id-before"; kubectl --context "$1" -n "$2" get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > "$3/credentials-before"' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
@@ -58,7 +63,7 @@ Feature: Bootstrap OpenBao with strict readiness and preserve initialized state
       """
     When I poll command for up to 45 seconds until output contains "endpoint=excluded":
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get endpointslices -l kubernetes.io/service-name=openbao-server -o json | jq -e --arg pod "$(cat "$3/sealed-member")" '"'"'(.items | length > 0) and ([.items[].endpoints[]? | select(.targetRef.name == $pod and .conditions.ready == true)] | length == 0)'"'"' >/dev/null && echo endpoint=excluded' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" get endpointslices -l kubernetes.io/service-name=openbao-server -o json | jq -e --arg pod "$(cat "$3/sealed-member")" '"'"'(.items | length > 0) and ([.items[].endpoints[]? | select(.targetRef.name == $pod and .conditions.ready == true)] | length == 0) and any(.items[].endpoints[]?; .targetRef.name != $pod and .conditions.ready == true and (.targetRef.name // "" | startswith("openbao-server-")))'"'"' >/dev/null && echo endpoint=excluded' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     When I successfully run command:
       """
@@ -79,7 +84,7 @@ Feature: Bootstrap OpenBao with strict readiness and preserve initialized state
       """
     When I successfully run command:
       """
-      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" exec openbao-server-0 -c openbao -- bao status -format=json | jq -r .cluster_id > "$3/cluster-id-after"; kubectl --context "$1" -n "$2" get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > "$3/credentials-after"; cmp "$3/cluster-id-before" "$3/cluster-id-after" && cmp "$3/credentials-before" "$3/credentials-after" && echo state=preserved' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
+      /bin/bash -e -o pipefail -c 'kubectl --context "$1" -n "$2" exec openbao-server-0 -c openbao -- bao status -format=json | jq -er '"'"'.cluster_id | strings | select(length > 0)'"'"' > "$3/cluster-id-after"; kubectl --context "$1" -n "$2" get secrets openbao-server-unseal openbao-server-root-token -o json | jq -c '"'"'[.items[] | {name: .metadata.name, data}] | sort_by(.name)'"'"' | shasum -a 256 > "$3/credentials-after"; cmp "$3/cluster-id-before" "$3/cluster-id-after" && cmp "$3/credentials-before" "$3/credentials-after" && echo state=preserved' qa "${OPENBAO_TEST_CONTEXT}" "${OPENBAO_TEST_NAMESPACE}" "${OPENBAO_TEST_ARTIFACTS}"
       """
     Then the command output should contain "state=preserved"
     When I successfully run command:

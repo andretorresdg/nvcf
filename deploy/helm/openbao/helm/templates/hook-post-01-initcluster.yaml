@@ -87,6 +87,8 @@ spec:
               value: {{ $waitOnly | quote }}
             - name: OPENBAO_API_TIMEOUT_SECONDS
               value: {{ .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds | default 600 | quote }}
+            - name: OPENBAO_CREDENTIAL_TIMEOUT_SECONDS
+              value: {{ .Values.openbao.hooks.initializeCluster.credentialTimeoutSeconds | default 120 | quote }}
             - name: JWT_PLUGIN_LIFECYCLE_MODE
               value: {{ include "nvcf-openbao.jwtLifecycleMode" . | quote }}
             - name: AUTO_UNSEAL

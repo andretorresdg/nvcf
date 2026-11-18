@@ -4848,6 +4848,8 @@ func TestOpenBaoBootstrapReadinessFeatureFileWiresToSteps(t *testing.T) {
 	}
 	runner.respond = func(command string) (harness.Result, bool) {
 		switch {
+		case strings.Contains(command, "bootstrap_state"):
+			return harness.Result{Stdout: "complete"}, true
 		case strings.Contains(command, "get statefulset"):
 			return harness.Result{Stdout: `[{"name":"openbao","path":"/v1/sys/health?standbyok=true"}]`}, true
 		case strings.Contains(command, "bao status") && strings.Contains(command, "jq -sc"):
