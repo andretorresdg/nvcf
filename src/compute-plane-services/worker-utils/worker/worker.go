@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -288,7 +289,9 @@ func NewNVCFWorker(ctx context.Context, zapLogger *logs.ZapLogger, config Config
 
 	shutdownCtx, shutdownCancel := context.WithCancel(ctx)
 
-	w := &NVCFWorker{
+	var w *NVCFWorker
+	healthReadyHandler := h.Handler()
+	w = &NVCFWorker{
 		globalCtx:               ctx,
 		shutdownCtx:             shutdownCtx,
 		shutdownCancel:          shutdownCancel,
@@ -352,7 +355,9 @@ func NewNVCFWorker(ctx context.Context, zapLogger *logs.ZapLogger, config Config
 			// only running a healthcheck server
 			servers.WithRegisterServer(func(*grpc.Server) {}),
 			servers.WithHttpHealthEndpoints("/v1/health/live"),
-			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": h.Handler()}),
+			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				w.serveReady(rw, r, healthReadyHandler)
+			})}),
 		),
 	}
 	return w, nil
@@ -528,15 +533,6 @@ func (w *NVCFWorker) Run(withHttpServer bool) error {
 		return types.NewInternalError(err)
 	}
 
-	err = w.health.Register(health.Config{
-		Name:    "nats-consumer",
-		Timeout: 1 * time.Second,
-		Check:   w.checkNatsConsumerSetup,
-	})
-	if err != nil {
-		return types.NewInternalError(err)
-	}
-
 	err = metrics.Initialize(metrics.NvcfRootNamespace, w.nvcfClient.NatsConn)
 	if err != nil {
 		return types.NewInternalError(err)
@@ -572,7 +568,7 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 		setupCtx, cancelSetup := context.WithCancel(ctx)
 		stopSetupAfterFunc := context.AfterFunc(w.shutdownCtx, cancelSetup)
 		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(), func() (*consumer.GlobalNatsConsumer, error) {
-			connectedRegion := *w.nvcfClient.ConnectedRegions.Load()
+			connectedRegion := w.nvcfClient.ConnectedRegions.Load()
 			c, err := consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
 				_, err := w.nvcfClient.Client.ProvisionRegionalWorker(ctx, &pb.ProvisionWorkerRequest{
 					InstanceId:        w.config.InstanceId,
@@ -582,7 +578,14 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 				}, auth.GrpcTokenFromSource(w.nvcfClient.NvcfTokenProvider))
 				return err
 			}, w.config.FunctionVersionId, connectedRegion.Primary, connectedRegion.Secondaries, w.config.MaxRequestConcurrency)
-			w.natsConsumerSetupFailing.Store(err != nil)
+			if err == nil && !sameRegions(connectedRegion, w.nvcfClient.ConnectedRegions.Load()) {
+				// The region reload skips a reload while no consumer is stored, so a consumer built for regions
+				// that changed during setup would stay on them until the next reconnect refresh.
+				c, err = nil, errRegionsChangedDuringSetup
+			}
+			if !errors.Is(err, errRegionsChangedDuringSetup) {
+				w.natsConsumerSetupFailing.Store(err != nil)
+			}
 			return c, err
 		}, zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
 		stopSetupAfterFunc()
@@ -750,13 +753,26 @@ func newNatsConsumerWithRetry(ctx context.Context, b backoff.BackOff, create fun
 	return c, err
 }
 
-// checkNatsConsumerSetup fails while NATS consumer setup keeps failing, for example when NATS is connected but the
-// consumer cannot be attached, so the worker does not look able to receive work.
-func (w *NVCFWorker) checkNatsConsumerSetup(context.Context) error {
-	if w.natsConsumerSetupFailing.Load() {
-		return errors.New("nats consumer setup is failing")
+var errRegionsChangedDuringSetup = errors.New("connected regions changed during nats consumer setup")
+
+func sameRegions(a, b *nvcf.ConnectionRegions) bool {
+	if a == nil || b == nil {
+		return a == b
 	}
-	return nil
+	return a.Primary == b.Primary && slices.Equal(slices.Sorted(slices.Values(a.Secondaries)), slices.Sorted(slices.Values(b.Secondaries)))
+}
+
+// serveReady reports not ready while NATS consumer setup keeps failing, for example when NATS is connected but the
+// consumer cannot be attached, so the worker does not look able to receive work. Otherwise it serves the health
+// checks. The consumer state is kept out of w.health because the inference health loop also gates fetching on it.
+func (w *NVCFWorker) serveReady(rw http.ResponseWriter, r *http.Request, next http.Handler) {
+	if w.natsConsumerSetupFailing.Load() {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = rw.Write([]byte(`{"status":"Unavailable","failures":{"nats-consumer":"nats consumer setup is failing"}}`))
+		return
+	}
+	next.ServeHTTP(rw, r)
 }
 
 // isPermanentSetupError reports whether worker provisioning rejected the

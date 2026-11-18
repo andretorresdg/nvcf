@@ -21,6 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/consumer"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/nvcf"
 )
 
 func TestNewNatsConsumerWithRetry(t *testing.T) {
@@ -178,9 +181,11 @@ func TestNatsConsumerSetupBackOff(t *testing.T) {
 	}
 
 	maxFast := natsConsumerFastRetryMaxWait + natsConsumerFastRetryMaxWait/4
-	for now.Sub(time.Unix(0, 0)) < natsConsumerFastRetryPeriod {
+	for i := 0; now.Sub(time.Unix(0, 0)) < natsConsumerFastRetryPeriod; i++ {
+		require.Less(t, i, 1000, "fast phase did not reach its end")
 		wait := b.NextBackOff()
 		require.NotEqual(t, backoff.Stop, wait)
+		require.Positive(t, wait)
 		require.LessOrEqual(t, wait, maxFast, "fast phase at %s", now.Sub(time.Unix(0, 0)))
 		advance(wait)
 	}
@@ -190,6 +195,7 @@ func TestNatsConsumerSetupBackOff(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		wait := b.NextBackOff()
 		require.NotEqual(t, backoff.Stop, wait, "the backoff must never stop on its own")
+		require.Positive(t, wait)
 		require.LessOrEqual(t, wait, maxSlow)
 		sawSlow = sawSlow || wait > maxFast
 		advance(wait)
@@ -217,13 +223,29 @@ func TestPhasedBackOffReset(t *testing.T) {
 	assert.Equal(t, time.Second, b.NextBackOff())
 }
 
-func TestCheckNatsConsumerSetup(t *testing.T) {
+func TestServeReady(t *testing.T) {
 	w := &NVCFWorker{}
-	require.NoError(t, w.checkNatsConsumerSetup(context.Background()))
+	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
+	serve := func() int {
+		rec := httptest.NewRecorder()
+		w.serveReady(rec, httptest.NewRequest(http.MethodGet, "/v1/health/ready", nil), next)
+		return rec.Code
+	}
 
+	assert.Equal(t, http.StatusOK, serve())
 	w.natsConsumerSetupFailing.Store(true)
-	require.Error(t, w.checkNatsConsumerSetup(context.Background()))
-
+	assert.Equal(t, http.StatusServiceUnavailable, serve())
 	w.natsConsumerSetupFailing.Store(false)
-	require.NoError(t, w.checkNatsConsumerSetup(context.Background()))
+	assert.Equal(t, http.StatusOK, serve(), "ready again as soon as setup succeeds")
+}
+
+func TestSameRegions(t *testing.T) {
+	r := func(primary string, secondaries ...string) *nvcf.ConnectionRegions {
+		return &nvcf.ConnectionRegions{Primary: primary, Secondaries: secondaries}
+	}
+	assert.True(t, sameRegions(r("a", "b", "c"), r("a", "c", "b")))
+	assert.False(t, sameRegions(r("a", "b"), r("b", "a")))
+	assert.False(t, sameRegions(r("a", "b"), r("a", "b", "c")))
+	assert.False(t, sameRegions(r("a"), nil))
+	assert.True(t, sameRegions(nil, nil))
 }
