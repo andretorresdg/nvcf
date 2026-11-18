@@ -269,6 +269,33 @@ plugin version. Keep `openbao.jwtPluginLifecycle.mode=versioned` and use hooks
 so the target-only preflight verifies mounts before the rollout. Verify again
 after leadership changes.
 
+When the UI is enabled, set
+`addons.nvcfUi.openbaoMigrations.jwtPluginVersion` in the stack environment to
+`JWT_PLUGIN_TARGET_VERSION` from the selected server image's
+`/openbao/jwt-plugin-versions.env`. Select a UI chart that forwards this value
+as `BAO_JWT_PLUGIN_VERSION` and a migrations image that supports it. Keep this
+an explicit release setting when the server target changes.
+
+Before qualifying that release, run from the source checkout with Helm 3,
+Helmfile 1.1.x, yq 4 and Docker. Authenticate to the selected image and chart
+registries first. Use the actual release environment, including its image,
+chart and plugin version settings:
+
+```bash
+tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed "$HELMFILE_ENV"
+```
+
+The check renders the selected published charts, reads the target from the
+selected server image and exercises the selected migration image's mount
+helper without a server connection. Missing, empty or mismatched UI versions
+and incompatible migration images fail qualification. PR tests check stack
+propagation and rejection cases with simulated images. The self-managed tag
+workflow checks the published artifacts with the optional UI enabled before
+creating release notes and inventory assets. CI uses `NVCF_RELEASE_NGC_API_KEY`
+for NGC authentication with temporary Helm and Docker configurations.
+Legacy and bridge images retain unversioned mount support; a disabled UI has
+no UI migration check. Continue with runtime signing and rollback validation.
+
 ```bash
 bao_admin jwt-plugin-lifecycle verify
 bao_admin jwt-plugin-lifecycle cleanup

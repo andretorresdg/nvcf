@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Render the selected published charts with actual environment values. Extra
+# arguments after STACK ENV are passed to Helmfile as state configuration.
+set -euo pipefail
+fail() { echo "qualify-openbao-ui-jwt-version: $*" >&2; exit 1; }
+[[ $# -ge 2 ]] || fail 'usage: qualify-openbao-ui-jwt-version STACK_DIR ENVIRONMENT [HELMFILE_GLOBAL_ARGS...]'
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+stack=$(cd "$1" && pwd) environment=$2
+shift 2
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+umask 077
+cp -R "$stack" "$work/stack"
+stack="$work/stack"
+[[ -f $stack/environments/$environment.yaml ]] || fail "environment $environment does not exist"
+# Render-only qualification needs no application credentials. Retain supplied
+# secrets when present because they can affect the selected release values.
+[[ -f $stack/secrets/$environment-secrets.yaml ]] || printf '{}\n' > "$stack/secrets/$environment-secrets.yaml"
+export HELMFILE_ENV=$environment
+export HELMFILE_CACHE_HOME="$work/helmfile-cache"
+registry_config=$(helm env HELM_REGISTRY_CONFIG)
+export HELM_CACHE_HOME="$work/helm/cache"
+export HELM_CONFIG_HOME="$work/helm/config"
+export HELM_DATA_HOME="$work/helm/data"
+export HELM_REGISTRY_CONFIG="$HELM_CONFIG_HOME/registry/config.json"
+export HELM_REPOSITORY_CONFIG="$HELM_CONFIG_HOME/repositories.yaml"
+export HELM_REPOSITORY_CACHE="$HELM_CACHE_HOME/repository"
+if [[ -f $registry_config ]]; then
+  mkdir -p "$HELM_CONFIG_HOME/registry"
+  cp "$registry_config" "$HELM_CONFIG_HOME/registry/config.json"
+fi
+if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+  # Keep credentials out of argv and use disposable Helm and Docker configs.
+  # shellcheck disable=SC2016
+  yq -n '.global.helm.sources.username = "$oauthtoken" |
+    .global.helm.sources.password = strenv(NVCF_RELEASE_NGC_API_KEY)' > "$work/registry-values.yaml"
+  set -- "$@" --state-values-file "$work/registry-values.yaml"
+fi
+
+helmfile --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
+  --allow-no-matching-release -l name=nvcf-ui list --skip-charts --output json > "$work/ui-releases.json"
+if [[ $(yq -r 'length' "$work/ui-releases.json") == 0 ]]; then
+  echo 'openbao-ui-jwt-version: UI disabled; no UI migration Job to qualify'
+  exit 0
+fi
+if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+  export DOCKER_CONFIG="$work/docker"
+  printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+fi
+helmfile --environment default -f "$stack/helmfile.d/01-dependencies.yaml.gotmpl" "$@" \
+  -l name=openbao-server template > "$work/openbao.yaml"
+helmfile --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
+  -l name=nvcf-ui template > "$work/ui.yaml"
+"$script_dir/check-openbao-ui-jwt-version" "$work/openbao.yaml" "$work/ui.yaml"

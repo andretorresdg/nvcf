@@ -39,6 +39,18 @@ AGENTS.md   Rules for working in this directory.
 
 ## Running
 
+`TestOpenBaoUIJWTVersion` renders a saved target-only release configuration
+and checks its selected server and UI migration images without a cluster.
+Set `OPENBAO_UI_JWT_STACK` to the stack directory and
+`OPENBAO_UI_JWT_ENVIRONMENT` to its environment name. The environment must
+enable the UI and explicitly configure its JWT plugin version. Authenticate
+to its registries, then run:
+
+```sh
+cd tests/bdd
+go test -count=1 -run '^TestOpenBaoUIJWTVersion$' -timeout 20m -v
+```
+
 `TestUpgradeReadOnlyChecks` exercises the downloadable upgrade scripts against
 an existing installation. Export the dedicated kubeconfig/context variables and
 the selected control-plane stack version from the
