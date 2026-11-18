@@ -31,13 +31,6 @@ if [[ -f $registry_config ]]; then
   mkdir -p "$HELM_CONFIG_HOME/registry"
   cp "$registry_config" "$HELM_CONFIG_HOME/registry/config.json"
 fi
-if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
-  # Keep credentials out of argv and use disposable Helm and Docker configs.
-  # shellcheck disable=SC2016
-  yq -n '.global.helm.sources.username = "$oauthtoken" |
-    .global.helm.sources.password = strenv(NVCF_RELEASE_NGC_API_KEY)' > "$work/registry-values.yaml"
-  set -- "$@" --state-values-file "$work/registry-values.yaml"
-fi
 
 helmfile --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
   --allow-no-matching-release -l name=nvcf-ui list --skip-charts --output json > "$work/ui-releases.json"
@@ -46,11 +39,38 @@ if [[ $(yq -r 'length' "$work/ui-releases.json") == 0 ]]; then
   exit 0
 fi
 if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
-  export DOCKER_CONFIG="$work/docker"
-  printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+  export NVCF_RELEASE_NGC_DOCKER_CONFIG="$work/docker"
+  mkdir -p "$NVCF_RELEASE_NGC_DOCKER_CONFIG"
+  # Seed an auth entry so Docker does not auto-detect a shared OS keychain.
+  printf '{"auths":{"nvcr.io":{}}}\n' > "$NVCF_RELEASE_NGC_DOCKER_CONFIG/config.json"
+  printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | DOCKER_CONFIG="$NVCF_RELEASE_NGC_DOCKER_CONFIG" docker login nvcr.io --username '$oauthtoken' --password-stdin
 fi
-helmfile --environment default -f "$stack/helmfile.d/01-dependencies.yaml.gotmpl" "$@" \
-  -l name=openbao-server template > "$work/openbao.yaml"
-helmfile --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
-  -l name=nvcf-ui template > "$work/ui.yaml"
+# A local empty chart lets build resolve repositories without downloading charts.
+mkdir -p "$work/source-chart"
+printf 'apiVersion: v2\nname: source-check\nversion: 0.0.0\n' > "$work/source-chart/Chart.yaml"
+# Resolve each state's effective repository before supplying credentials.
+# Helmfile reads NVCF_USERNAME/PASSWORD at repo authentication time and passes
+# the password to Helm on stdin, without adding it to rendered state.
+render_release() {
+  local state=$1 release=$2
+  shift 2
+  helmfile --environment default -f "$stack/helmfile.d/$state" "$@" \
+    -l "name=$release" --chart "$work/source-chart" build > "$work/state.yaml"
+  local origin
+  origin=$(yq -r '.repositories[] | select(.name == "nvcf") | .url' "$work/state.yaml")
+  case "$origin" in
+    https://helm.ngc.nvidia.com|https://helm.ngc.nvidia.com/*)
+      if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+        NVCF_USERNAME=\$oauthtoken NVCF_PASSWORD=$NVCF_RELEASE_NGC_API_KEY \
+          helmfile --environment default -f "$stack/helmfile.d/$state" "$@" \
+          -l "name=$release" template
+        return
+      fi
+      ;;
+  esac
+  helmfile --environment default -f "$stack/helmfile.d/$state" "$@" \
+    -l "name=$release" template
+}
+render_release 01-dependencies.yaml.gotmpl openbao-server "$@" > "$work/openbao.yaml"
+render_release 02-core.yaml.gotmpl nvcf-ui "$@" > "$work/ui.yaml"
 "$script_dir/check-openbao-ui-jwt-version" "$work/openbao.yaml" "$work/ui.yaml"

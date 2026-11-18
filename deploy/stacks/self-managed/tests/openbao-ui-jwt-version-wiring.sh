@@ -15,6 +15,11 @@ cp -R "$repo_root/migrations/openbao/migrations/utils" "$work/image/app/migratio
 cp "$repo_root/infra/openbao/jwt-plugin-versions.env" "$work/image/openbao/"
 export TEST_IMAGE_ROOT="$work/image" TEST_DOCKER_CALLS="$work/docker-calls"
 export TEST_MIGRATION_COMPATIBLE=true
+export DOCKER_CONFIG="$work/operator-docker"
+mkdir -p "$DOCKER_CONFIG"
+printf '{"credsStore":"fixture","auths":{"mirror.example.com":{}}}\n' > "$DOCKER_CONFIG/config.json"
+cp "$DOCKER_CONFIG/config.json" "$work/original-docker.json"
+export TEST_OPERATOR_DOCKER_CONFIG=$DOCKER_CONFIG
 # shellcheck disable=SC1091
 source "$work/image/openbao/jwt-plugin-versions.env"
 target=$JWT_PLUGIN_TARGET_VERSION old=$JWT_PLUGIN_OLD_VERSION
@@ -30,6 +35,9 @@ printf '%s\n' "$*" >> "$TEST_DOCKER_CALLS"
 if [[ $1 == login ]]; then
   supplied=$(cat)
   [[ $supplied == fixture-registry-key ]]
+  [[ $DOCKER_CONFIG != "$TEST_OPERATOR_DOCKER_CONFIG" ]]
+  yq -e '(.auths | has("nvcr.io")) and (.credsStore == null) and (.credHelpers == null)' "$DOCKER_CONFIG/config.json" >/dev/null
+  printf '{"auths":{"nvcr.io":{"auth":"fixture"}}}\n' > "$DOCKER_CONFIG/config.json"
   exit
 fi
 [[ $1 == run ]]; shift
@@ -43,12 +51,21 @@ while (($#)); do
   esac
 done
 image=$1; shift
+if [[ $image == nvcr.io/* && -n ${NVCF_RELEASE_NGC_DOCKER_CONFIG:-} ]]; then
+  [[ $DOCKER_CONFIG == "$NVCF_RELEASE_NGC_DOCKER_CONFIG" ]]
+  [[ -f $DOCKER_CONFIG/config.json ]]
+else
+  [[ $DOCKER_CONFIG == "$TEST_OPERATOR_DOCKER_CONFIG" ]]
+fi
 [[ $1 == -ec ]]; shift
 probe=$1
 if [[ $entrypoint == /bin/bash && $TEST_MIGRATION_COMPATIBLE == noop ]]; then
   exit 0
 fi
-if [[ $entrypoint == /bin/bash && $TEST_MIGRATION_COMPATIBLE != true ]]; then
+if [[ $entrypoint == /bin/bash && $TEST_MIGRATION_COMPATIBLE == joined ]]; then
+  joined_helper='enable_secrets_mount() { bao "secrets enable -path=$1 -plugin-version=$BAO_JWT_PLUGIN_VERSION $2"; }'
+  probe=${probe/source \/app\/migrations\/utils\/functions.sh/$joined_helper}
+elif [[ $entrypoint == /bin/bash && $TEST_MIGRATION_COMPATIBLE != true ]]; then
   # An older helper accepts the input but creates an unversioned mount.
   legacy_helper='enable_secrets_mount() { bao secrets enable "-path=$1" "$2"; }'
   probe=${probe/source \/app\/migrations\/utils\/functions.sh/$legacy_helper}
@@ -111,6 +128,23 @@ grep -Fq "$ui_image" "$TEST_DOCKER_CALLS"
 export TEST_HELMFILE_BIN
 TEST_HELMFILE_BIN=$(command -v helmfile)
 export TEST_UI_CHART="$chart" TEST_SERVER_CHART="$work/server-chart"
+export TEST_REAL_HELM TEST_AUTH_HELM="$work/auth-helm" TEST_AUTH_LOG="$work/auth-log"
+TEST_REAL_HELM=$(command -v helm)
+cat > "$TEST_AUTH_HELM" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $1 == repo && $2 == add ]]; then
+  if [[ $3 == nvcf ]]; then
+    [[ $4 == https://helm.ngc.nvidia.com/nvidia/nvcf ]]
+    [[ $* == *--password-stdin* && $* != *fixture-registry-key* ]]
+    [[ $(cat) == fixture-registry-key ]]
+    echo ngc-authenticated >> "$TEST_AUTH_LOG"
+  fi
+  exit 0
+fi
+exec "$TEST_REAL_HELM" "$@"
+BASH
+chmod +x "$TEST_AUTH_HELM"
 mkdir -p "$TEST_SERVER_CHART/templates"
 printf 'apiVersion: v2\nname: test-openbao\nversion: 0.0.0\n' > "$TEST_SERVER_CHART/Chart.yaml"
 cp "$repo_root/deploy/helm/openbao/helm/values.yaml" "$TEST_SERVER_CHART/values.yaml"
@@ -131,6 +165,16 @@ cat > "$work/bin/helmfile" <<'BASH'
 set -euo pipefail
 for arg in "$@"; do
   if [[ $arg == template ]]; then
+    if [[ ${TEST_CHART_ORIGIN:-} == ngc ]]; then
+      [[ $NVCF_USERNAME == '$oauthtoken' && $NVCF_PASSWORD == fixture-registry-key ]]
+      auth_args=()
+      for auth_arg in "$@"; do
+        if [[ $auth_arg == template ]]; then auth_args+=(repos); else auth_args+=("$auth_arg"); fi
+      done
+      "$TEST_HELMFILE_BIN" --helm-binary "$TEST_AUTH_HELM" "${auth_args[@]}"
+    else
+      [[ ${NVCF_PASSWORD:-} != fixture-registry-key ]]
+    fi
     if [[ $* == *01-dependencies.yaml.gotmpl* ]]; then
       exec "$TEST_HELMFILE_BIN" "$@" --chart "$TEST_SERVER_CHART" --skip-deps
     else
@@ -146,10 +190,36 @@ qualify() {
     --state-values-set ingress.gatewayApi.gateways.shared.name=shared-gw \
     --state-values-set ingress.gatewayApi.gateways.shared.namespace=envoy-gateway-system \
     --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
-    --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system
+    --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system "$@"
 }
-qualify
 TEST_NGC_API_KEY=fixture-registry-key qualify
+# Pin distinct fixture image references to detect incorrect release selection.
+yq -i '.global.image.registry = "mirror.example.com" |
+  .global.image.repository = "selected" |
+  .addons.nvcfUi.openbaoMigrations.image.tag = "fixture-migration"' "$work/stack/environments/$environment.yaml"
+: > "$TEST_DOCKER_CALLS"
+qualify
+server_tag=$(yq -r '.openbao.server.image.tag' "$TEST_SERVER_CHART/values.yaml")
+grep -Fq "mirror.example.com/selected/nvcf-openbao:$server_tag" "$TEST_DOCKER_CALLS"
+grep -Fq 'mirror.example.com/selected/nvcf-openbao-migrations:fixture-migration' "$TEST_DOCKER_CALLS"
+# The NGC key must not replace mirror chart credentials or leak at debug level.
+yq -i '.global.helm.sources.url = "https://mirror.example.com/charts" |
+  .global.helm.sources.username = "mirror-user" |
+  .global.helm.sources.password = "mirror-password"' "$work/stack/environments/$environment.yaml"
+TEST_NGC_API_KEY=fixture-registry-key qualify --log-level debug > "$work/result" 2>&1
+if grep -Fq fixture-registry-key "$work/result"; then fail 'NGC key leaked in mirror debug output'; fi
+grep -Fq mirror-password "$work/result"
+# An exact NGC origin may use the key without rendering it into Helmfile state.
+TEST_CHART_ORIGIN=ngc TEST_NGC_API_KEY=fixture-registry-key qualify --log-level debug \
+  --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com/nvidia/nvcf \
+  --state-values-set global.helm.sources.username= \
+  --state-values-set global.helm.sources.password= > "$work/result" 2>&1
+if grep -Fq fixture-registry-key "$work/result"; then fail 'NGC key leaked in NGC debug output'; fi
+test "$(grep -c ngc-authenticated "$TEST_AUTH_LOG")" = 2
+# A lookalike hostname is still a mirror.
+TEST_NGC_API_KEY=fixture-registry-key qualify \
+  --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com.example.com/charts
+cmp "$work/original-docker.json" "$DOCKER_CONFIG/config.json"
 if grep -Fq fixture-registry-key "$TEST_DOCKER_CALLS"; then fail 'registry credential appeared in command arguments'; fi
 render "      jwtPluginVersion: $old"
 if qualify > "$work/result" 2>&1; then fail 'qualification accepted stale saved environment values'; fi
@@ -166,6 +236,11 @@ render '      jwtPluginVersion: v99.0.0'
 reject 'mismatched version' "expected $target"
 
 render "      jwtPluginVersion: $target"
+OPENBAO_UI_JWT_TEST_VERSION=$target yq -i '(select(.kind == "Job") | .spec.template.spec.containers[] | select(.name == "openbao-migrations") | .env[] | select(.name == "BAO_JWT_PLUGIN_VERSION") | .value) = strenv(OPENBAO_UI_JWT_TEST_VERSION) + "\n"' "$work/ui.yaml"
+reject 'version with trailing newline' "expected $target"
+render "      jwtPluginVersion: $target"
+export TEST_MIGRATION_COMPATIBLE=joined
+reject 'migration helper joining arguments' 'does not support explicit JWT plugin version selection'
 export TEST_MIGRATION_COMPATIBLE=false
 reject 'migration image that ignores the version' 'does not support explicit JWT plugin version selection'
 export TEST_MIGRATION_COMPATIBLE=true

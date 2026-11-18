@@ -15,7 +15,20 @@ server_image=$server_images
 
 # Run only inspection commands. Never start the server or contact a cluster.
 isolation=(--rm --pull always --network none --read-only --cap-drop ALL --security-opt no-new-privileges)
-layout=$(docker run "${isolation[@]}" --entrypoint /bin/sh "$server_image" -ec '
+# Use the temporary NGC login only for NGC images. Mirror pulls retain the
+# operator's Docker config and credential helpers.
+docker_image() {
+  local image=$1
+  shift
+  if [[ $image == nvcr.io/* && -n ${NVCF_RELEASE_NGC_DOCKER_CONFIG:-} ]]; then
+    DOCKER_CONFIG=$NVCF_RELEASE_NGC_DOCKER_CONFIG docker "$@"
+  else
+    docker "$@"
+  fi
+}
+# The inspection script expands variables inside the selected image.
+# shellcheck disable=SC2016
+layout=$(docker_image "$server_image" run "${isolation[@]}" --entrypoint /bin/sh "$server_image" -ec '
   if test -x /openbao/plugins/vault-plugin-secrets-jwt; then
     echo legacy-or-bridge
   else
@@ -37,7 +50,8 @@ container='select(.kind == "Job") | .spec.template.spec.containers[] | select(.n
 count=$(yq ea -r "[. | $container] | length" "$ui_manifest")
 [[ $count == 1 ]] || fail 'expected exactly one rendered UI OpenBao migration container; use a UI chart with JWT version selection'
 versions=$(yq -rN "$container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\") | .value" "$ui_manifest")
-[[ $versions == "$target" ]] || fail "UI BAO_JWT_PLUGIN_VERSION is '${versions:-missing or empty}', expected $target from $server_image; set addons.nvcfUi.openbaoMigrations.jwtPluginVersion in the release environment and select a UI chart that forwards it"
+export OPENBAO_UI_JWT_EXPECTED_VERSION=$target
+[[ $(yq ea -r "[. | $container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\" and .value == strenv(OPENBAO_UI_JWT_EXPECTED_VERSION))] | length" "$ui_manifest") == 1 ]] || fail "UI BAO_JWT_PLUGIN_VERSION is '${versions:-missing or empty}', expected $target from $server_image; set addons.nvcfUi.openbaoMigrations.jwtPluginVersion in the release environment and select a UI chart that forwards it"
 version_count=$(yq ea -r "[. | $container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\")] | length" "$ui_manifest")
 [[ $version_count == 1 ]] || fail 'UI migration Job must contain exactly one BAO_JWT_PLUGIN_VERSION'
 migration_image=$(yq -rN "$container | .image" "$ui_manifest")
@@ -45,7 +59,8 @@ migration_image=$(yq -rN "$container | .image" "$ui_manifest")
 
 # Exercise the selected image's mount helper with a fake bao. The probe fails
 # for old images that ignore BAO_JWT_PLUGIN_VERSION, even if their tag is newer.
-probe_output=$(docker run "${isolation[@]}" --env "BAO_JWT_PLUGIN_VERSION=$target" \
+# shellcheck disable=SC2016
+probe_output=$(docker_image "$migration_image" run "${isolation[@]}" --env "BAO_JWT_PLUGIN_VERSION=$target" \
   --entrypoint /bin/bash "$migration_image" -ec '
     exec 3>&1
     source /app/migrations/utils/functions.sh
@@ -55,7 +70,9 @@ probe_output=$(docker run "${isolation[@]}" --env "BAO_JWT_PLUGIN_VERSION=$targe
       if [[ $1 == secrets && $2 == list ]]; then
         printf "{}\n"
       else
-        [[ $* == "secrets enable -path=ci/ui-jwt -plugin-version=$BAO_JWT_PLUGIN_VERSION vault-plugin-secrets-jwt" ]] || return 1
+        [[ $# == 5 && $1 == secrets && $2 == enable &&
+           $3 == -path=ci/ui-jwt && $4 == "-plugin-version=$BAO_JWT_PLUGIN_VERSION" &&
+           $5 == vault-plugin-secrets-jwt ]] || return 1
         printf "jwt-version-selected\n" >&3
       fi
     }

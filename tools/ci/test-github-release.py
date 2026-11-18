@@ -2756,6 +2756,32 @@ class GithubReleaseTest(unittest.TestCase):
             workflow.index("Validate tag and create release notes"),
         )
 
+    def test_openbao_qualification_uses_publisher_mode(self):
+        workflow = (SCRIPT_PATH.parents[2] / ".github/workflows/release-tags.yml").read_text()
+        mode_step = workflow.split("      - name: Resolve release publication mode\n", 1)[1]
+        script = mode_step.split("        run: |\n", 1)[1].split("\n\n", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        for auto, dry, expected in [
+            ("", "", "false"),
+            ("true", "true", "false"),
+            ("false", "false", "false"),
+            ("true", "false", "true"),
+            ("on", "off", "true"),
+        ]:
+            with self.subTest(auto=auto, dry=dry), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                env = dict(os.environ, GITHUB_OUTPUT=str(output),
+                           NVCF_GITHUB_AUTO_TAGGING_ENABLED=auto,
+                           NVCF_GITHUB_RELEASE_DRY_RUN=dry)
+                subprocess.run(["bash", "-eu", "-c", script], env=env,
+                               cwd=SCRIPT_PATH.parents[2], check=True, capture_output=True)
+                self.assertEqual(output.read_text(), f"publish={expected}\n")
+        for name in ["Install yq for OpenBao UI release qualification",
+                     "Qualify selected OpenBao and UI migration images"]:
+            step = workflow.split(f"      - name: {name}\n", 1)[1].split("\n      - ", 1)[0]
+            self.assertIn("steps.release-mode.outputs.publish == 'true'", step)
+            self.assertIn("startsWith(github.ref_name, 'deploy/stacks/self-managed/v')", step)
+
     def test_stack_inventory_preflight_renders_without_release_publication(self):
         workflow = (SCRIPT_PATH.parents[2] / ".github/workflows/release-tags.yml").read_text()
         self.assertIn("inventory_tag:", workflow)

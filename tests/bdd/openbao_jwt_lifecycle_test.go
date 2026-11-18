@@ -18,10 +18,14 @@ limitations under the License.
 package bdd_tmp
 
 import (
+	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
+	"github.com/google/shlex"
 
 	"nvcf-bdd/harness"
 	"nvcf-bdd/steps"
@@ -71,14 +75,24 @@ func TestOpenBaoJWTPluginLifecycle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live OpenBao lifecycle requires a prepared isolated container")
 	}
-	t.Setenv("BDD_CLEANUP_MODE", "")
+	if os.Getenv("BDD_CLEANUP_MODE") != "" {
+		t.Fatal("unset BDD_CLEANUP_MODE before running this cluster-free suite")
+	}
 	runLiveFeature(t, "openbao-jwt-plugin-lifecycle.feature")
 }
 
 func TestOpenBaoUIJWTVersionFeatureFileWiresToSteps(t *testing.T) {
-	t.Setenv("OPENBAO_UI_JWT_STACK", "/tmp/selected-stack")
+	t.Setenv("OPENBAO_UI_JWT_STACK", "/tmp/selected stack")
 	t.Setenv("OPENBAO_UI_JWT_ENVIRONMENT", "release")
 	runner := newFakeRunner(nil)
+	runner.onRun = func(command string) error {
+		args, err := shlex.Split(command)
+		expected := []string{"tools/ci/qualify-openbao-ui-jwt-version", "/tmp/selected stack", "release"}
+		if err != nil || !slices.Equal(args, expected) {
+			return fmt.Errorf("unexpected qualification command: %q", command)
+		}
+		return nil
+	}
 	runner.respond = func(command string) (harness.Result, bool) {
 		return harness.Result{ExitCode: 0, Stdout: "openbao-ui-jwt-version: target-only"}, true
 	}
@@ -108,6 +122,8 @@ func TestOpenBaoUIJWTVersion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires a saved target-only release environment and registry access")
 	}
-	t.Setenv("BDD_CLEANUP_MODE", "")
+	if os.Getenv("BDD_CLEANUP_MODE") != "" {
+		t.Fatal("unset BDD_CLEANUP_MODE before running this cluster-free suite")
+	}
 	runLiveFeature(t, "openbao-ui-jwt-version.feature")
 }

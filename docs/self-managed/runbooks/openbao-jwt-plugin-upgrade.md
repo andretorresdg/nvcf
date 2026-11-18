@@ -264,10 +264,6 @@ versions and running SHA values. Check every member is on the intended image.
 Qualify a later target-only image built with `JWT_INCLUDE_LEGACY=false`.
 It must retain exactly the same target binary and catalog digest as the bridge.
 The target-only image omits old command paths and old registration stanzas.
-Deploy and rotate it with the same health checks, without changing the target
-plugin version. Keep `openbao.jwtPluginLifecycle.mode=versioned` and use hooks
-so the target-only preflight verifies mounts before the rollout. Verify again
-after leadership changes.
 
 When the UI is enabled, set
 `addons.nvcfUi.openbaoMigrations.jwtPluginVersion` in the stack environment to
@@ -277,9 +273,14 @@ as `BAO_JWT_PLUGIN_VERSION` and a migrations image that supports it. Keep this
 an explicit release setting when the server target changes.
 
 Before qualifying that release, run from the source checkout with Helm 3,
-Helmfile 1.1.x, yq 4 and Docker. Authenticate to the selected image and chart
-registries first. Use the actual release environment, including its image,
-chart and plugin version settings:
+Helmfile 1.1.x, yq 4 and Docker. For NGC, export
+`NVCF_RELEASE_NGC_API_KEY`. The qualifier uses it for a temporary `nvcr.io`
+Docker login and HTTPS chart authentication at `helm.ngc.nvidia.com`. It does
+not reuse `helm repo add` entries. For chart mirrors, configure credentials in
+`global.helm.sources`; authenticate Docker to image mirrors before running.
+Mirror image pulls retain the existing Docker config and credential helpers.
+Use the actual release environment, including its image, chart and plugin
+version settings. Complete this check before deploying the target-only image:
 
 ```bash
 tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed "$HELMFILE_ENV"
@@ -291,10 +292,18 @@ helper without a server connection. Missing, empty or mismatched UI versions
 and incompatible migration images fail qualification. PR tests check stack
 propagation and rejection cases with simulated images. The self-managed tag
 workflow checks the published artifacts with the optional UI enabled before
-creating release notes and inventory assets. CI uses `NVCF_RELEASE_NGC_API_KEY`
-for NGC authentication with temporary Helm and Docker configurations.
+publishing release notes and inventory assets. Dry runs skip this check.
+CI uses `NVCF_RELEASE_NGC_API_KEY` for NGC authentication with temporary Helm
+and Docker configurations.
 Legacy and bridge images retain unversioned mount support; a disabled UI has
-no UI migration check. Continue with runtime signing and rollback validation.
+no UI migration check.
+
+Deploy and rotate it with the same health checks, without changing the target
+plugin version. Keep `openbao.jwtPluginLifecycle.mode=versioned` and use hooks
+so the target-only preflight verifies mounts before the rollout. Verify again
+after leadership changes.
+
+Continue with runtime signing and rollback validation before cleanup.
 
 ```bash
 bao_admin jwt-plugin-lifecycle verify
@@ -317,7 +326,7 @@ flowchart LR
   H --> C[Separate window: pin old and rotate members]
   C --> D[Tune target and rotate members]
   D --> E[Validate all mounts and retain rollback window]
-  E --> F[Later target-only image]
+  E --> F[Qualify UI and deploy later target-only image]
   F --> G[Verify then remove old catalog entries]
   D --> C
 ```

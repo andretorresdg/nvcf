@@ -12,6 +12,6 @@ Feature: Target-only releases configure the UI JWT mount version explicitly
       | OPENBAO_UI_JWT_ENVIRONMENT       |
     When I successfully run command:
       """
-      cd ${REPO_ROOT} && tools/ci/qualify-openbao-ui-jwt-version "${OPENBAO_UI_JWT_STACK}" "${OPENBAO_UI_JWT_ENVIRONMENT}"
+      tools/ci/qualify-openbao-ui-jwt-version "${OPENBAO_UI_JWT_STACK}" "${OPENBAO_UI_JWT_ENVIRONMENT}"
       """
     Then the command output should contain "openbao-ui-jwt-version: target-only"
