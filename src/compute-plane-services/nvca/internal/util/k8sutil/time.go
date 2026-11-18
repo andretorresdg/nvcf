@@ -41,6 +41,7 @@ const (
 	defaultFailingObjectsBackoffTimeout              = 90 * time.Second
 	defaultFailingObjectsBackoffRequeueInterval      = 30 * time.Second
 	defaultWorkerContainerRestartCountToFailInstance = RestartCountToFailInstance
+	defaultWorkerContainerRestartCountResetPeriod    = 30 * time.Minute
 )
 
 type TimeConfig struct {
@@ -80,6 +81,9 @@ type TimeConfig struct {
 	// WorkerContainerRestartCountToFailInstance is the NVCA worker container restart count at which a Pod is
 	// considered to be in a restart loop and its instance is marked failed. Other containers always use 3.
 	WorkerContainerRestartCountToFailInstance int32
+	// WorkerContainerRestartCountResetPeriod is how long the NVCA worker container must run and stay ready before
+	// its earlier restarts stop counting toward WorkerContainerRestartCountToFailInstance.
+	WorkerContainerRestartCountResetPeriod time.Duration
 }
 
 // workerRestartCountToFailInstance returns the configured worker container restart threshold, or the default when
@@ -89,6 +93,15 @@ func (t *TimeConfig) workerRestartCountToFailInstance() int32 {
 		return defaultWorkerContainerRestartCountToFailInstance
 	}
 	return t.WorkerContainerRestartCountToFailInstance
+}
+
+// workerRestartCountResetPeriod returns the configured worker restart count reset period, or the default when the
+// TimeConfig was not completed.
+func (t *TimeConfig) workerRestartCountResetPeriod() time.Duration {
+	if t.WorkerContainerRestartCountResetPeriod <= 0 {
+		return defaultWorkerContainerRestartCountResetPeriod
+	}
+	return t.WorkerContainerRestartCountResetPeriod
 }
 
 // Complete sets defaults on TimeConfig. It panics if some field is not set or defaulted.
@@ -143,6 +156,9 @@ func (t *TimeConfig) Complete() *TimeConfig {
 	}
 	if t.WorkerContainerRestartCountToFailInstance <= 0 {
 		t.WorkerContainerRestartCountToFailInstance = defaultWorkerContainerRestartCountToFailInstance
+	}
+	if t.WorkerContainerRestartCountResetPeriod <= 0 {
+		t.WorkerContainerRestartCountResetPeriod = defaultWorkerContainerRestartCountResetPeriod
 	}
 
 	// Detect unset fields, which could cause downstream errors.

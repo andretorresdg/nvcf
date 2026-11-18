@@ -1878,3 +1878,119 @@ func TestPodSpecRequestsGPU_CustomResourceNames(t *testing.T) {
 	// Custom resource names should match
 	assert.True(t, PodSpecRequestsGPU(podSpec, "custom.io/accelerator"))
 }
+
+func TestIsContainerInRestartLoopWorkerRestartBaseline(t *testing.T) {
+	now := time.Now()
+	newPod := func(baseline string) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "fn-pod", Namespace: "nvcf-backend"},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "inference"},
+				{Name: common.UtilsContainerName, Env: []corev1.EnvVar{{Name: InstanceIDEnvKey, Value: "instance-1"}}},
+			}},
+			Status: corev1.PodStatus{StartTime: &metav1.Time{Time: now.Add(-72 * time.Hour)}},
+		}
+		if baseline != "" {
+			pod.Annotations = map[string]string{WorkerRestartCountBaselineAnnotationKey: baseline}
+		}
+		return pod
+	}
+	crashLooping := func(name string, restarts int32, lastRun time.Duration) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:         name,
+			RestartCount: restarts,
+			State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   2,
+				Reason:     "Error",
+				StartedAt:  metav1.NewTime(now.Add(-lastRun - 10*time.Second)),
+				FinishedAt: metav1.NewTime(now.Add(-10 * time.Second)),
+			}},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		baseline string
+		status   corev1.ContainerStatus
+		want     bool
+	}{
+		{name: "no baseline counts every restart", status: crashLooping(common.UtilsContainerName, 5, time.Minute), want: true},
+		{name: "restarts before the baseline do not count", baseline: "3", status: crashLooping(common.UtilsContainerName, 5, time.Minute), want: false},
+		{name: "restarts after the baseline reach the threshold", baseline: "3", status: crashLooping(common.UtilsContainerName, 8, time.Minute), want: true},
+		{name: "invalid baseline is ignored", baseline: "three", status: crashLooping(common.UtilsContainerName, 5, time.Minute), want: true},
+		{name: "baseline above the restart count is ignored", baseline: "9", status: crashLooping(common.UtilsContainerName, 5, time.Minute), want: true},
+		{name: "a long previous run resets the count without a baseline", status: crashLooping(common.UtilsContainerName, 5, 2*time.Hour), want: false},
+		{name: "baseline does not apply to other containers", baseline: "3", status: crashLooping("inference", 3, time.Minute), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeConfig := (&TimeConfig{WorkerContainerRestartCountToFailInstance: 5}).Complete()
+			assert.Equal(t, tt.want, IsContainerInRestartLoop(newPod(tt.baseline), tt.status, timeConfig))
+		})
+	}
+}
+
+func TestWorkerRestartCountBaselineToRecord(t *testing.T) {
+	now := time.Now()
+	newPod := func(baseline string, statuses ...corev1.ContainerStatus) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "fn-pod", Namespace: "nvcf-backend"},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "inference"},
+				{Name: common.UtilsContainerName, Env: []corev1.EnvVar{{Name: InstanceIDEnvKey, Value: "instance-1"}}},
+			}},
+			Status: corev1.PodStatus{ContainerStatuses: statuses},
+		}
+		if baseline != "" {
+			pod.Annotations = map[string]string{WorkerRestartCountBaselineAnnotationKey: baseline}
+		}
+		return pod
+	}
+	running := func(name string, restarts int32, ready bool, runFor time.Duration) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:         name,
+			RestartCount: restarts,
+			Ready:        ready,
+			State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now.Add(-runFor))}},
+		}
+	}
+	crashedAfter := func(restarts int32, lastRun time.Duration) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:         common.UtilsContainerName,
+			RestartCount: restarts,
+			State:        corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   2,
+				StartedAt:  metav1.NewTime(now.Add(-lastRun - time.Minute)),
+				FinishedAt: metav1.NewTime(now.Add(-time.Minute)),
+			}},
+		}
+	}
+
+	tests := []struct {
+		name         string
+		pod          *corev1.Pod
+		resetPeriod  time.Duration
+		wantBaseline int32
+		wantRecord   bool
+	}{
+		{name: "worker healthy for the default period", pod: newPod("", running(common.UtilsContainerName, 4, true, 31*time.Minute)), wantBaseline: 4, wantRecord: true},
+		{name: "baseline already recorded", pod: newPod("4", running(common.UtilsContainerName, 4, true, 2*time.Hour))},
+		{name: "older baseline is raised", pod: newPod("2", running(common.UtilsContainerName, 4, true, 2*time.Hour)), wantBaseline: 4, wantRecord: true},
+		{name: "worker not healthy for long enough", pod: newPod("", running(common.UtilsContainerName, 4, true, 10*time.Minute))},
+		{name: "worker running but not ready", pod: newPod("", running(common.UtilsContainerName, 4, false, 2*time.Hour))},
+		{name: "worker never restarted", pod: newPod("", running(common.UtilsContainerName, 0, true, 2*time.Hour))},
+		{name: "configured period is honored", pod: newPod("", running(common.UtilsContainerName, 4, true, 45*time.Minute)), resetPeriod: time.Hour},
+		{name: "crash after a long run records the restarts before it", pod: newPod("2", crashedAfter(5, 2*time.Hour)), wantBaseline: 4, wantRecord: true},
+		{name: "other containers are ignored", pod: newPod("", running("inference", 4, true, 2*time.Hour))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeConfig := (&TimeConfig{WorkerContainerRestartCountResetPeriod: tt.resetPeriod}).Complete()
+			baseline, record := WorkerRestartCountBaselineToRecord(tt.pod, now, timeConfig)
+			assert.Equal(t, tt.wantRecord, record)
+			assert.Equal(t, tt.wantBaseline, baseline)
+		})
+	}
+}

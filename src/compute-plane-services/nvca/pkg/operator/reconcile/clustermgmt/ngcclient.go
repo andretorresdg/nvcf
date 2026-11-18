@@ -577,12 +577,27 @@ func withAgentConfigMapper() clusterMapper {
 			}
 		}
 
+		var workerContainerRestartCountResetPeriod time.Duration
+		if minutesStr := src.ClusterConfigurations[NVCAWorkerContainerRestartCountResetPeriodMinutesConfig]; minutesStr != "" {
+			minutes, err := strconv.ParseInt(minutesStr, 10, 32)
+			if err != nil {
+				return fmt.Errorf("failed to parse worker container restart count reset period minutes: %w", err)
+			}
+			if minutes < 0 {
+				core.GetLogger(ctx).Warnf("ignoring negative %s %d, using the NVCA default",
+					NVCAWorkerContainerRestartCountResetPeriodMinutesConfig, minutes)
+				minutes = 0
+			}
+			workerContainerRestartCountResetPeriod = time.Duration(minutes) * time.Minute
+		}
+
 		// Map NVCFWorkerConfig
 		dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig = nvidiaiov1.NVCFWorkerConfig{
 			CacheMountOptionsEnabled:                  cacheMountOptionsEnabled,
 			CacheMountOptions:                         cacheMountOptions,
 			WorkerDegradationPeriod:                   workerDegradationPeriod,
 			WorkerContainerRestartCountToFailInstance: workerContainerRestartCountToFailInstance,
+			WorkerContainerRestartCountResetPeriod:    workerContainerRestartCountResetPeriod,
 		}
 
 		return nil

@@ -31,6 +31,7 @@ The operator supports cluster-level configuration options set via the NGC API du
 | `ClusterNetworkCIDRAllowedRange` | Allowed CIDR ranges for cluster network access |
 | `NVCFWorkerDegradationPeriodMinutes` | Time before a worker is considered degraded |
 | `NVCAWorkerContainerRestartCountToFailInstance` | NVCA worker (utils) container restart count at which a function instance is marked failed and replaced (default `3`; other containers always use `3`) |
+| `NVCAWorkerContainerRestartCountResetPeriodMinutes` | Minutes the NVCA worker (utils) container must run and stay ready before its earlier restarts stop counting toward `NVCAWorkerContainerRestartCountToFailInstance` (default `30`) |
 | `NVCASecretMirrorSourceNamespace` | Source namespace for secret mirroring to function namespaces |
 | `NVCASecretMirrorLabelSelector` | Label selector for secrets to mirror to function namespaces |
 

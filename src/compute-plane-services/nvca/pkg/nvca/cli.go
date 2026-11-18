@@ -250,6 +250,7 @@ func newCobraCommand(
 					FailingObjectsBackoffTimeout:              cfg.Workload.FailingObjectsBackoffTimeout,
 					FailingObjectsBackoffRequeueInterval:      cfg.Workload.FailingObjectsBackoffRequeueInterval,
 					WorkerContainerRestartCountToFailInstance: cfg.Workload.WorkerContainerRestartCountToFailInstance,
+					WorkerContainerRestartCountResetPeriod:    cfg.Workload.WorkerContainerRestartCountResetPeriod,
 				},
 				FunctionEnvOverrides: cfg.Workload.EffectiveFunctionEnvOverrides(),
 				TaskEnvOverrides:     cfg.Workload.EffectiveTaskEnvOverrides(),

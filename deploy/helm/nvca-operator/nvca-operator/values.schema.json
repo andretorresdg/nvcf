@@ -752,6 +752,11 @@
                     "minimum": 0,
                     "maximum": 2147483647
                 },
+                "workerContainerRestartCountResetPeriod": {
+                    "type": "string",
+                    "description": "How long the NVCA worker (utils) container must run and stay ready before its earlier restarts stop counting toward workerContainerRestartCountToFailInstance (e.g., \"30m\", \"1h\"). Empty uses the NVCA default of 30m",
+                    "default": ""
+                },
                 "secretMirrorNamespace": {
                     "type": "string",
                     "description": "Default namespace to mirror custom secrets for nvcf workloads",
