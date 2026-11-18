@@ -45,7 +45,9 @@ STUB_FN(cuCheckpointProcessLock)
 STUB_FN(cuCheckpointProcessCheckpoint)
 STUB_FN(cuCheckpointProcessRestore)
 STUB_FN(cuCheckpointProcessUnlock)
-STUB_FN(cuCheckpointProcessGetState)
+/* The suspend must fail after the quiesce (the fake ranks cannot be
+ * checkpointed): fail here, explicitly. */
+CUresult cuCheckpointProcessGetState(int pid, int *state) { (void)pid; *state = 0; return 999; }
 STUB_FN(cuCheckpointProcessGetRestoreThreadId)
 """
 
@@ -108,7 +110,9 @@ while True:
     cmd = c.recv(4096).rstrip(b"\0").decode()
     log.write(cmd + "\n"); log.flush()
     idle = role == "behind" or stepped() >= steps
-    if cmd == "hold":
+    if role == "broken":
+        rep = "err broken"
+    elif cmd == "hold":
         rep = "ok held"
     elif cmd == "poll":
         rep = ("ok idle 3" if role == "behind" else "ok idle 0") if idle else "ok busy"
@@ -250,6 +254,56 @@ class CatchUp(QuiesceDeadline):
         self.assertNotIn("step", self.commands("ahead"), "a busy rank was stepped past its peers")
 
     # The deadline and abort tests do not apply to two ranks that catch up.
+    test_timeout_is_wall_clock = None
+    test_fabric_abort_ends_the_suspend = None
+
+
+class PartialHold(CatchUp):
+    """The first rank's control thread fails; the second accepts "hold".
+    The rollback must still resume the second."""
+
+    def setUp(self):
+        self.state = os.path.join(tempfile.mkdtemp(dir=self.tmp), "stepped")
+        self.ranks = []
+        for role in ("broken", "behind"):
+            w = rank(role, self.state, 0)
+            self.addCleanup(w.stdout.close)
+            self.addCleanup(w.wait)
+            self.addCleanup(w.kill)
+            self.ranks.append(w.pid)
+
+    def test_every_rank_resumed(self):
+        p, _ = self.run_tool("--timeout-ms", "10000", "suspend", *map(str, self.ranks))
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        cmds = self.commands("behind")
+        self.assertIn("hold", cmds)
+        self.assertTrue(any(c.startswith("resume") for c in cmds), "held rank not resumed: %s" % cmds)
+
+    test_drained_rank_catches_up_then_both_quiesce = None
+
+
+class Deadlines(QuiesceDeadline):
+    def test_vote_wait_ends_at_the_deadline(self):
+        # No driver answers: the node gives up at its own deadline
+        # (--timeout-ms plus a minute with --fabric-map), not after 600 s.
+        fabric = tempfile.mkdtemp(dir=self.tmp)
+        p, took = self.run_tool("--timeout-ms", "1000", "--fabric-map", fabric, "suspend", str(self.pid),
+                                timeout=120)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("no verdict", p.stdout + p.stderr)
+        self.assertLess(took, 75, p.stdout + p.stderr)
+
+    def test_timeout_zero_keeps_trying(self):
+        # --timeout-ms 0 is "wait forever": still retrying after several
+        # busy attempts.
+        p = subprocess.Popen([self.tool, "--timeout-ms", "0", "suspend", str(self.pid)], env=self.env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(4)
+        alive = p.poll() is None
+        p.kill()
+        out = p.communicate()[0]
+        self.assertTrue(alive, "gave up with --timeout-ms 0:\n" + out)
+
     test_timeout_is_wall_clock = None
     test_fabric_abort_ends_the_suspend = None
 

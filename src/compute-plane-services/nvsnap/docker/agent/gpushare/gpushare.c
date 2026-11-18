@@ -877,7 +877,11 @@ static void *sync_main(void *arg)
     return arg;
 }
 
-static int timed_sync(int ms, CUresult *r)
+/* A finished result is used while no launch has gone through since its
+ * sync started ("poll"). fresh ("quiesce"): only a sync that starts now
+ * counts, since copies and memsets do not bump launch_gen; bumping it here
+ * makes an earlier result, or a sync still running, stale. */
+static int timed_sync(int ms, CUresult *r, int fresh)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -886,7 +890,7 @@ static int timed_sync(int ms, CUresult *r)
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&sync_mu);
     int done;
-    if (!sync_running) sync_done = 0;  /* an old result covers none of the launches since */
+    if (fresh) __atomic_add_fetch(&launch_gen, 1, __ATOMIC_SEQ_CST);
     for (;;) {
         if (!sync_running && !sync_done) {
             pthread_t t;
@@ -1173,7 +1177,13 @@ static int drained(int ms, CUresult *r)
 {
     *r = CUDA_SUCCESS;
     if (__atomic_load_n(&lgate.inflight, __ATOMIC_SEQ_CST)) return 0;
-    if (timed_sync(ms, r) < 0) return 0;
+    /* A launch let through by "step" and not taken yet still goes to the
+     * GPU: not drained until it has. */
+    pthread_mutex_lock(&gate_mu);
+    int permit = lgate.pass;
+    pthread_mutex_unlock(&gate_mu);
+    if (permit) return 0;
+    if (timed_sync(ms, r, 0) < 0) return 0;
     return *r == CUDA_SUCCESS ? 1 : -1;
 }
 
@@ -1218,8 +1228,15 @@ static void do_quiesce(char *reply, size_t n)
      * (e.g. a peer's NCCL kernel). Reopen the gate; the tool retries. */
     held = 0;  /* an "open" from a restore is no longer due */
     CUresult r;
-    if (gate_close(&lgate, 2000) < 0 || timed_sync(2000, &r) < 0 ||
-        gate_close(&mgate, 2000) < 0 || timed_sync(2000, &r) < 0) {
+    /* Take back a "step" permit not used yet: no launch may pass the gate
+     * once quiesce has drained (one already let through counts as
+     * inflight, and gate_close waits for it). */
+    pthread_mutex_lock(&gate_mu);
+    lgate.closed = 1;
+    lgate.pass = mgate.pass = 0;
+    pthread_mutex_unlock(&gate_mu);
+    if (gate_close(&lgate, 2000) < 0 || timed_sync(2000, &r, 1) < 0 ||
+        gate_close(&mgate, 2000) < 0 || timed_sync(2000, &r, 1) < 0) {
         gate_open();
         snprintf(reply, n, "err busy (GPU work did not drain)");
         pthread_mutex_unlock(&mu);

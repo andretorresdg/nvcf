@@ -703,6 +703,14 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
 
 static int ctl(int pid, const char *cmd) { return ctl_rep(pid, cmd, NULL, 0, 0); }
 
+/* Reopen every pid's gates after a failed or abandoned quiesce: each pid,
+ * even after one fails (ctl_all would stop there and leave the rest held).
+ * Failures are printed by ctl. */
+static void resume_all(const int *pids, int n)
+{
+    for (int i = 0; i < n; i++) ctl(pids[i], "resume");
+}
+
 /* Run cmd on every pid that shares GPU memory. Returns the first error
  * (see ctl), otherwise the number of pids that had a control socket. */
 static int ctl_all(const int *pids, int n, const char *cmd)
@@ -1111,8 +1119,10 @@ static void undo(const int *pids, int n, int locked, int shared)
  * "<attempt> abort" once the session cannot succeed (a node is gone, or the
  * driver's quiesce deadline passed: it keeps the nodes' deadline, so they
  * stop at the same attempt). Returns 1 for go, 0 for retry, -1 on abort or
- * timeout. */
-static int node_vote(int attempt, int quiesced)
+ * when deadline (now_ms() time) passes with no verdict. */
+static double now_ms(void);
+
+static int node_vote(int attempt, int quiesced, double deadline)
 {
     char q[512], tmp[520], d[512], line[64];
     snprintf(q, sizeof(q), "%s/q", fabric_dir);
@@ -1123,7 +1133,7 @@ static int node_vote(int attempt, int quiesced)
         fprintf(stderr, "%s: %s\n", q, strerror(errno));
         return -1;
     }
-    for (int t = 0; t < 6000; t++) {
+    for (;;) {
         int a = -1;
         char verdict[16] = "";
         if ((fp = fopen(d, "re"))) {
@@ -1137,9 +1147,10 @@ static int node_vote(int attempt, int quiesced)
             }
             return !strcmp(verdict, "go");
         }
+        if (now_ms() >= deadline) break;
         usleep(100000);
     }
-    fprintf(stderr, "no verdict in %s after 600 s\n", d);
+    fprintf(stderr, "no verdict in %s for attempt %d by the deadline\n", d, attempt);
     return -1;
 }
 
@@ -1245,7 +1256,9 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
      * driver ends the session at the deadline with an "abort" verdict, the
      * same attempt on every node; this node's own deadline, a minute later,
      * only covers a driver that never answers. */
-    double deadline = now_ms() + timeout_ms + (fabric_dir ? 60000 : 0);
+    /* --timeout-ms 0 waits forever on one node; across nodes the driver's
+     * own deadline still ends the session. */
+    double deadline = timeout_ms || fabric_dir ? now_ms() + timeout_ms + (fabric_dir ? 60000 : 0) : 1e300;
     int catchup = 1, holding = 0, nudge = 0;
     for (int tries = 0;; tries++) {
         int r = -3;
@@ -1257,16 +1270,16 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
         }
         if (!catchup) r = ctl_all(pids, n, "quiesce");
         nudge = 0;
-        if (r < 0 && r != -2) { ctl_all(pids, n, "resume"); goto out; }
+        if (r < 0 && r != -2) { resume_all(pids, n); goto out; }
         /* Busy with no other node to wait for (or an older library): start over. */
-        if (r == -2 && (!holding || !fabric_dir)) ctl_all(pids, n, "resume"), holding = 0;
+        if (r == -2 && (!holding || !fabric_dir)) resume_all(pids, n), holding = 0;
         if (fabric_dir) {  /* every node must be quiesced before any releases */
-            int v = node_vote(tries, r >= 0);
-            if (v < 0) { ctl_all(pids, n, "resume"); goto out; }
+            int v = node_vote(tries, r >= 0, deadline);
+            if (v < 0) { resume_all(pids, n); goto out; }
             if (v == 1) { shared = r > 0; break; }
             if (holding && (tries + 1) % HOLD_ROUNDS) nudge = r >= 0;  /* keep holding: catch up */
             else {
-                if (r >= 0 || holding) ctl_all(pids, n, "resume");
+                if (r >= 0 || holding) resume_all(pids, n);
                 holding = 0;
             }
         } else if (r >= 0) {
@@ -1274,7 +1287,7 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
             break;
         }
         if (now_ms() >= deadline) {
-            if (holding) ctl_all(pids, n, "resume");
+            if (holding) resume_all(pids, n);
             printf("quiesce: not quiesced after %d attempt(s) in %u ms: rolling back\n", tries + 1,
                    timeout_ms + (fabric_dir ? 60000 : 0));
             goto out;
