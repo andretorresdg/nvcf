@@ -15,9 +15,13 @@ cp -R "$repo_root/migrations/openbao/migrations/utils" "$work/image/app/migratio
 cp "$repo_root/infra/openbao/jwt-plugin-versions.env" "$work/image/openbao/"
 export TEST_IMAGE_ROOT="$work/image" TEST_DOCKER_CALLS="$work/docker-calls"
 export TEST_MIGRATION_COMPATIBLE=true
+export NVCF_RELEASE_NGC_API_KEY=''
 export DOCKER_CONFIG="$work/operator-docker"
 mkdir -p "$DOCKER_CONFIG"
-printf '{"credsStore":"fixture","auths":{"mirror.example.com":{}}}\n' > "$DOCKER_CONFIG/config.json"
+printf '{"currentContext":"fixture-remote","credsStore":"fixture","auths":{"mirror.example.com":{}}}\n' > "$DOCKER_CONFIG/config.json"
+mkdir -p "$DOCKER_CONFIG/contexts/meta/fixture" "$DOCKER_CONFIG/contexts/tls/fixture"
+printf '{"Name":"fixture-remote","Endpoints":{"docker":{"Host":"tcp://fixture.invalid:2376"}}}\n' > "$DOCKER_CONFIG/contexts/meta/fixture/meta.json"
+printf 'fixture-tls\n' > "$DOCKER_CONFIG/contexts/tls/fixture/ca.pem"
 cp "$DOCKER_CONFIG/config.json" "$work/original-docker.json"
 export TEST_OPERATOR_DOCKER_CONFIG=$DOCKER_CONFIG
 # shellcheck disable=SC1091
@@ -34,10 +38,15 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$TEST_DOCKER_CALLS"
 if [[ $1 == login ]]; then
   supplied=$(cat)
+  [[ ${TEST_NGC_LOGIN_FAIL:-false} != true ]]
   [[ $supplied == fixture-registry-key ]]
   [[ $DOCKER_CONFIG != "$TEST_OPERATOR_DOCKER_CONFIG" ]]
   yq -e '(.auths | has("nvcr.io")) and (.credsStore == null) and (.credHelpers == null)' "$DOCKER_CONFIG/config.json" >/dev/null
-  printf '{"auths":{"nvcr.io":{"auth":"fixture"}}}\n' > "$DOCKER_CONFIG/config.json"
+  [[ $(yq -r '.currentContext' "$DOCKER_CONFIG/config.json") == fixture-remote ]]
+  cmp "$TEST_OPERATOR_DOCKER_CONFIG/contexts/meta/fixture/meta.json" "$DOCKER_CONFIG/contexts/meta/fixture/meta.json"
+  cmp "$TEST_OPERATOR_DOCKER_CONFIG/contexts/tls/fixture/ca.pem" "$DOCKER_CONFIG/contexts/tls/fixture/ca.pem"
+  yq -i '.auths."nvcr.io".auth = "fixture"' "$DOCKER_CONFIG/config.json"
+  echo 'Login Succeeded'
   exit
 fi
 [[ $1 == run ]]; shift
@@ -53,7 +62,8 @@ done
 image=$1; shift
 if [[ $image == nvcr.io/* && -n ${NVCF_RELEASE_NGC_DOCKER_CONFIG:-} ]]; then
   [[ $DOCKER_CONFIG == "$NVCF_RELEASE_NGC_DOCKER_CONFIG" ]]
-  [[ -f $DOCKER_CONFIG/config.json ]]
+  [[ -f $DOCKER_CONFIG/logged-in ]]
+  [[ $(yq -r '.currentContext' "$DOCKER_CONFIG/config.json") == fixture-remote ]]
 else
   [[ $DOCKER_CONFIG == "$TEST_OPERATOR_DOCKER_CONFIG" ]]
 fi
@@ -123,6 +133,15 @@ grep -Fq 'registry.example.com/selected/server:release' "$TEST_DOCKER_CALLS"
 ui_image=$(yq -rN 'select(.kind == "Job") | .spec.template.spec.containers[] | select(.name == "openbao-migrations") | .image' "$work/ui.yaml")
 grep -Fq "$ui_image" "$TEST_DOCKER_CALLS"
 
+# Fail before login if the isolated context config cannot be prepared.
+: > "$TEST_DOCKER_CALLS"
+printf '{invalid-json' > "$DOCKER_CONFIG/config.json"
+if NVCF_RELEASE_NGC_API_KEY=fixture-registry-key check > "$work/result" 2>&1; then
+  fail 'accepted malformed operator Docker config'
+fi
+if grep -q '^login ' "$TEST_DOCKER_CALLS"; then fail 'logged in after context setup failed'; fi
+cp "$work/original-docker.json" "$DOCKER_CONFIG/config.json"
+
 # Exercise qualification orchestration with real Helmfile and Helm. Substitute
 # local charts for downloads; keep the actual saved environment and UI chart.
 export TEST_HELMFILE_BIN
@@ -133,18 +152,32 @@ TEST_REAL_HELM=$(command -v helm)
 cat > "$TEST_AUTH_HELM" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ $1 == registry && $2 == login ]]; then
+  [[ $3 == nvcr.io && $(cat) == fixture-registry-key ]]
+  yq -e '(.auths | has("nvcr.io")) and (.credsStore == null) and (.credHelpers == null)' "$HELM_REGISTRY_CONFIG" >/dev/null
+  echo oci-authenticated >> "$TEST_AUTH_LOG"
+  exit
+fi
 if [[ $1 == repo && $2 == add ]]; then
   if [[ $3 == nvcf ]]; then
-    [[ $4 == https://helm.ngc.nvidia.com/nvidia/nvcf ]]
-    [[ $* == *--password-stdin* && $* != *fixture-registry-key* ]]
-    [[ $(cat) == fixture-registry-key ]]
-    echo ngc-authenticated >> "$TEST_AUTH_LOG"
+    supplied=$(cat)
+    [[ $* == *--password-stdin* && $* != *fixture-registry-key* && $* != *mirror-password* ]]
+    case "$4" in
+      https://helm.ngc.nvidia.com/nvidia/nvcf)
+        [[ $supplied == fixture-registry-key && $* == *'$oauthtoken'* ]]
+        echo ngc-authenticated >> "$TEST_AUTH_LOG" ;;
+      https://mirror.example.com/charts|https://helm.ngc.nvidia.com.example.com/charts)
+        [[ $supplied == mirror-password && $* == *mirror-user* ]]
+        echo mirror-authenticated >> "$TEST_AUTH_LOG" ;;
+      *) exit 1 ;;
+    esac
   fi
   exit 0
 fi
 exec "$TEST_REAL_HELM" "$@"
 BASH
 chmod +x "$TEST_AUTH_HELM"
+cp "$TEST_AUTH_HELM" "$work/bin/helm"
 mkdir -p "$TEST_SERVER_CHART/templates"
 printf 'apiVersion: v2\nname: test-openbao\nversion: 0.0.0\n' > "$TEST_SERVER_CHART/Chart.yaml"
 cp "$repo_root/deploy/helm/openbao/helm/values.yaml" "$TEST_SERVER_CHART/values.yaml"
@@ -164,18 +197,26 @@ cat > "$work/bin/helmfile" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 for arg in "$@"; do
+  if [[ $arg == list && ${TEST_CHART_OUTSIDE_ORIGIN:-false} == true ]]; then
+    "$TEST_HELMFILE_BIN" "$@" | yq -o=json '.[].chart = "different/chart"'
+    exit
+  fi
+  if [[ $arg == build && -n ${TEST_MUTATE_VALUES_FILE:-} ]]; then
+    "$TEST_HELMFILE_BIN" "$@"
+    yq -i '.global.helm.sources.url = "https://mirror.example.com/charts" |
+      .global.helm.sources.username = "mirror-user" |
+      .global.helm.sources.password = "mirror-password"' "$TEST_MUTATE_VALUES_FILE"
+    exit
+  fi
   if [[ $arg == template ]]; then
-    if [[ ${TEST_CHART_ORIGIN:-} == ngc ]]; then
-      [[ $NVCF_USERNAME == '$oauthtoken' && $NVCF_PASSWORD == fixture-registry-key ]]
+    if [[ ${TEST_AUTHENTICATE:-false} == true ]]; then
       auth_args=()
       for auth_arg in "$@"; do
         if [[ $auth_arg == template ]]; then auth_args+=(repos); else auth_args+=("$auth_arg"); fi
       done
-      "$TEST_HELMFILE_BIN" --helm-binary "$TEST_AUTH_HELM" "${auth_args[@]}"
-    else
-      [[ ${NVCF_PASSWORD:-} != fixture-registry-key ]]
+      "$TEST_HELMFILE_BIN" --helm-binary "$TEST_AUTH_HELM" "${auth_args[@]}" >&2
     fi
-    if [[ $* == *01-dependencies.yaml.gotmpl* ]]; then
+    if [[ $* == *openbao-server.yaml* ]]; then
       exec "$TEST_HELMFILE_BIN" "$@" --chart "$TEST_SERVER_CHART" --skip-deps
     else
       exec "$TEST_HELMFILE_BIN" "$@" --chart "$TEST_UI_CHART" --skip-deps
@@ -192,7 +233,9 @@ qualify() {
     --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
     --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system "$@"
 }
+: > "$TEST_DOCKER_CALLS"
 TEST_NGC_API_KEY=fixture-registry-key qualify
+test "$(grep -c '^login nvcr.io ' "$TEST_DOCKER_CALLS")" = 1
 # Pin distinct fixture image references to detect incorrect release selection.
 yq -i '.global.image.registry = "mirror.example.com" |
   .global.image.repository = "selected" |
@@ -206,18 +249,41 @@ grep -Fq 'mirror.example.com/selected/nvcf-openbao-migrations:fixture-migration'
 yq -i '.global.helm.sources.url = "https://mirror.example.com/charts" |
   .global.helm.sources.username = "mirror-user" |
   .global.helm.sources.password = "mirror-password"' "$work/stack/environments/$environment.yaml"
-TEST_NGC_API_KEY=fixture-registry-key qualify --log-level debug > "$work/result" 2>&1
+TEST_AUTHENTICATE=true TEST_NGC_API_KEY=fixture-registry-key HELMFILE_DEBUG=true qualify --debug --log-level debug > "$work/result" 2>&1
 if grep -Fq fixture-registry-key "$work/result"; then fail 'NGC key leaked in mirror debug output'; fi
-grep -Fq mirror-password "$work/result"
+if grep -Fq mirror-password "$work/result"; then fail 'mirror password leaked in debug output'; fi
+test "$(grep -c mirror-authenticated "$TEST_AUTH_LOG")" = 2
+# A stale NGC key must not prevent a mirror-only qualification.
+TEST_AUTHENTICATE=true TEST_NGC_LOGIN_FAIL=true TEST_NGC_API_KEY=expired-key qualify
 # An exact NGC origin may use the key without rendering it into Helmfile state.
-TEST_CHART_ORIGIN=ngc TEST_NGC_API_KEY=fixture-registry-key qualify --log-level debug \
-  --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com/nvidia/nvcf \
-  --state-values-set global.helm.sources.username= \
-  --state-values-set global.helm.sources.password= > "$work/result" 2>&1
+TEST_AUTHENTICATE=true TEST_NGC_API_KEY=fixture-registry-key qualify --log-level debug \
+  --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com/nvidia/nvcf > "$work/result" 2>&1
 if grep -Fq fixture-registry-key "$work/result"; then fail 'NGC key leaked in NGC debug output'; fi
+if grep -Fq mirror-password "$work/result"; then fail 'saved password leaked during NGC override'; fi
 test "$(grep -c ngc-authenticated "$TEST_AUTH_LOG")" = 2
+# External values may change after build. Authentication must use frozen state.
+printf 'global:\n  helm:\n    sources:\n      url: https://helm.ngc.nvidia.com/nvidia/nvcf\n' > "$work/switch-values.yaml"
+TEST_AUTHENTICATE=true TEST_MUTATE_VALUES_FILE="$work/switch-values.yaml" TEST_NGC_API_KEY=fixture-registry-key \
+  qualify --state-values-file "$work/switch-values.yaml"
+test "$(grep -c ngc-authenticated "$TEST_AUTH_LOG")" = 3
+# Release qualification must match the inventory's OCI chart origin.
+NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=registry.example.com \
+  --state-values-set global.helm.sources.repository=release/charts
+if NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify > "$work/result" 2>&1; then
+  fail 'accepted chart origin different from release inventory'
+fi
+grep -Fq 'qualified chart origin differs' "$work/result"
+if TEST_CHART_OUTSIDE_ORIGIN=true NVCF_RELEASE_HELM_REGISTRY=registry.example.com/release/charts qualify \
+  --state-values-set global.helm.sources.url= \
+  --state-values-set global.helm.sources.registry=registry.example.com \
+  --state-values-set global.helm.sources.repository=release/charts > "$work/result" 2>&1; then
+  fail 'accepted chart outside the release inventory origin'
+fi
+grep -Fq 'qualified chart origin differs' "$work/result"
 # A lookalike hostname is still a mirror.
-TEST_NGC_API_KEY=fixture-registry-key qualify \
+TEST_AUTHENTICATE=true TEST_NGC_API_KEY=fixture-registry-key qualify \
   --state-values-set global.helm.sources.url=https://helm.ngc.nvidia.com.example.com/charts
 cmp "$work/original-docker.json" "$DOCKER_CONFIG/config.json"
 if grep -Fq fixture-registry-key "$TEST_DOCKER_CALLS"; then fail 'registry credential appeared in command arguments'; fi

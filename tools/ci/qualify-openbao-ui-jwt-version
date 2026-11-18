@@ -32,44 +32,64 @@ if [[ -f $registry_config ]]; then
   cp "$registry_config" "$HELM_CONFIG_HOME/registry/config.json"
 fi
 
-helmfile --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
+# Saved repository passwords can appear in Helmfile's rendered debug state.
+# Override both caller flags and environment settings on every invocation.
+helmfile_safe() {
+  HELMFILE_DEBUG=false helmfile "$@" --debug=false --log-level warn
+}
+helmfile_safe --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
   --allow-no-matching-release -l name=nvcf-ui list --skip-charts --output json > "$work/ui-releases.json"
 if [[ $(yq -r 'length' "$work/ui-releases.json") == 0 ]]; then
   echo 'openbao-ui-jwt-version: UI disabled; no UI migration Job to qualify'
   exit 0
 fi
-if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
-  export NVCF_RELEASE_NGC_DOCKER_CONFIG="$work/docker"
-  mkdir -p "$NVCF_RELEASE_NGC_DOCKER_CONFIG"
-  # Seed an auth entry so Docker does not auto-detect a shared OS keychain.
-  printf '{"auths":{"nvcr.io":{}}}\n' > "$NVCF_RELEASE_NGC_DOCKER_CONFIG/config.json"
-  printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | DOCKER_CONFIG="$NVCF_RELEASE_NGC_DOCKER_CONFIG" docker login nvcr.io --username '$oauthtoken' --password-stdin
-fi
-# A local empty chart lets build resolve repositories without downloading charts.
+# Build with an empty local chart to avoid downloading unauthenticated charts.
+# Embed all release values, restore the selected chart, and render this frozen
+# state without loading caller-supplied values a second time.
 mkdir -p "$work/source-chart"
 printf 'apiVersion: v2\nname: source-check\nversion: 0.0.0\n' > "$work/source-chart/Chart.yaml"
-# Resolve each state's effective repository before supplying credentials.
-# Helmfile reads NVCF_USERNAME/PASSWORD at repo authentication time and passes
-# the password to Helm on stdin, without adding it to rendered state.
 render_release() {
   local state=$1 release=$2
   shift 2
-  helmfile --environment default -f "$stack/helmfile.d/$state" "$@" \
-    -l "name=$release" --chart "$work/source-chart" build > "$work/state.yaml"
-  local origin
-  origin=$(yq -r '.repositories[] | select(.name == "nvcf") | .url' "$work/state.yaml")
-  case "$origin" in
-    https://helm.ngc.nvidia.com|https://helm.ngc.nvidia.com/*)
-      if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
-        NVCF_USERNAME=\$oauthtoken NVCF_PASSWORD=$NVCF_RELEASE_NGC_API_KEY \
-          helmfile --environment default -f "$stack/helmfile.d/$state" "$@" \
-          -l "name=$release" template
-        return
+  local frozen="$work/$release.yaml" chart origin oci
+  helmfile_safe --environment default -f "$stack/helmfile.d/$state" "$@" \
+    -l "name=$release" list --skip-charts --output json > "$work/releases.json"
+  [[ $(yq -r 'length' "$work/releases.json") == 1 ]] || fail "expected one selected $release release"
+  chart=$(yq -er '.[0].chart' "$work/releases.json")
+  helmfile_safe --environment default -f "$stack/helmfile.d/$state" "$@" \
+    -l "name=$release" --chart "$work/source-chart" build --embed-values > "$frozen"
+  OPENBAO_UI_JWT_CHART=$chart OPENBAO_UI_JWT_RELEASE=$release yq -i \
+    'del(.environments, .values, .templates, .chart) |
+     .releases |= map(select(.name == strenv(OPENBAO_UI_JWT_RELEASE))) |
+     del(.releases[].condition, .releases[].needs) |
+     .releases[].chart = strenv(OPENBAO_UI_JWT_CHART)' "$frozen"
+  origin=$(yq -r '.repositories[] | select(.name == "nvcf") | .url' "$frozen")
+  oci=$(yq -r '.repositories[] | select(.name == "nvcf") | .oci' "$frozen")
+  if [[ -n ${NVCF_RELEASE_HELM_REGISTRY:-} ]]; then
+    [[ $chart == nvcf/* && $oci == true && ${origin#oci://} == "${NVCF_RELEASE_HELM_REGISTRY%/}" ]] || \
+      fail 'qualified chart origin differs from NVCF_RELEASE_HELM_REGISTRY'
+  fi
+  if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+    if [[ $oci != true && ( $origin == https://helm.ngc.nvidia.com || $origin == https://helm.ngc.nvidia.com/* ) ]]; then
+      # Explicit saved mirror credentials must not override the NGC key.
+      yq -i '(.repositories[] | select(.name == "nvcf")) |= del(.username, .password)' "$frozen"
+      NVCF_USERNAME=\$oauthtoken NVCF_PASSWORD=$NVCF_RELEASE_NGC_API_KEY \
+        helmfile_safe -f "$frozen" -l "name=$release" template
+      return
+    elif [[ $oci == true && ( $origin == nvcr.io/* || $origin == oci://nvcr.io/* ) ]]; then
+      local ngc_config="$work/helm-ngc.json"
+      if [[ ! -f $ngc_config ]]; then
+        printf '{"auths":{"nvcr.io":{}}}\n' > "$ngc_config"
+        printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | HELM_REGISTRY_CONFIG="$ngc_config" \
+          helm registry login nvcr.io --username \$oauthtoken --password-stdin >&2
       fi
-      ;;
-  esac
-  helmfile --environment default -f "$stack/helmfile.d/$state" "$@" \
-    -l "name=$release" template
+      yq -i '(.repositories[] | select(.name == "nvcf")) |= del(.username, .password)' "$frozen"
+      HELM_REGISTRY_CONFIG=$ngc_config NVCF_USERNAME='' NVCF_PASSWORD='' \
+        helmfile_safe -f "$frozen" -l "name=$release" template
+      return
+    fi
+  fi
+  helmfile_safe -f "$frozen" -l "name=$release" template
 }
 render_release 01-dependencies.yaml.gotmpl openbao-server "$@" > "$work/openbao.yaml"
 render_release 02-core.yaml.gotmpl nvcf-ui "$@" > "$work/ui.yaml"

@@ -45,9 +45,10 @@ Set `OPENBAO_UI_JWT_STACK` to the stack directory and
 `OPENBAO_UI_JWT_ENVIRONMENT` to its environment name. The environment must
 enable the UI and explicitly configure its JWT plugin version. Unset
 `BDD_CLEANUP_MODE`. For NGC, export `NVCF_RELEASE_NGC_API_KEY`; the qualifier
-uses it for a temporary `nvcr.io` Docker login and HTTPS chart authentication
-at `helm.ngc.nvidia.com`. It does not reuse `helm repo add` entries. For chart
-mirrors, set credentials in `global.helm.sources`. Authenticate Docker to image
+uses it for NGC chart authentication (HTTPS at `helm.ngc.nvidia.com` or OCI at
+`nvcr.io`) and runs Docker login only when a selected image uses `nvcr.io`.
+It does not reuse `helm repo add` entries. For chart mirrors, set credentials
+in `global.helm.sources`. Authenticate Docker to image
 mirrors first; their pulls retain the existing config and credential helpers.
 Then run:
 

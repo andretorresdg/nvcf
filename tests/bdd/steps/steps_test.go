@@ -30,6 +30,8 @@ import (
 
 	"github.com/cucumber/godog"
 	messages "github.com/cucumber/messages/go/v21"
+	"github.com/google/shlex"
+	"slices"
 
 	"nvcf-bdd/harness"
 )
@@ -690,6 +692,30 @@ func TestISuccessfullyRunCommandDocPreservesOutput(t *testing.T) {
 	}
 	if err := sc.commandOutputShouldContain("rendered output"); err != nil {
 		t.Fatalf("assert preserved output: %v", err)
+	}
+}
+
+func TestISuccessfullyRunExecutablePreservesArguments(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	t.Setenv("QUOTED_PATH", `/tmp/release\candidate 'quoted' "value" ${LITERAL}`)
+	table := &godog.Table{Rows: []*messages.PickleTableRow{
+		{Cells: []*messages.PickleTableCell{{Value: "argument"}}},
+		{Cells: []*messages.PickleTableCell{{Value: "${QUOTED_PATH}"}}},
+		{Cells: []*messages.PickleTableCell{{Value: "release"}}},
+	}}
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err != nil {
+		t.Fatal(err)
+	}
+	args, err := shlex.Split(fake.runs[0].command)
+	if err != nil || !slices.Equal(args, []string{"qualifier", os.Getenv("QUOTED_PATH"), "release"}) {
+		t.Fatalf("args=%q err=%v", args, err)
+	}
+	fake.result.ExitCode = 1
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
+		t.Fatal("accepted command failure")
+	}
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", nil); err == nil {
+		t.Fatal("accepted missing argument table")
 	}
 }
 

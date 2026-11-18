@@ -275,10 +275,13 @@ an explicit release setting when the server target changes.
 Before qualifying that release, run from the source checkout with Helm 3,
 Helmfile 1.1.x, yq 4 and Docker. For NGC, export
 `NVCF_RELEASE_NGC_API_KEY`. The qualifier uses it for a temporary `nvcr.io`
-Docker login and HTTPS chart authentication at `helm.ngc.nvidia.com`. It does
-not reuse `helm repo add` entries. For chart mirrors, configure credentials in
+Docker login when a selected image uses NGC, and for NGC chart authentication
+(HTTPS at `helm.ngc.nvidia.com` or OCI at `nvcr.io`). It does not reuse
+`helm repo add` entries. For chart mirrors, configure credentials in
 `global.helm.sources`; authenticate Docker to image mirrors before running.
 Mirror image pulls retain the existing Docker config and credential helpers.
+NGC image pulls preserve the selected Docker context and its TLS metadata.
+The qualifier suppresses Helmfile debug output to protect saved passwords.
 Use the actual release environment, including its image, chart and plugin
 version settings. Complete this check before deploying the target-only image:
 
@@ -286,7 +289,9 @@ version settings. Complete this check before deploying the target-only image:
 tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed "$HELMFILE_ENV"
 ```
 
-The check renders the selected published charts, reads the target from the
+The check freezes the selected chart and embedded values before rendering;
+changes to external values files cannot redirect its chart credentials.
+It renders the selected published charts, reads the target from the
 selected server image and exercises the selected migration image's mount
 helper without a server connection. Missing, empty or mismatched UI versions
 and incompatible migration images fail qualification. PR tests check stack

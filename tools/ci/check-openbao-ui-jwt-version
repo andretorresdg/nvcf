@@ -15,13 +15,35 @@ server_image=$server_images
 
 # Run only inspection commands. Never start the server or contact a cluster.
 isolation=(--rm --pull always --network none --read-only --cap-drop ALL --security-opt no-new-privileges)
-# Use the temporary NGC login only for NGC images. Mirror pulls retain the
-# operator's Docker config and credential helpers.
+# Authenticate lazily. Keep Docker context metadata, but never copy credential
+# stores into the temporary NGC config. Mirror pulls retain the original config.
+if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+  umask 077
+  NVCF_RELEASE_NGC_DOCKER_CONFIG=$(mktemp -d)
+  export NVCF_RELEASE_NGC_DOCKER_CONFIG
+  trap 'rm -rf "$NVCF_RELEASE_NGC_DOCKER_CONFIG"' EXIT
+fi
 docker_image() {
   local image=$1
   shift
-  if [[ $image == nvcr.io/* && -n ${NVCF_RELEASE_NGC_DOCKER_CONFIG:-} ]]; then
-    DOCKER_CONFIG=$NVCF_RELEASE_NGC_DOCKER_CONFIG docker "$@"
+  if [[ $image == nvcr.io/* && -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+    local original_config=${DOCKER_CONFIG:-$HOME/.docker}
+    local config=$NVCF_RELEASE_NGC_DOCKER_CONFIG
+    if [[ ! -f $config/logged-in ]]; then
+      if [[ -f $original_config/config.json ]]; then
+        yq -o=json '{"auths": {"nvcr.io": {}}, "currentContext": (.currentContext // "")}' \
+          "$original_config/config.json" > "$config/config.json" || return 1
+      else
+        printf '{"auths":{"nvcr.io":{}}}\n' > "$config/config.json" || return 1
+      fi
+      if [[ -d $original_config/contexts ]]; then
+        cp -R "$original_config/contexts" "$config/contexts" || return 1
+      fi
+      printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | DOCKER_CONFIG="$config" \
+        docker login nvcr.io --username '$oauthtoken' --password-stdin >&2 || return 1
+      touch "$config/logged-in" || return 1
+    fi
+    DOCKER_CONFIG="$config" docker "$@"
   else
     docker "$@"
   fi

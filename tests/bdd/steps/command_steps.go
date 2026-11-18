@@ -41,6 +41,7 @@ func registerCommandSteps(ctx *godog.ScenarioContext, sc *ScenarioContext) {
 	ctx.Step(`^I run command:$`, sc.iRunCommandDoc)
 	ctx.Step(`^I successfully run command "([^"]*)"$`, sc.iSuccessfullyRunCommandLine)
 	ctx.Step(`^I successfully run command:$`, sc.iSuccessfullyRunCommandDoc)
+	ctx.Step(`^I successfully run executable "([^"]*)" with arguments:$`, sc.iSuccessfullyRunExecutable)
 	ctx.Step(`^I poll command for up to (\d+) seconds until output contains "([^"]*)":$`, sc.iPollCommandUntilOutputContains)
 	ctx.Step(`^I run command with a terminal:$`, sc.iRunCommandWithTTYDoc)
 	ctx.Step(`^command has succeeded:$`, sc.commandHasSucceededDoc)
@@ -62,6 +63,17 @@ func (sc *ScenarioContext) iSuccessfullyRunCommandLine(ctx context.Context, comm
 
 func (sc *ScenarioContext) iSuccessfullyRunCommandDoc(ctx context.Context, doc *godog.DocString) error {
 	return sc.runSuccessfully(ctx, doc.Content)
+}
+
+func (sc *ScenarioContext) iSuccessfullyRunExecutable(ctx context.Context, executable string, table *godog.Table) error {
+	args, err := tableToSingleColumn(table, "argument")
+	if err != nil {
+		return err
+	}
+	for i := range args {
+		args[i] = dsl.Interpolate(args[i])
+	}
+	return sc.runResolvedSuccessfully(ctx, dsl.BuildCommand(append([]string{dsl.Interpolate(executable)}, args...)...))
 }
 
 func (sc *ScenarioContext) iPollCommandUntilOutputContains(

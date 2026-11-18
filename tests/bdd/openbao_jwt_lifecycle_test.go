@@ -82,39 +82,43 @@ func TestOpenBaoJWTPluginLifecycle(t *testing.T) {
 }
 
 func TestOpenBaoUIJWTVersionFeatureFileWiresToSteps(t *testing.T) {
-	t.Setenv("OPENBAO_UI_JWT_STACK", "/tmp/selected stack")
-	t.Setenv("OPENBAO_UI_JWT_ENVIRONMENT", "release")
-	runner := newFakeRunner(nil)
-	runner.onRun = func(command string) error {
-		args, err := shlex.Split(command)
-		expected := []string{"tools/ci/qualify-openbao-ui-jwt-version", "/tmp/selected stack", "release"}
-		if err != nil || !slices.Equal(args, expected) {
-			return fmt.Errorf("unexpected qualification command: %q", command)
-		}
-		return nil
-	}
-	runner.respond = func(command string) (harness.Result, bool) {
-		return harness.Result{ExitCode: 0, Stdout: "openbao-ui-jwt-version: target-only"}, true
-	}
-	sc := steps.NewScenarioContext(newWiringSuite(t, runner))
-	var out strings.Builder
-	status := godog.TestSuite{
-		Name: "openbao-ui-jwt-version-wiring",
-		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
-			steps.RegisterAll(ctx, sc)
-		},
-		Options: &godog.Options{
-			Format: "pretty",
-			Paths:  []string{mustResolveFeaturePath(t, "openbao-ui-jwt-version.feature")},
-			Strict: true,
-			Output: &out,
-		},
-	}.Run()
-	if status != 0 {
-		t.Fatalf("godog suite status = %d\n%s", status, out.String())
-	}
-	if !commandRanThatContains(runner.runs, "qualify-openbao-ui-jwt-version") {
-		t.Fatal("release qualification command was never invoked")
+	for _, stack := range []string{"/tmp/selected stack", `/tmp/release\candidate`, `/tmp/release'"${LITERAL}`} {
+		t.Run(stack, func(t *testing.T) {
+			t.Setenv("OPENBAO_UI_JWT_STACK", stack)
+			t.Setenv("OPENBAO_UI_JWT_ENVIRONMENT", "release")
+			runner := newFakeRunner(nil)
+			runner.onRun = func(command string) error {
+				args, err := shlex.Split(command)
+				expected := []string{"tools/ci/qualify-openbao-ui-jwt-version", stack, "release"}
+				if err != nil || !slices.Equal(args, expected) {
+					return fmt.Errorf("unexpected qualification command: %q", command)
+				}
+				return nil
+			}
+			runner.respond = func(command string) (harness.Result, bool) {
+				return harness.Result{ExitCode: 0, Stdout: "openbao-ui-jwt-version: target-only"}, true
+			}
+			sc := steps.NewScenarioContext(newWiringSuite(t, runner))
+			var out strings.Builder
+			status := godog.TestSuite{
+				Name: "openbao-ui-jwt-version-wiring",
+				ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+					steps.RegisterAll(ctx, sc)
+				},
+				Options: &godog.Options{
+					Format: "pretty",
+					Paths:  []string{mustResolveFeaturePath(t, "openbao-ui-jwt-version.feature")},
+					Strict: true,
+					Output: &out,
+				},
+			}.Run()
+			if status != 0 {
+				t.Fatalf("godog suite status = %d\n%s", status, out.String())
+			}
+			if !commandRanThatContains(runner.runs, "qualify-openbao-ui-jwt-version") {
+				t.Fatal("release qualification command was never invoked")
+			}
+		})
 	}
 }
 

@@ -2779,8 +2779,42 @@ class GithubReleaseTest(unittest.TestCase):
         for name in ["Install yq for OpenBao UI release qualification",
                      "Qualify selected OpenBao and UI migration images"]:
             step = workflow.split(f"      - name: {name}\n", 1)[1].split("\n      - ", 1)[0]
-            self.assertIn("steps.release-mode.outputs.publish == 'true'", step)
-            self.assertIn("startsWith(github.ref_name, 'deploy/stacks/self-managed/v')", step)
+            gate = next(line.strip() for line in step.splitlines() if line.strip().startswith("if:"))
+            self.assertEqual(gate, "if: startsWith(github.ref_name, 'deploy/stacks/self-managed/v') && steps.release-mode.outputs.publish == 'true'")
+
+    def test_openbao_qualification_matches_release_inventory_source(self):
+        workflow = (SCRIPT_PATH.parents[2] / ".github/workflows/release-tags.yml").read_text()
+        step = workflow.split("      - name: Qualify selected OpenBao and UI migration images\n", 1)[1].split("\n      - ", 1)[0]
+        publish = workflow.split("      - name: Validate tag and create release notes\n", 1)[1]
+        for body in [step, publish]:
+            self.assertIn("NVCF_RELEASE_HELM_REGISTRY: ${{ secrets.NCP_DEV_REGISTRY }}", body)
+        script = "\n".join(line[10:] for line in step.split("        run: |\n", 1)[1].splitlines())
+        inventory_source = (SCRIPT_PATH.parents[1] / "docs-version-sync/resolved_inventory_publish.go").read_text()
+        image_overrides = re.findall(r'"(global\.image\.(?:registry|repository)=[^"]+)"',
+                                    inventory_source.split("var resolvedInventoryCommonOverrides = []string{", 1)[1].split("}", 1)[0])
+        self.assertEqual(len(image_overrides), 2)
+        for source in ["registry.example.com/release/charts", "registry.example.com:5000/release/charts/"]:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                qualifier = root / "tools/ci/qualify-openbao-ui-jwt-version"
+                qualifier.parent.mkdir(parents=True)
+                qualifier.write_text("#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\nPath(os.environ['TEST_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n")
+                qualifier.chmod(0o755)
+                capture = root / "arguments.json"
+                env = dict(os.environ, NVCF_RELEASE_HELM_REGISTRY=source, TEST_CAPTURE=str(capture))
+                subprocess.run(["bash", "-eu", "-c", script], cwd=root, env=env, check=True, capture_output=True)
+                args = json.loads(capture.read_text())
+                host, path = source.rstrip("/").split("/", 1)
+                for override in ["global.helm.sources.url=", f"global.helm.sources.registry={host}",
+                                 f"global.helm.sources.repository={path}", *image_overrides]:
+                    self.assertIn(override, args)
+                self.assertEqual(args[:2], ["deploy/stacks/self-managed", "base"])
+        for source in ["", "registry.example.com", "https://registry.example.com/charts", "user@registry.example.com/charts", "registry.example.com/../charts"]:
+            with self.subTest(invalid_source=source):
+                env = dict(os.environ, NVCF_RELEASE_HELM_REGISTRY=source)
+                result = subprocess.run(["bash", "-eu", "-c", script], cwd=SCRIPT_PATH.parents[2], env=env, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"must use host/repository format", result.stderr)
 
     def test_stack_inventory_preflight_renders_without_release_publication(self):
         workflow = (SCRIPT_PATH.parents[2] / ".github/workflows/release-tags.yml").read_text()
