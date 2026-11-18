@@ -3264,6 +3264,14 @@ const (
 	sampleLLMEchoDefaultImage = "nvcf-openai-compatible-sample:5.1.0"
 )
 
+// TestOpenBaoBootstrapReadiness runs the isolated chart lifecycle checks.
+func TestOpenBaoBootstrapReadiness(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeature(t, "openbao-bootstrap-readiness.feature")
+}
+
 // TestSingleClusterHA is the live entry point for the high-availability
 // Helmfile feature on the single-cluster ncp-local topology. Skipped under
 // -short.
@@ -4782,5 +4790,57 @@ func seedFunctionAPIKey(t *testing.T, home string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(home, ".nvcf-cli.nvcf-cli-local.state"), []byte(`{"apiKey":"wiring-function-api-key"}`), 0o600); err != nil {
 		t.Fatalf("write NVCF CLI state: %v", err)
+	}
+}
+
+func TestOpenBaoBootstrapReadinessFeatureFileWiresToSteps(t *testing.T) {
+	values := map[string]string{
+		"OPENBAO_TEST_CONTEXT":   "qa-context",
+		"OPENBAO_TEST_NAMESPACE": "qa-openbao",
+		"OPENBAO_TEST_RELEASE":   "qa-release",
+		"OPENBAO_TEST_CHART":     "chart",
+		"OPENBAO_TEST_VALUES":    "values.yaml",
+		"OPENBAO_TEST_ARTIFACTS": "out/qa-openbao",
+	}
+	for key, value := range values {
+		t.Setenv(key, value)
+	}
+	runner := &fakeRunner{results: map[string]harness.Result{}}
+	runner.respond = func(command string) (harness.Result, bool) {
+		switch {
+		case strings.Contains(command, "get statefulset"):
+			return harness.Result{Stdout: `[{"name":"openbao","path":"/v1/sys/health?standbyok=true"}]`}, true
+		case strings.Contains(command, "bao status") && strings.Contains(command, "jq -sc"):
+			return harness.Result{Stdout: `[{"pod":"openbao-server-0","initialized":true,"sealed":false},{"pod":"openbao-server-1","initialized":true,"sealed":false},{"pod":"openbao-server-2","initialized":true,"sealed":false}]`}, true
+		case strings.Contains(command, "openbao-unseal-monitor.sh"):
+			if strings.Contains(command, " pause") {
+				return harness.Result{Stdout: "monitor=pause"}, true
+			}
+			return harness.Result{Stdout: "monitor=resume"}, true
+		case strings.Contains(command, "state=preserved"):
+			return harness.Result{Stdout: "state=preserved"}, true
+		}
+		return harness.Result{}, true
+	}
+	suite := newWiringSuite(t, runner)
+	sc := steps.NewScenarioContext(suite)
+	var out strings.Builder
+	status := godog.TestSuite{
+		Name: "openbao-bootstrap-readiness-wiring",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			steps.RegisterAll(ctx, sc)
+		},
+		Options: &godog.Options{
+			Format: "pretty",
+			Paths:  []string{mustResolveFeaturePath(t, "openbao-bootstrap-readiness.feature")},
+			Strict: true,
+			Output: &out,
+		},
+	}.Run()
+	if status != 0 {
+		t.Fatalf("OpenBao bootstrap feature status = %d\n%s", status, out.String())
+	}
+	if !strings.Contains(strings.Join(runner.runs, "\n"), "operator seal") {
+		t.Fatal("OpenBao bootstrap feature did not exercise sealing")
 	}
 }

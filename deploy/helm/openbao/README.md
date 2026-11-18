@@ -9,9 +9,61 @@ The chart is designed to provide:
 
 - An OpenBao server deployment built on top of the upstream
   `openbao/openbao-helm` chart
-- NVCF-specific post-install and post-upgrade jobs for cluster initialization
-  and migrations
+- A bootstrap Job that initializes and unseals members before readiness
+- Post-install JWT configuration and post-install/post-upgrade migrations
 - Opinionated defaults for HA, injector enablement, and operational hooks
+
+## Readiness and bootstrap
+
+The server readiness probe accepts active and standby members after unseal.
+Sealed and uninitialized members stay NotReady. Client Services must set
+`openbao.server.service.publishNotReadyAddresses=false` to exclude them from
+routing. The self-managed HA values set this flag; standalone installs must
+set it explicitly. Keep the internal headless Service publishing NotReady
+addresses so Raft peers can discover one another during bootstrap.
+
+With `--wait`, Helm waits for StatefulSet readiness before running post-install
+hooks. The chart therefore creates a regular bootstrap Job with the StatefulSet. It
+uses each member's local API while the member is NotReady, initializes the
+primary, saves credentials and joins/unseals peers. The post-install Job then
+waits for bootstrap completion and configures JWT support before migrations
+run. It never initializes members, including installs without Helm `--wait`.
+
+```mermaid
+sequenceDiagram
+    Helm->>Kubernetes: Create StatefulSet, bootstrap scripts and bootstrap Job
+    Note over Kubernetes: Members expose APIs and remain NotReady
+    Bootstrap->>OpenBao: Initialize primary and persist credentials
+    Bootstrap->>OpenBao: Join and unseal members
+    OpenBao->>Kubernetes: Members become Ready
+    Kubernetes->>Helm: Resource readiness and bootstrap completion
+    Helm->>OpenBao: Post-install JWT setup and migrations
+```
+
+Bootstrap waits up to `openbao.hooks.initializeCluster.apiTimeoutSeconds`
+(default 600 seconds) for member APIs. It reads the StatefulSet replica count
+and selects the `openbao` container by name. A new Job name on each release
+revision avoids immutable Job-template errors on upgrade. Existing initialized
+members reuse saved credentials. Inconsistent state or missing credentials
+fails closed instead of initializing again; restore the matching data and
+credentials before retrying.
+
+When upgrading with `--reuse-values`, explicitly replace the old readiness
+path, which otherwise remains in the reused values:
+
+```bash
+helm upgrade openbao-server helm --namespace vault-system \
+  --reuse-values \
+  --set openbao.server.service.publishNotReadyAddresses=false \
+  --set-string 'openbao.server.readinessProbe.path=/v1/sys/health?standbyok=true' \
+  --wait --wait-for-jobs --timeout 20m
+```
+
+Retain your image, namespace and migration overrides when upgrading. With an
+`OnDelete` StatefulSet strategy, the probe change reaches each Pod only after
+that Pod is recreated. Roll one member at a time and verify recovery and Raft
+quorum before continuing. After rollback to an older chart, that chart's
+readiness defaults apply again.
 
 ## JWT plugin lifecycle
 
@@ -105,6 +157,7 @@ helm install openbao-server helm \
   --create-namespace \
   --values helm/values.yaml \
   --values path/to/values.yaml \
+  --set openbao.server.service.publishNotReadyAddresses=false \
   --wait \
   --wait-for-jobs \
   --timeout 20m

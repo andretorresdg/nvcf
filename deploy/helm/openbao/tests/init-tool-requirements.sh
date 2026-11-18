@@ -23,6 +23,16 @@ test "$(yq -r "$init_job | .spec.template.spec.containers[0].args[0]" "$rendered
 read -r -a chart_command <<< "$(yq -r "$init_job | .spec.template.spec.containers[0].args[1]" "$rendered")"
 test "${chart_command[0]}" = /scripts/deploy.sh
 
+# Bootstrap must run while the StatefulSet is NotReady, before post-install.
+bootstrap_job='select(.kind == "Job" and .metadata.labels."app.kubernetes.io/component" == "openbao-bootstrap")'
+test "$(yq -r "$bootstrap_job | .metadata.annotations.\"helm.sh/hook\"" "$rendered")" = null
+test "$(yq -r "$bootstrap_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_ONLY\") | .value" "$rendered")" = true
+for name in bootstrap-script bootstrap-utils; do
+    test "$(yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"openbao-server-$name\") | .metadata.annotations.\"helm.sh/hook\"" "$rendered")" = null
+done
+probe_path=$(yq -r 'select(.kind == "StatefulSet") | .spec.template.spec.containers[] | select(.name == "openbao") | .readinessProbe.httpGet.path' "$rendered")
+test "$probe_path" = '/v1/sys/health?standbyok=true'
+
 bin_dir="$test_root/bin"
 mkdir -p "$bin_dir"
 for tool in dirname jq tr sort head; do
@@ -41,6 +51,7 @@ esac
 exit 1
 MOCK
 chmod +x "$bin_dir/kubectl"
+export OPENBAO_API_TIMEOUT_SECONDS=1
 export KUBECTL_CALLS="$test_root/kubectl-calls"
 
 for source_dir in "$project_dir" "$project_dir/helm/scripts"; do
@@ -52,11 +63,11 @@ for source_dir in "$project_dir" "$project_dir/helm/scripts"; do
         cp "$source_dir/deploy.sh" "$stage/deploy.sh"
         cp "$source_dir/utils/utils.sh" "$source_dir/utils/log.sh" "$stage/utils/"
         mkdir -p "$stage/helm/scripts/utils"
-        cp "$project_dir/helm/scripts/utils/jwt-plugin.sh" "$stage/helm/scripts/utils/"
+        cp "$project_dir/helm/scripts/utils/"{jwt-plugin,bootstrap}.sh "$stage/helm/scripts/utils/"
     else
-        yq -r 'select(.kind == "ConfigMap" and .metadata.name == "openbao-server-init-script") | .data."deploy.sh"' "$rendered" > "$stage/deploy.sh"
-        for script in utils log jwt-plugin; do
-            yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"openbao-server-utils-script\") | .data.\"$script.sh\"" "$rendered" > "$stage/utils/$script.sh"
+        yq -r 'select(.kind == "ConfigMap" and .metadata.name == "openbao-server-bootstrap-script") | .data."deploy.sh"' "$rendered" > "$stage/deploy.sh"
+        for script in utils log jwt-plugin bootstrap; do
+            yq -r "select(.kind == \"ConfigMap\" and .metadata.name == \"openbao-server-bootstrap-utils\") | .data.\"$script.sh\"" "$rendered" > "$stage/utils/$script.sh"
         done
         hook_args=("${chart_command[@]:1}")
     fi

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Contains the initialization script and a job to run it as a hook
+# Bootstrap runs before readiness; post-install configures JWT after readiness.
 
 # The script runs in an image that must contain:
 # - bash
@@ -21,21 +21,32 @@
 # - jq
 # - jwker
 {{- $serverFullname := include "nvcf-openbao.serverFullname" . }}
+{{- $root := . }}
+{{- range $bootstrapOnly := list true false }}
+{{- with $root }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ $serverFullname }}-initialize-cluster
+  name: {{ if $bootstrapOnly }}{{ printf "%s-bootstrap-%d" ($serverFullname | trunc 40 | trimSuffix "-") .Release.Revision }}{{ else }}{{ $serverFullname }}-initialize-cluster{{ end }}
   namespace: {{ include "nvcf-openbao.namespace" . }}
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: {{ if $bootstrapOnly }}openbao-bootstrap{{ else }}openbao-initialize{{ end }}
+  {{- if not $bootstrapOnly }}
   annotations:
     helm.sh/hook: post-install
     helm.sh/hook-weight: "-5"
+  {{- end }}
 spec:
   template:
-    {{- with .Values.openbao.hooks.initializeCluster.podAnnotations }}
     metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: {{ if $bootstrapOnly }}openbao-bootstrap{{ else }}openbao-initialize{{ end }}
+      {{- with .Values.openbao.hooks.initializeCluster.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
-    {{- end }}
+      {{- end }}
     spec:
       securityContext:
         runAsNonRoot: true
@@ -63,6 +74,10 @@ spec:
             - /scripts/deploy.sh {{ include "nvcf-openbao.namespace" . }} {{ $serverFullname }} helm
           env:
             {{- include "nvcf-openbao.kubectlEnv" . | nindent 12 }}
+            - name: OPENBAO_BOOTSTRAP_ONLY
+              value: {{ $bootstrapOnly | quote }}
+            - name: OPENBAO_API_TIMEOUT_SECONDS
+              value: {{ .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds | default 600 | quote }}
             - name: JWT_PLUGIN_LIFECYCLE_MODE
               value: {{ include "nvcf-openbao.jwtLifecycleMode" . | quote }}
             - name: AUTO_UNSEAL
@@ -87,28 +102,22 @@ spec:
       volumes:
         - name: init-script
           configMap:
-            name: {{ $serverFullname }}-init-script
+            name: {{ $serverFullname }}-bootstrap-script
             # The migrations image runs as the upstream non-root OpenBao user.
             # These ConfigMaps contain executable scripts, not secrets.
             defaultMode: 0555
         - name: utils-script
           configMap:
-            name: {{ $serverFullname }}-utils-script
+            name: {{ $serverFullname }}-bootstrap-utils
             defaultMode: 0555
 ---
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ $serverFullname }}-init-script
+  name: {{ $serverFullname }}-bootstrap-script
   namespace: {{ include "nvcf-openbao.namespace" . }}
-  annotations:
-    helm.sh/hook: post-install,post-upgrade
-    helm.sh/hook-weight: "-6"
-    # Do NOT include `hook-failed`: if the init Job's first pod errors, the
-    # Job's native retry creates new pods. Those retries can't mount these
-    # configmaps if they've already been deleted on hook-failed. Keep them
-    # around until the Job ultimately succeeds.
-    helm.sh/hook-delete-policy: hook-succeeded
 data:
   deploy.sh: |-
     {{- .Files.Get "scripts/deploy.sh" | nindent 4 }}
@@ -116,16 +125,8 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ $serverFullname }}-utils-script
+  name: {{ $serverFullname }}-bootstrap-utils
   namespace: {{ include "nvcf-openbao.namespace" . }}
-  annotations:
-    helm.sh/hook: post-install,post-upgrade
-    helm.sh/hook-weight: "-6"
-    # Do NOT include `hook-failed`: if the init Job's first pod errors, the
-    # Job's native retry creates new pods. Those retries can't mount these
-    # configmaps if they've already been deleted on hook-failed. Keep them
-    # around until the Job ultimately succeeds.
-    helm.sh/hook-delete-policy: hook-succeeded
 data:
   utils.sh: |-
     {{- .Files.Get "scripts/utils.sh" | nindent 4 }}
@@ -133,3 +134,5 @@ data:
     {{- .Files.Get "scripts/log.sh" | nindent 4 }}
   jwt-plugin.sh: |-
     {{- .Files.Get "scripts/utils/jwt-plugin.sh" | nindent 4 }}
+  bootstrap.sh: |-
+    {{- .Files.Get "scripts/utils/bootstrap.sh" | nindent 4 }}

@@ -170,7 +170,36 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   go test -run '^TestMultiClusterHelmfileLLMLastClusterAffinity$' -timeout 120m -v
 ```
 
-### OpenBao JWT plugin lifecycle
+#### OpenBao bootstrap readiness
+
+`TestOpenBaoBootstrapReadiness` uses an existing isolated Kubernetes context
+and installs the source chart. Prepare a fresh namespace, registry pull secret
+and values file for three OpenBao members. Retain the `auto-unseal-sidecar` for
+this Shamir-seal scenario. Values must provide the server and migration images,
+JWT lifecycle mode and migration credentials. Keep `openbao.fullnameOverride`
+as `openbao-server`. The runner needs Bash, Helm 3, kubectl, jq and shasum.
+Follow the root QA cleanup rules.
+
+```sh
+OPENBAO_TEST_CONTEXT=<isolated-context> \
+OPENBAO_TEST_NAMESPACE=<fresh-namespace> \
+OPENBAO_TEST_RELEASE=<unique-release> \
+OPENBAO_TEST_CHART=<absolute-source-chart-path> \
+OPENBAO_TEST_VALUES=<absolute-private-values-path> \
+OPENBAO_TEST_ARTIFACTS=<unique-artifact-directory> \
+  go test -run '^TestOpenBaoBootstrapReadiness$' -timeout 45m -v
+```
+
+The scenario installs with Helm resource/job waits, checks initialized and
+unsealed members, temporarily holds an unseal monitor, verifies a sealed
+member becomes NotReady, resumes unsealing, and upgrades with a changed Job
+annotation. Cluster identity and bootstrap credential digests must remain
+unchanged. Only digests are written; credentials stay out of command text and
+output. The monitor hold also expires after 90 seconds if a later assertion
+fails. Stop the isolated environment after collecting diagnostics.
+This scenario does not replace the full `TestSingleClusterHA` suite.
+
+## OpenBao JWT plugin lifecycle
 
 `TestOpenBaoJWTPluginLifecycle` exercises real file-backed OpenBao restarts,
 declarative registration, version tuning, plugin reload, rollback, and gated
