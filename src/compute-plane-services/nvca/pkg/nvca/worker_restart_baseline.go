@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -78,17 +79,33 @@ func recordWorkerRestartBaselines(ctx context.Context, client kubernetes.Interfa
 		return
 	}
 	for _, pod := range pods {
-		baseline, ok := k8sutil.WorkerRestartCountBaselineToRecord(pod, now)
-		if !ok {
-			continue
-		}
-		if err := patchWorkerRestartBaseline(ctx, client, pod, baseline); err != nil {
-			log.WithError(err).Warnf("failed to record worker restart baseline %d on pod %s/%s",
-				baseline, pod.Namespace, pod.Name)
-			continue
-		}
-		log.Infof("recorded worker restart baseline %d on pod %s/%s", baseline, pod.Namespace, pod.Name)
+		recordWorkerRestartBaseline(ctx, client, pod, now)
 	}
+}
+
+// recordWorkerRestartBaseline records the worker restart baseline on a function Pod when it changed. It is also
+// called on every Pod update, so a healthy run that just ended is recorded before the next restart replaces its
+// termination state.
+func recordWorkerRestartBaseline(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, now time.Time) {
+	reqID, ok := pod.Labels[nvcatypes.ICMSRequestIDKey]
+	if !ok {
+		return
+	}
+	baseline, ok := k8sutil.WorkerRestartCountBaselineToRecord(pod, now)
+	if !ok {
+		return
+	}
+	log := core.GetLogger(ctx).WithFields(logrus.Fields{
+		"icms_request_id": reqID,
+		"namespace":       pod.Namespace,
+		"pod":             pod.Name,
+		"baseline":        baseline,
+	})
+	if err := patchWorkerRestartBaseline(ctx, client, pod, baseline); err != nil {
+		log.WithError(err).Warn("failed to record worker restart baseline")
+		return
+	}
+	log.Info("recorded worker restart baseline")
 }
 
 func patchWorkerRestartBaseline(ctx context.Context, client kubernetes.Interface, pod *corev1.Pod, baseline int32) error {

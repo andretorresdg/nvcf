@@ -45,7 +45,11 @@ func TestRecordWorkerRestartBaselines(t *testing.T) {
 				Name: common.UtilsContainerName,
 				Env:  []corev1.EnvVar{{Name: k8sutil.InstanceIDEnvKey, Value: "instance-1"}},
 			}}},
-			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+				Type:               corev1.PodReady,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: metav1.NewTime(now.Add(-runFor)),
+			}}, ContainerStatuses: []corev1.ContainerStatus{{
 				Name:         common.UtilsContainerName,
 				RestartCount: restarts,
 				Ready:        true,
@@ -75,4 +79,25 @@ func TestRecordWorkerRestartBaselines(t *testing.T) {
 		got[name] = p.Annotations[k8sutil.WorkerRestartCountBaselineAnnotationKey]
 	}
 	assert.Equal(t, map[string]string{"healthy": "4", "recent": "", "unrelated": ""}, got)
+
+	t.Run("pod update records a long run that just ended", func(t *testing.T) {
+		pod := newPod("crashed", reqLabels, 3, time.Minute)
+		pod.Status.ContainerStatuses[0].State = corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+		}
+		pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   2,
+				StartedAt:  metav1.NewTime(now.Add(-2 * time.Hour)),
+				FinishedAt: metav1.NewTime(now.Add(-time.Minute)),
+			},
+		}
+		client := fakek8sclient.NewSimpleClientset(pod)
+
+		recordWorkerRestartBaseline(context.Background(), client, pod, now)
+
+		got, err := client.CoreV1().Pods("nvcf-backend").Get(context.Background(), "crashed", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "3", got.Annotations[k8sutil.WorkerRestartCountBaselineAnnotationKey])
+	})
 }

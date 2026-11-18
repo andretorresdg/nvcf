@@ -697,6 +697,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 					for _, ww := range []workloadWatcher{watchForPodCrashesRestarts, onNVCFPodUpdateFunc} {
 						ww(ctx, oldPod, newPod)
 					}
+					recordWorkerRestartBaseline(ctx, k8sClient, newPod, time.Now())
 				},
 			})
 			if err != nil {
