@@ -21,6 +21,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -134,5 +136,55 @@ func TestHTTPServerMetricsIgnoreHost(t *testing.T) {
 	}
 	if !clientFound {
 		t.Error("HTTP client server_address label lost")
+	}
+}
+
+func TestDefaultHTTPServerMetricsProvider(t *testing.T) {
+	const subprocessEnv = "NVCF_TEST_DEFAULT_METRICS_PROVIDER"
+	if os.Getenv(subprocessEnv) != "1" {
+		// Package initialization runs in a fresh process so this test neither
+		// replaces nor pollutes the other tests' global telemetry state.
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(executable, "-test.run=^TestDefaultHTTPServerMetricsProvider$", "-test.v")
+		cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("default provider subprocess: %v\n%s", err, output)
+		}
+		return
+	}
+
+	// Use the global provider installed by init(), as production does.
+	handler := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte("ok"))
+	}), "test")
+	scrapeHandler := promhttp.Handler()
+	for _, host := range []string{"proxy.example\xff", "proxy.example"} {
+		req := httptest.NewRequest(http.MethodPost, "http://proxy.example/invoke", strings.NewReader("request"))
+		req.Host = host
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != http.StatusOK || response.Body.String() != "ok" {
+			t.Fatalf("host %q: response = %d %q", host, response.Code, response.Body.String())
+		}
+
+		scrape := httptest.NewRecorder()
+		scrapeHandler.ServeHTTP(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if scrape.Code != http.StatusOK {
+			t.Fatalf("host %q: scrape = %d %s", host, scrape.Code, scrape.Body.String())
+		}
+		for _, name := range []string{
+			"http_server_request_body_size_bytes_count{",
+			"http_server_response_body_size_bytes_count{",
+			"http_server_request_duration_seconds_count{",
+			RootNamespace + "_active_connections_total ",
+		} {
+			if !strings.Contains(scrape.Body.String(), name) {
+				t.Errorf("host %q: missing metric %s", host, name)
+			}
+		}
 	}
 }
