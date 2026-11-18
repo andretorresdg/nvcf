@@ -644,6 +644,10 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 			ExitCode: 0,
 			Stdout:   "Listing cluster groups...\nFound 1 cluster groups:\n\nID: test-cluster-group-id\n---\n",
 		},
+		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml api-key show": {
+			ExitCode: 0,
+			Stdout:   "Current saved API keys:\nfunction key: nvapi-redacted\n",
+		},
 		invalidHelmFunctionDeployCommand: {
 			ExitCode: 1,
 			Stderr:   "deployment failed: function deployment failed with status: ERROR\n",
@@ -749,6 +753,14 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		"load_tester_supreme:0.0.8",
 		"--health-protocol GRPC --health-uri / --health-port 8001") {
 		t.Fatal("gRPC sample function was not configured with a gRPC health endpoint")
+	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"api-key generate --for function",
+		"--description bdd-init-keeps-api-keys") {
+		t.Fatal("init key retention scenario did not generate its function API key")
+	}
+	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "api-key show") {
+		t.Fatal("init key retention scenario did not inspect the saved API keys")
 	}
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"api-key generate --for function",

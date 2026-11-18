@@ -83,6 +83,11 @@ type State struct {
 	LastInvokeURL string `json:"lastInvokeUrl,omitempty"`
 	LastAccount   string `json:"lastAccount,omitempty"`
 
+	// Endpoints the task and Event Ledger keys were saved against. init keeps
+	// each key only while its own endpoint is unchanged.
+	LastNVCTURL        string `json:"lastNvctUrl,omitempty"`
+	LastEventLedgerURL string `json:"lastEventLedgerUrl,omitempty"`
+
 	// Self-hosted auth cache: admin token + control-plane fingerprint.
 	// nil when no self-hosted installation has been run, or when the
 	// state file was written by an older CLI that didn't have this field.
@@ -240,6 +245,13 @@ func (sm *StateManager) SetEndpoints(baseURL, invokeURL, account string) {
 	sm.state.LastBaseURL = baseURL
 	sm.state.LastInvokeURL = invokeURL
 	sm.state.LastAccount = account
+}
+
+// SetKeyEndpoints records the NVCT and Event Ledger endpoints that the saved
+// task and Event Ledger keys belong to.
+func (sm *StateManager) SetKeyEndpoints(nvctURL, eventLedgerURL string) {
+	sm.state.LastNVCTURL = nvctURL
+	sm.state.LastEventLedgerURL = eventLedgerURL
 }
 
 // IsTokenValid checks if the current token is still valid

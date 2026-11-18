@@ -180,8 +180,9 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
     # This scenario intentionally has no Background. It depends on the
     # earlier NVCA registration scenario in this feature run, and is not a
-    # standalone tag target. The final init clears the narrowly scoped API
-    # key from CLI state so later scenarios start from the admin token.
+    # standalone tag target. The final api-key clear removes the narrowly
+    # scoped API key from CLI state so later scenarios start from the admin
+    # token. A repeated init keeps saved keys, so it cannot do this.
     @cluster-groups
     Scenario: Operator lists cluster groups with the admin token and with a scoped API key
       When I successfully run command:
@@ -208,7 +209,40 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
       When I successfully run command:
         """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key clear --force
+        """
+
+    # This scenario intentionally has no Background. It only needs the API
+    # Keys service from the earlier control-plane install, and is not a
+    # standalone tag target.
+    @init-keeps-api-keys
+    Scenario: Operator keeps saved API keys when init runs again against the same deployment
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully run command:
+        """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
+        """
+      When I successfully generate a function API key with CLI options:
+        | option        | value                    |
+        | --description | bdd-init-keeps-api-keys  |
+        | --scopes      | list_cluster_groups      |
+
+      When I successfully run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
+        """
+      When I run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key show
+        """
+      Then the command exit code should be 0
+      And the command output should contain "function key:"
+      And the command output should not contain "No API key found in state"
+
+      When I successfully run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key clear --force
         """
 
   Rule: Helmfile-installed local NVCF can run a Helm task
