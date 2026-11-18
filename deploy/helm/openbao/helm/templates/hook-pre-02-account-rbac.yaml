@@ -42,6 +42,7 @@ rules:
   # Hooks wait for the current bootstrap Job's post-write verification.
   - apiGroups: ["batch"]
     resources: ["jobs"]
+    resourceNames: [{{ include "nvcf-openbao.bootstrapJobName" . | quote }}]
     verbs: ["get"]
   # create unseal and jwt secrets
   - apiGroups: [""]

@@ -49,6 +49,13 @@ done
 script_map=$(yq -r "$init_job | .spec.template.spec.volumes[] | select(.name == \"init-script\") | .configMap.name" "$rendered")
 utils_map=$(yq -r "$init_job | .spec.template.spec.volumes[] | select(.name == \"utils-script\") | .configMap.name" "$rendered")
 expected_credential_timeout=$(yq -r '.openbao.hooks.initializeCluster.credentialTimeoutSeconds' "$project_dir/helm/values.yaml")
+expected_api_timeout=$(yq -r '.openbao.hooks.initializeCluster.apiTimeoutSeconds' "$project_dir/helm/values.yaml")
+expected_deadline=$((2 * expected_api_timeout + 4 * expected_credential_timeout + 60))
+test "$(yq -r "$bootstrap_job | .spec.activeDeadlineSeconds" "$rendered")" = "$expected_deadline"
+for job in "$init_job" "$wait_job"; do
+    test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS\") | .value" "$rendered")" = "$((expected_deadline + 60))"
+    test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS\") | .value | tag" "$rendered")" = '!!str'
+done
 test "$(yq -r "$bootstrap_job | .spec.template.spec.containers[0].env[] | select(.name == \"OPENBAO_CREDENTIAL_TIMEOUT_SECONDS\") | .value" "$rendered")" = "$expected_credential_timeout"
 # Zero must reach script validation; only an absent key uses the default.
 for key in credential api; do
@@ -60,15 +67,28 @@ for key in credential api; do
     if [ "$key" = api ]; then env_name=OPENBAO_API_TIMEOUT_SECONDS; fi
     for job in "$bootstrap_job" "$init_job" "$wait_job"; do
         test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"$env_name\") | .value" "$test_root/timeout.yaml")" = 0
+        test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"$env_name\") | .value | tag" "$test_root/timeout.yaml")" = '!!str'
     done
     yq -i "del(.openbao.hooks.initializeCluster.${key}TimeoutSeconds)" "$chart_dir/values.yaml"
     helm template openbao "$chart_dir" --namespace test \
         -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" > "$test_root/timeout.yaml"
     for job in "$bootstrap_job" "$init_job" "$wait_job"; do
         test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"$env_name\") | .value" "$test_root/timeout.yaml")" = "$expected_default"
+        test "$(yq -r "$job | .spec.template.spec.containers[0].env[] | select(.name == \"$env_name\") | .value | tag" "$test_root/timeout.yaml")" = '!!str'
     done
 done
 test "$(yq -r 'select(.kind == "Role") | .rules[] | select(.apiGroups[0] == "batch" and .resources[0] == "jobs") | .verbs[0]' "$rendered")" = get
+previous_name=""
+for suffix in a b; do
+    helm template openbao "$test_root"/*.tgz --namespace test \
+        -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
+        --set "openbao.fullnameOverride=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-$suffix" > "$test_root/named.yaml"
+    job_name=$(yq -r "$bootstrap_job | .metadata.name" "$test_root/named.yaml")
+    test "${#job_name}" -le 63 && test "$job_name" != "$previous_name"
+    test "$(yq -r 'select(.kind == "Role") | .rules[] | select(.resources[0] == "jobs") | .resourceNames[0]' "$test_root/named.yaml")" = "$job_name"
+    test "$(yq -r 'select(.kind == "Job" and .metadata.annotations."helm.sh/hook" == "post-upgrade") | .spec.template.spec.containers[0].env[] | select(.name == "OPENBAO_BOOTSTRAP_JOB_NAME") | .value' "$test_root/named.yaml")" = "$job_name"
+    previous_name=$job_name
+done
 helm template openbao "$test_root"/*.tgz --namespace test \
     -f "$project_dir/../../../tools/ci/helm-validate-values/openbao.yaml" \
     --set 'openbao.hooks.initializeCluster.schedulingGates[0].name=example.com/hold' > "$test_root/gated.yaml"

@@ -20,16 +20,9 @@
 # - kubectl
 # - jq
 # - jwker
+# - sha256sum or shasum
 {{- $serverFullname := include "nvcf-openbao.serverFullname" . }}
-{{- $bootstrapJobName := printf "%s-bootstrap-%d" ($serverFullname | trunc 40 | trimSuffix "-") .Release.Revision }}
-{{- $credentialTimeout := 120 }}
-{{- if hasKey .Values.openbao.hooks.initializeCluster "credentialTimeoutSeconds" }}
-{{- $credentialTimeout = .Values.openbao.hooks.initializeCluster.credentialTimeoutSeconds }}
-{{- end }}
-{{- $apiTimeout := 600 }}
-{{- if hasKey .Values.openbao.hooks.initializeCluster "apiTimeoutSeconds" }}
-{{- $apiTimeout = .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds }}
-{{- end }}
+{{- $bootstrapJobName := include "nvcf-openbao.bootstrapJobName" . }}
 {{- $root := . }}
 {{- if ne .Values.openbao.server.podManagementPolicy "Parallel" }}
 {{- fail "OpenBao bootstrap requires openbao.server.podManagementPolicy=Parallel" }}
@@ -52,6 +45,9 @@ metadata:
     helm.sh/hook-weight: "-5"
   {{- end }}
 spec:
+  {{- if $bootstrapOnly }}
+  activeDeadlineSeconds: {{ include "nvcf-openbao.bootstrapDeadlineSeconds" . }}
+  {{- end }}
   template:
     metadata:
       labels:
@@ -94,12 +90,14 @@ spec:
               value: {{ $bootstrapOnly | quote }}
             - name: OPENBAO_BOOTSTRAP_JOB_NAME
               value: {{ $bootstrapJobName | quote }}
+            - name: OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS
+              value: {{ add (include "nvcf-openbao.bootstrapDeadlineSeconds" . | int) 60 | quote }}
             - name: OPENBAO_WAIT_ONLY
               value: {{ $waitOnly | quote }}
             - name: OPENBAO_API_TIMEOUT_SECONDS
-              value: {{ $apiTimeout | quote }}
+              value: {{ include "nvcf-openbao.apiTimeoutSeconds" . | quote }}
             - name: OPENBAO_CREDENTIAL_TIMEOUT_SECONDS
-              value: {{ $credentialTimeout | quote }}
+              value: {{ include "nvcf-openbao.credentialTimeoutSeconds" . | quote }}
             - name: JWT_PLUGIN_LIFECYCLE_MODE
               value: {{ include "nvcf-openbao.jwtLifecycleMode" . | quote }}
             - name: AUTO_UNSEAL

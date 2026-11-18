@@ -72,6 +72,13 @@ concurrent restore causes a conflict and a reread instead of an overwrite.
 The completion check also rereads the desired replica count before releasing
 the next hook.
 
+The bootstrap Job has an overall deadline of twice the API budget plus four
+credential budgets and 60 seconds for startup. The default is 1740 seconds.
+All Job retries share this deadline. Hooks check the Job first and allow a
+further 60 seconds to observe termination. After Job success, the final API,
+member and credential checks get a fresh API budget. Set the Helm or Helmfile
+release timeout to cover both waits; use at least one hour with the defaults.
+
 New root-token Secrets atomically save `bootstrap_state=pending` and a digest
 of the original unseal key or recovery shares. A retry must match that digest
 before marking completion. Completion uses a version check on the root Secret,
@@ -81,8 +88,11 @@ after this reread. Retries, including later release revisions, must finish
 verification when the receipt is missing. Hooks require this receipt and wait
 for the current bootstrap Job to succeed.
 
-If recovery-key persistence fails in auto-unseal mode, the saved root token
-remains available for recovery, but retries and hooks reject pending state.
+If credential persistence fails, check the root-token and recovery-key Secrets
+independently. The script attempts both writes; Kubernetes can reject both.
+A root token that was successfully saved remains available for recovery.
+Restore or recover a valid root token with the supported recovery procedure
+before retrying if its Secret is missing. Retries and hooks reject pending state.
 Restore the matching recovery-key Secret only if the original shares were
 saved or exported. A root token or KMS access cannot reconstruct lost shares.
 For an unused fresh cluster with no application data, an operator can explicitly
@@ -100,6 +110,49 @@ Do not delete the completion, digest or verification fields from the root-token
 Secret. Resolve pending credentials before rolling back to a chart that does
 not check these fields.
 
+### Recovery-key export
+
+Before export, prevent bootstrap retries and all other writers from changing
+either Secret. Keep this exclusion through verification and deletion. Compare
+the exported shares with the stored digest before deleting the recovery-key
+Secret. The completion receipt records an earlier check; it does not lock the
+Secret against later changes. Retain the Secret if writer exclusion or digest
+verification cannot be completed.
+
+For new installations with the digest field, run this example in Bash from the
+repository root. Set `KUBE_CONTEXT` and `OPENBAO_NAMESPACE` to the target cluster
+and namespace. Adjust `OPENBAO_SERVER_NAME` if the server fullname differs.
+The command writes a private export file and prints only its path on success.
+
+```bash
+set -euo pipefail
+: "${KUBE_CONTEXT:?Set the target Kubernetes context}"
+: "${OPENBAO_NAMESPACE:?Set the target OpenBao namespace}"
+server=${OPENBAO_SERVER_NAME:-openbao-server}
+source deploy/helm/openbao/helm/scripts/utils/bootstrap.sh
+expected=$(kubectl --context "$KUBE_CONTEXT" -n "$OPENBAO_NAMESPACE" \
+  get secret "$server-root-token" -o json | jq -er '
+  select((.data.bootstrap_state | @base64d) == "complete" and
+         (.data.bootstrap_verified | @base64d) == "true") |
+  .data.bootstrap_credential_digest | @base64d |
+  select(test("^[a-f0-9]{64}$"))')
+umask 077
+recovery_file=$(mktemp "${TMPDIR:-/tmp}/openbao-recovery.XXXXXX")
+kubectl --context "$KUBE_CONTEXT" -n "$OPENBAO_NAMESPACE" \
+  get secret "$server-recovery-keys" -o jsonpath='{.data.recovery_keys_b64}' | \
+  base64 -d > "$recovery_file"
+actual=$(bootstrap_credential_digest auto "$(cat "$recovery_file")")
+test "$actual" = "$expected"
+printf 'Verified recovery-key export: %s\n' "$recovery_file"
+```
+
+Store the verified file in the approved recovery store before deleting the
+Secret. Older installations without a stored digest need their existing share
+verification procedure. Ask the recovery owner to verify those shares; do not
+create a digest from an unverified Secret to bypass this check.
+
+### Existing installations
+
 Existing root-token Secrets without this field retain the legacy credential
 checks. Before upgrading a previously failed auto-unseal installation, verify
 that its recovery shares were saved or exported; an unsealed server and a root
@@ -113,7 +166,7 @@ helm upgrade openbao-server helm --namespace vault-system \
   --reuse-values \
   --set openbao.server.service.publishNotReadyAddresses=false \
   --set-string 'openbao.server.readinessProbe.path=/v1/sys/health?standbyok=true' \
-  --wait --wait-for-jobs --timeout 20m
+  --wait --wait-for-jobs --timeout 60m
 ```
 
 Retain your image, namespace and migration overrides when upgrading. With an
@@ -163,7 +216,7 @@ helm upgrade "$release" helm --namespace "$namespace" --reuse-values \
   --set openbao.server.persistentVolumeClaimRetentionPolicy.whenScaled=Retain \
   --set openbao.server.service.publishNotReadyAddresses=false \
   --set-string 'openbao.server.readinessProbe.path=/v1/sys/health?standbyok=true' \
-  --wait --wait-for-jobs --timeout 20m
+  --wait --wait-for-jobs --timeout 60m
 ```
 
 Confirm the replacement StatefulSet uses `Parallel` and has adopted the same
@@ -185,7 +238,8 @@ bash deploy.sh vault-system openbao-server helm
 ```
 
 Use the original namespace and StatefulSet name. This existing-resources mode
-requires `kubectl`, `jq` and `jwker`, skips Helm installation and reuses saved
+requires `kubectl`, `jq`, `jwker` and either `sha256sum` or `shasum`. It skips
+Helm installation and reuses saved
 credentials before joining/unsealing remaining members and configuring JWT.
 The default `script` mode remains for fresh installations. Missing credentials
 or mismatched data require recovery before retrying; do not delete resources
@@ -286,7 +340,7 @@ helm install openbao-server helm \
   --set openbao.server.service.publishNotReadyAddresses=false \
   --wait \
   --wait-for-jobs \
-  --timeout 20m
+  --timeout 60m
 ```
 
 ## Configuration

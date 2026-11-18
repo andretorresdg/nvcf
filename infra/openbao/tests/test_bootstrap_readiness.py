@@ -69,6 +69,7 @@ if 'exec' in a and 'curl' in a:
  if 'Authorization: Bearer test-service-token' not in a: done('', 1)
  done(json.dumps({'keys':[{'kty':'RSA','n':'test','e':'AQAB'}]}))
 if 'job' in a and 'get' in a:
+ if s.get('job_read_delay'): time.sleep(s['job_read_delay'])
  s['job_reads'] = s.get('job_reads', 0) + 1
  if s.get('job_delay', 0):
   s['job_delay'] -= 1; done(json.dumps({'status':{}}))
@@ -90,6 +91,7 @@ if 'secret' in a and 'get' in a:
  if a[-1] == 'name': done(name)
  version = s.setdefault('secret_versions', {}).setdefault(name, 1)
  encoded = {k:base64.b64encode(v.encode()).decode() for k,v in data.items()}
+ if a[-1] == 'jsonpath={.metadata.resourceVersion}': done(str(version))
  if a[-1] == 'json': done(json.dumps({'metadata':{'name':name, 'uid':s.get('secret_uids', {}).get(name, name+'-uid'), 'resourceVersion':str(version)}, 'data':encoded}))
  match = re.fullmatch(r'jsonpath=\{\.data\.([^}]+)\}', a[-1])
  if match: done(encoded.get(match[1], ''))
@@ -112,6 +114,11 @@ if 'secret' in a and ('patch' in a or 'create' in a):
   if s.get('restore_root_before_complete') and 'bootstrap_state' in patch['data']:
    s['restore_root_before_complete'] = False
    s['secrets'][name]['root_token'] = 'restored-root'
+   versions[name] = versions.get(name, 1) + 1
+  if s.get('verify_before_reset') and name.endswith('-root-token') and base64.b64decode(patch['data'].get('bootstrap_state', '')).decode() == 'pending':
+   s['verify_before_reset'] = False
+   s['secrets'][name]['bootstrap_verified'] = 'true'
+   s['secrets'].pop('bao-recovery-keys', None)
    versions[name] = versions.get(name, 1) + 1
   if name not in s['secrets']: done('', 1)
   supplied = patch.get('metadata', {}).get('resourceVersion')
@@ -137,6 +144,9 @@ if 'secret' in a and ('patch' in a or 'create' in a):
     s['secrets'][name][key] = Path(filename).read_text()
  versions[name] = versions.get(name, 0) + 1
  if s.get('lost_write_response'): done('', 1)
+ if 'patch' in a and a[-1] == 'json':
+  data = {k:base64.b64encode(v.encode()).decode() for k,v in s['secrets'][name].items()}
+  done(json.dumps({'metadata':{'name':name, 'uid':name+'-uid', 'resourceVersion':str(versions[name])},'data':data}))
  done()
 if 'exec' in a and 'unseal' in a:
  name = next(x for x in a if x.startswith('bao-') and x[4:].isdigit())
@@ -173,7 +183,7 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.state_file = self.path / "state.json"
 
     def invoke(self, function="initialize_cluster", standalone=False, success=True, api_timeout="5", mode="shamir",
-               credential_timeout="120", arguments="test bao", process_timeout=8, bootstrap_source=None, bootstrap_job=""):
+               credential_timeout="120", arguments="test bao", process_timeout=8, bootstrap_source=None, bootstrap_job="", bootstrap_timeout=None, extra_preamble="", omit_digest_tools=False):
         self.state_file.write_text(json.dumps(self.state))
         source = REPO / "deploy/helm/openbao/deploy.sh" if standalone else CHART / "deploy.sh"
         content = source.read_text()
@@ -189,11 +199,16 @@ class BootstrapReadinessTest(unittest.TestCase):
             re.search(r"^get_root_token\(\) \{.*?^\}", content, re.M | re.S)[0],
             re.search(r"^get_unseal_key\(\) \{.*?^\}", content, re.M | re.S)[0],
             f'source "{helper}"' if helper.exists() else '',
-            'OPENBAO_REPLICAS=3', body, f'{function} {arguments}',
+            'OPENBAO_REPLICAS=3', body, extra_preamble, f'{function} {arguments}',
         ])
         env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ["PATH"],
                    BOOTSTRAP_TEST_STATE=str(self.state_file), OPENBAO_API_TIMEOUT_SECONDS=api_timeout,
-                   OPENBAO_CREDENTIAL_TIMEOUT_SECONDS=credential_timeout, OPENBAO_BOOTSTRAP_JOB_NAME=bootstrap_job)
+                   OPENBAO_CREDENTIAL_TIMEOUT_SECONDS=credential_timeout, OPENBAO_BOOTSTRAP_JOB_NAME=bootstrap_job,
+                   OPENBAO_BOOTSTRAP_TIMEOUT_SECONDS=api_timeout if bootstrap_timeout is None else bootstrap_timeout)
+        if omit_digest_tools:
+            for name in ("bash", "jq", "python3", "base64", "tr"):
+                (self.path / name).symlink_to(shutil.which(name))
+            env["PATH"] = str(self.path)
         process = subprocess.Popen(["bash", "-c", preamble], env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
@@ -574,7 +589,14 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.assertNotEqual(self.state["secrets"]["bao-root-token"].get("bootstrap_verified"), "true")
         for member in self.state["members"]:
             member.update(initialized=True, sealed=False, recovery_seal=True)
-        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-1", api_timeout="2", success=False)
+        start = len(self.state["calls"])
+        options = dict(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-1", api_timeout="3")
+        self.invoke(**options, success=False)
+        self.assertTrue(any(call[:3] == ["get", "secret", "bao-root-token"] and call[-1] == "json"
+                            for call in self.state["calls"][start:]))
+        self.state["secrets"]["bao-root-token"]["bootstrap_verified"] = "true"
+        self.invoke(**options)
+        del self.state["secrets"]["bao-root-token"]["bootstrap_verified"]
         self.state["fail_verification"] = False
         self.state["secrets"]["bao-recovery-keys"]["recovery_keys_b64"] = '["foreign-recovery"]'
         self.invoke(mode="auto", bootstrap_job="bootstrap-2", success=False)
@@ -588,7 +610,11 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.state["job_state"] = "Pending"
         self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2", api_timeout="2", success=False)
         self.state["job_state"] = "Failed"
-        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2", success=False)
+        self.state["unavailable"] = 10000
+        error = self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2", success=False)
+        self.assertIn("OpenBao bootstrap Job failed", error)
+        self.assertEqual(self.state["unavailable"], 10000)
+        self.state["unavailable"] = 0
         self.state["job_state"] = "Complete"
         self.state["job_delay"] = 1
         self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-2")
@@ -611,6 +637,80 @@ class BootstrapReadinessTest(unittest.TestCase):
         self.invoke(bootstrap_source=mutated, success=False)
         self.assertEqual(self.state["secrets"]["bao-root-token"]["root_token"], "restored-root")
         self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "complete")
+
+    def test_missing_digest_utilities_fail_before_standalone_init(self):
+        error = self.invoke(standalone=True, omit_digest_tools=True, success=False)
+        self.assertIn("A working sha256sum or shasum is required", error)
+        self.assertEqual(self.state["init_calls"], 0)
+        self.assertEqual(self.state["writes"], 0)
+
+    def test_recovery_digest_requires_exactly_one_json_array(self):
+        for value in ('["test-recovery"] null', '["test-recovery"] false', '["test-recovery"] []'):
+            with self.subTest(value=value):
+                self.state["secrets"] = {
+                    "bao-root-token": self.root_secret(state="pending", mode="auto"),
+                    "bao-recovery-keys": {"recovery_keys_b64": value},
+                }
+                self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root", success=False)
+                self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "pending")
+        self.state["secrets"]["bao-recovery-keys"]["recovery_keys_b64"] = '[\n  "test-recovery"\n]'
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root")
+
+    def test_stale_reset_preserves_another_attempts_receipt_and_export(self):
+        self.state["secrets"] = {
+            "bao-root-token": self.root_secret(state="pending", mode="auto"),
+            "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
+        }
+        self.state["secondary_change_at_completion"] = "replace"
+        self.state["verify_before_reset"] = True
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root", success=False)
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_state"], "complete")
+        self.assertEqual(self.state["secrets"]["bao-root-token"]["bootstrap_verified"], "true")
+        self.assertNotIn("bao-recovery-keys", self.state["secrets"])
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root")
+
+    def test_credential_reads_do_not_put_secrets_in_jq_arguments(self):
+        self.state["secrets"] = {
+            "bao-root-token": self.root_secret(state="pending", mode="auto"),
+            "bao-recovery-keys": {"recovery_keys_b64": '["test-recovery"]'},
+        }
+        guard = '''jq() {
+            for arg in "$@"; do
+                case "$arg" in *dGVzdC1yb290*|*WyJ0ZXN0LXJlY292ZXJ5Il0=*) return 99;; esac
+            done
+            command jq "$@"
+        }'''
+        self.invoke(function="complete_bootstrap_credentials", arguments="test bao auto test-root", extra_preamble=guard)
+
+    def test_job_wait_has_its_own_budget_before_final_api_checks(self):
+        for member in self.state["members"]:
+            member.update(initialized=True, sealed=False)
+        self.state["secrets"]["bao-root-token"] = {"root_token": "test-root"}
+        self.state["job_read_delay"] = 1.5
+        self.state["job_delay"] = 1
+        self.invoke(function="wait_for_openbao_bootstrap", bootstrap_job="bootstrap-1", api_timeout="2",
+                    credential_timeout="1", bootstrap_timeout="6", process_timeout=15)
+        self.assertEqual(self.state["job_reads"], 2)
+
+    def test_documented_export_rejects_changed_or_multi_document_shares(self):
+        doc = (REPO / "deploy/helm/openbao/README.md").read_text().split("### Recovery-key export", 1)[1]
+        command = re.search(r"```bash\n(.*?)```", doc, re.S)[1]
+        for shares, accepted in (('["test-recovery"]', True), ('["foreign"]', False), ('["test-recovery"] null', False)):
+            with self.subTest(shares=shares):
+                self.state["secrets"] = {
+                    "bao-root-token": self.root_secret(mode="auto"),
+                    "bao-recovery-keys": {"recovery_keys_b64": shares},
+                }
+                self.state_file.write_text(json.dumps(self.state))
+                env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ["PATH"],
+                           BOOTSTRAP_TEST_STATE=str(self.state_file), KUBE_CONTEXT="test-context",
+                           OPENBAO_NAMESPACE="test", OPENBAO_SERVER_NAME="bao", TMPDIR=str(self.path))
+                result = subprocess.run(["bash", "-c", command], cwd=REPO, env=env,
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual("Verified recovery-key export:" in result.stdout, accepted)
+                self.assertNotIn("test-recovery", result.stdout)
+                self.assertNotIn("foreign", result.stdout)
 
     def test_credential_persistence_budget_is_bounded(self):
         self.state["secret_read_delay"] = 10
