@@ -329,17 +329,21 @@ func TestInit_RepairsCorruptStateFile(t *testing.T) {
 	assert.Equal(t, "new-admin-token", saved.GetState().Token)
 }
 
-// A state file that exists but cannot be read is not corrupt: init must stop
-// before it changes the file, so the saved keys survive.
-func TestInit_StopsWhenStateFileIsUnreadable(t *testing.T) {
+// A state path that exists but cannot be read is not a corrupt file: init must
+// stop before it changes anything. A directory stands in for the unreadable
+// file because CI runs tests as root, which ignores file permission bits.
+func TestInit_StopsWhenStateFileCannotBeRead(t *testing.T) {
 	statePath := ""
 	setupInitTest(t, func() {
-		if err := os.Chmod(statePath, 0); err != nil {
-			t.Errorf("make state file unreadable: %v", err)
+		if err := os.Remove(statePath); err != nil {
+			t.Errorf("remove state file: %v", err)
+			return
+		}
+		if err := os.MkdirAll(filepath.Join(statePath, "keep"), 0o700); err != nil {
+			t.Errorf("replace state file with a directory: %v", err)
 		}
 	})
 	statePath = filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state")
-	t.Cleanup(func() { _ = os.Chmod(statePath, 0o600) })
 	seedKeys(t, baseRouteConfig(), true)
 	applyRouteConfig(t, baseRouteConfig())
 
@@ -347,22 +351,20 @@ func TestInit_StopsWhenStateFileIsUnreadable(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to reload state")
-	require.NoError(t, os.Chmod(statePath, 0o600))
-	saved := state.NewStateManager()
-	require.NoError(t, saved.Load())
-	assert.Equal(t, "old-admin-token", saved.GetState().Token, "init must not change the file")
-	assert.Equal(t, "function-key", saved.GetState().APIKey)
+	info, statErr := os.Stat(filepath.Join(statePath, "keep"))
+	require.NoError(t, statErr, "init must not replace the state path")
+	assert.True(t, info.IsDir())
 }
 
+// A directory where Save writes its temporary file makes the save fail, even
+// for root.
 func TestInit_ReturnsErrorWhenSaveFails(t *testing.T) {
-	home := ""
 	setupInitTest(t, func() {
-		if err := os.Chmod(home, 0o500); err != nil {
-			t.Errorf("make home read-only: %v", err)
+		tempPath := filepath.Join(os.Getenv("HOME"), ".nvcf-cli.state.tmp")
+		if err := os.MkdirAll(filepath.Join(tempPath, "keep"), 0o700); err != nil {
+			t.Errorf("block the temporary state file: %v", err)
 		}
 	})
-	home = os.Getenv("HOME")
-	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
 	applyRouteConfig(t, baseRouteConfig())
 
 	err := runInit(nil, nil)

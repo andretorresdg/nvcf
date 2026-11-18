@@ -751,31 +751,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		"--health-protocol GRPC --health-uri / --health-port 8001") {
 		t.Fatal("gRPC sample function was not configured with a gRPC health endpoint")
 	}
-	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
-		"api-key generate --for function",
-		"--description bdd-init-keeps-api-keys") {
-		t.Fatal("init key retention scenario did not generate its function API key")
-	}
-	if !clusterGroups.called {
-		t.Fatal("init key retention scenario did not list cluster groups with the saved function API key")
-	}
-	if !initRanAfter(clusterGroups.runsBeforeCall, "--description bdd-init-keeps-api-keys", "/usr/bin/nvcf-cli") {
-		t.Fatal("init key retention scenario must run init after generating its key and before listing cluster groups")
-	}
-	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
-		"api-key generate --for function",
-		"--description bdd-cluster-groups",
-		"--scopes list_cluster_groups") {
-		t.Fatal("cluster groups scenario did not generate its scoped function API key")
-	}
-	// init prints the admin token and api-key generate prints the key, so
-	// every such command must drop stdout to keep secrets out of the logs.
-	for _, run := range suite.Runner.(*fakeRunner).runs {
-		prints := strings.HasSuffix(run, " init") || strings.Contains(run, " api-key generate ")
-		if strings.Contains(run, "/usr/bin/nvcf-cli --config ") && prints && !strings.Contains(run, `exec "$@" >/dev/null`) {
-			t.Fatalf("command prints a secret without dropping stdout: %s", run)
-		}
-	}
+	assertAPIKeyScenariosWiring(t, suite.Runner.(*fakeRunner).runs, clusterGroups)
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"api-key generate --for function",
 		"--description bdd-load-tester-supreme") {
@@ -4801,6 +4777,33 @@ func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 				t.Fatalf("feature failed:\n%s", out.String())
 			}
 		})
+	}
+}
+
+// assertAPIKeyScenariosWiring checks the cluster-groups and init key retention
+// scenarios: their keys are generated, the second init runs before the list
+// request, and no command that prints a secret keeps its stdout.
+func assertAPIKeyScenariosWiring(t *testing.T, runs []string, clusterGroups *clusterGroupsHTTPFake) {
+	t.Helper()
+	if !commandRanThatContainsAll(runs, "api-key generate --for function", "--description bdd-init-keeps-api-keys") {
+		t.Fatal("init key retention scenario did not generate its function API key")
+	}
+	if !clusterGroups.called {
+		t.Fatal("init key retention scenario did not list cluster groups with the saved function API key")
+	}
+	if !initRanAfter(clusterGroups.runsBeforeCall, "--description bdd-init-keeps-api-keys", "/usr/bin/nvcf-cli") {
+		t.Fatal("init key retention scenario must run init after generating its key and before listing cluster groups")
+	}
+	if !commandRanThatContainsAll(runs, "api-key generate --for function", "--description bdd-cluster-groups", "--scopes list_cluster_groups") {
+		t.Fatal("cluster groups scenario did not generate its scoped function API key")
+	}
+	// init prints the admin token and api-key generate prints the key, so
+	// every such command must drop stdout to keep secrets out of the logs.
+	for _, run := range runs {
+		prints := strings.HasSuffix(run, " init") || strings.Contains(run, " api-key generate ")
+		if strings.Contains(run, "/usr/bin/nvcf-cli --config ") && prints && !strings.Contains(run, `exec "$@" >/dev/null`) {
+			t.Fatalf("command prints a secret without dropping stdout: %s", run)
+		}
 	}
 }
 
