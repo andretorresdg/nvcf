@@ -380,7 +380,7 @@ func parseWorkerRestartCountBaseline(pod *corev1.Pod) (int32, bool) {
 // ended most recently when it ran that long. A run that ended is not checked for readiness because its readiness
 // history is not available. The kubelet increments RestartCount only when the next run starts, so a run that ended
 // keeps its count while the container is terminated or waiting, and is one below the count once the next run is
-// running.
+// running or was created and is waiting to start, which shows as a container ID different from the ended run's.
 func healthyWorkerRestartCount(status corev1.PodStatus, cs corev1.ContainerStatus, now time.Time) (int32, bool) {
 	if cs.RestartCount == 0 {
 		return 0, false
@@ -394,14 +394,20 @@ func healthyWorkerRestartCount(status corev1.PodStatus, cs corev1.ContainerStatu
 		}
 		return 0, false
 	}
-	ended := cs.State.Terminated
-	if ended == nil {
-		ended = cs.LastTerminationState.Terminated
+	if ended := cs.State.Terminated; ended != nil {
+		if ranLongEnough(ended) {
+			return cs.RestartCount, true
+		}
+		return 0, false
 	}
-	if ranLongEnough(ended) {
-		return cs.RestartCount, true
+	ended := cs.LastTerminationState.Terminated
+	if !ranLongEnough(ended) {
+		return 0, false
 	}
-	return 0, false
+	if cs.ContainerID != "" && ended.ContainerID != "" && cs.ContainerID != ended.ContainerID {
+		return cs.RestartCount - 1, true
+	}
+	return cs.RestartCount, true
 }
 
 // readySince returns when the running container and its Pod became ready, and false when either is not ready.

@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	otelattr "go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -35,6 +37,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
 
 	nvcametrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics"
+	nvcaotel "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/otel"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
 	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
@@ -101,7 +104,17 @@ func recordWorkerRestartBaseline(ctx context.Context, client kubernetes.Interfac
 		"pod":             pod.Name,
 		"baseline":        baseline,
 	})
-	if err := patchWorkerRestartBaseline(ctx, client, pod, baseline); err != nil {
+	err := nvcaotel.InvokeWithSpan(ctx, nvcaotel.NewTracer(), "nvca.patchWorkerRestartBaseline",
+		func(ctx context.Context) error {
+			return patchWorkerRestartBaseline(ctx, client, pod, baseline)
+		},
+		oteltrace.WithSpanKind(oteltrace.SpanKindClient),
+		oteltrace.WithAttributes(
+			otelattr.String(nvcaotel.ICMSRequestIDAttributeKey, reqID),
+			otelattr.String("k8s.namespace.name", pod.Namespace),
+			otelattr.String("k8s.pod.name", pod.Name),
+			otelattr.Int("nvca.worker.restart_count_baseline", int(baseline))))
+	if err != nil {
 		log.WithError(err).Warn("failed to record worker restart baseline")
 		return
 	}

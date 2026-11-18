@@ -2033,21 +2033,32 @@ func TestIsContainerInRestartLoopWorkerLongRunSequence(t *testing.T) {
 		Status: corev1.PodStatus{StartTime: &metav1.Time{Time: now.Add(-72 * time.Hour)}},
 	}
 	longRun := &corev1.ContainerStateTerminated{
-		ExitCode:   2,
-		StartedAt:  metav1.NewTime(now.Add(-2 * time.Hour)),
-		FinishedAt: metav1.NewTime(now.Add(-time.Minute)),
+		ExitCode:    2,
+		StartedAt:   metav1.NewTime(now.Add(-2 * time.Hour)),
+		FinishedAt:  metav1.NewTime(now.Add(-time.Minute)),
+		ContainerID: "containerd://ended",
 	}
 	timeConfig := (&TimeConfig{WorkerContainerRestartCountToFailInstance: 1}).Complete()
 
 	// A long run ends at RestartCount 4. Its own crash is the first restart that counts.
-	ended := corev1.ContainerStatus{Name: common.UtilsContainerName, RestartCount: 4,
+	ended := corev1.ContainerStatus{Name: common.UtilsContainerName, RestartCount: 4, ContainerID: longRun.ContainerID,
 		State: corev1.ContainerState{Terminated: longRun}}
 	assert.False(t, IsContainerInRestartLoop(pod, ended, timeConfig), "terminated")
 
-	waiting := corev1.ContainerStatus{Name: common.UtilsContainerName, RestartCount: 4,
+	waiting := corev1.ContainerStatus{Name: common.UtilsContainerName, RestartCount: 4, ContainerID: longRun.ContainerID,
 		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
 		LastTerminationState: corev1.ContainerState{Terminated: longRun}}
 	assert.False(t, IsContainerInRestartLoop(pod, waiting, timeConfig), "waiting")
+
+	// The replacement was created at RestartCount 5 and is waiting to start.
+	created := corev1.ContainerStatus{Name: common.UtilsContainerName, RestartCount: 5, ContainerID: "containerd://created",
+		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
+		LastTerminationState: corev1.ContainerState{Terminated: longRun}}
+	assert.True(t, IsContainerInRestartLoop(pod, created, timeConfig), "created")
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{created}
+	baseline, ok := WorkerRestartCountBaselineToRecord(pod, now)
+	assert.True(t, ok)
+	assert.Equal(t, int32(4), baseline, "created baseline")
 
 	restarted := corev1.ContainerStatus{Name: common.UtilsContainerName, RestartCount: 5,
 		State:                corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now)}},
