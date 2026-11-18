@@ -23,7 +23,11 @@ SPDX-License-Identifier: Apache-2.0
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <link.h>
 #include <linux/kcmp.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2590,6 +2594,187 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
     }
     fclose(fp);
     return found;
+}
+
+/* ── UCX route checks after a restore into another pod ───────────────── */
+
+/* UCX checks that a RoCE device can reach a peer against the routing
+ * table, which it reads once per process (ucs_netlink_init_routing_table_cache
+ * in UCX 1.22) and never again. A process restored into another pod keeps
+ * the old pod's table, in which the new pod's interfaces have no routes, so
+ * UCX finds no device that reaches anything (NIXL: NIXL_ERR_BACKEND). UCX's
+ * RoCE transport calls the three functions below in libucs through the
+ * dynamic linker, so they are defined here: while the process is in the
+ * network namespace it was in at the first call (when UCX read its table),
+ * they call UCX's; in another one, they read the routes again on each call
+ * and match them as UCX does: every table (policy rules, as in pods whose
+ * RoCE interfaces have their own tables, are ignored), longest prefix on the
+ * interface. Only for UCX 1.22, whose signatures these are; other versions
+ * keep UCX's table. */
+
+struct ucx_find { const char *stem; char path[512]; };
+
+static int ucx_find_cb(struct dl_phdr_info *info, size_t size, void *arg)
+{
+    struct ucx_find *f = arg;
+    const char *b = strrchr(info->dlpi_name, '/');
+    size_t n = strlen(f->stem);
+    (void)size;
+    b = b ? b + 1 : info->dlpi_name;
+    if (strncmp(b, f->stem, n) || (b[n] != '-' && b[n] != '.')) return 0;
+    snprintf(f->path, sizeof(f->path), "%s", info->dlpi_name);
+    return 1;
+}
+
+/* NAME in the loaded UCX library STEM ("libucs", "libucp"; NIXL bundles
+ * them as libucs-<hash>.so and loads them RTLD_LOCAL). */
+static void *ucx_sym(const char *stem, const char *name)
+{
+    struct ucx_find f = { stem, "" };
+    void *h, *p;
+    if (!real_dlsym) init_real_dlsym();
+    if (!dl_iterate_phdr(ucx_find_cb, &f) || !(h = dlopen(f.path, RTLD_LAZY | RTLD_NOLOAD))) return NULL;
+    p = real_dlsym(h, name);
+    dlclose(h);
+    return p;
+}
+
+static unsigned ucx_ver[3];
+
+static int ucx_122(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        void (*get)(unsigned *, unsigned *, unsigned *) =
+            (void (*)(unsigned *, unsigned *, unsigned *))ucx_sym("libucp", "ucp_get_version");
+        if (get) get(&ucx_ver[0], &ucx_ver[1], &ucx_ver[2]);
+        v = ucx_ver[0] == 1 && ucx_ver[1] == 22;
+    }
+    return v;
+}
+
+static unsigned long first_netns;
+
+/* 1 when the kernel answers: the process left the network namespace UCX
+ * read its routes in. */
+static int kernel_routes(void)
+{
+    static int said;
+    unsigned long want = 0;
+    struct stat st;
+    if (stat("/proc/self/ns/net", &st)) return 0;
+    if (__atomic_compare_exchange_n(&first_netns, &want, (unsigned long)st.st_ino, 0, __ATOMIC_SEQ_CST,
+                                    __ATOMIC_SEQ_CST) || want == st.st_ino)
+        return 0;
+    int k = ucx_122();
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST)) {
+        if (k) logf_("network namespace changed since UCX read its routes: UCX route checks read the routes again");
+        else logf_("network namespace changed since UCX read its routes, but UCX %u.%u.%u is not 1.22: "
+                   "UCX keeps the old routes, and RoCE peers may look unreachable", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
+    }
+    return k;
+}
+
+struct rt { int oif, type, len, family; unsigned char dst[16]; };
+
+/* The routes of address family FAM in every table, as UCX reads them
+ * (RTM_GETROUTE dump; a route without an interface or a destination it
+ * needs is left out): up to N into RT. Their count, or -1. */
+static int rt_dump(int fam, struct rt *rt, int n)
+{
+    struct { struct nlmsghdr h; struct rtmsg r; } req = {
+        { NLMSG_LENGTH(sizeof(struct rtmsg)), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, 0 },
+        { .rtm_family = (unsigned char)fam } };
+    char buf[16384] __attribute__((aligned(8)));
+    struct timeval tv = { 1, 0 };
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE), k = 0, done = 0;
+    if (fd < 0) return -1;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (send(fd, &req, req.h.nlmsg_len, 0) != (ssize_t)req.h.nlmsg_len) done = 1, k = -1;
+    while (!done) {
+        ssize_t got = recv(fd, buf, sizeof(buf), 0);
+        int left = (int)got;
+        if (got <= 0) { k = -1; break; }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
+                if (h->nlmsg_type == NLMSG_ERROR) k = -1;
+                done = 1;
+                break;
+            }
+            if (h->nlmsg_type != RTM_NEWROUTE || k >= n) continue;
+            struct rtmsg *m = NLMSG_DATA(h);
+            struct rt e = { -1, m->rtm_type, m->rtm_dst_len, m->rtm_family, { 0 } };
+            int alen = RTM_PAYLOAD(h), dst = 0;
+            for (struct rtattr *x = RTM_RTA(m); RTA_OK(x, alen); x = RTA_NEXT(x, alen)) {
+                if (x->rta_type == RTA_OIF && RTA_PAYLOAD(x) >= sizeof(int)) memcpy(&e.oif, RTA_DATA(x), sizeof(int));
+                else if (x->rta_type == RTA_DST && RTA_PAYLOAD(x) <= sizeof(e.dst)) {
+                    memcpy(e.dst, RTA_DATA(x), RTA_PAYLOAD(x));
+                    dst = 1;
+                }
+            }
+            if (e.oif != -1 && (!e.len || dst)) rt[k++] = e;
+        }
+    }
+    close(fd);
+    return k;
+}
+
+/* The longest prefix among the routes that hold SA, out of interface OIF
+ * (any when < 0) and of type TYPE (any when 0); its interface in *DEV.
+ * -1 if none. */
+static int rt_len(const struct sockaddr *sa, int oif, int type, int *dev)
+{
+    struct rt rt[1024];
+    const unsigned char *a = sa->sa_family == AF_INET ? (const unsigned char *)&((const struct sockaddr_in *)sa)->sin_addr
+                           : sa->sa_family == AF_INET6 ? (const unsigned char *)&((const struct sockaddr_in6 *)sa)->sin6_addr
+                           : NULL;
+    int bits = sa->sa_family == AF_INET ? 32 : 128, best = -1, n;
+    if (!a || (n = rt_dump(sa->sa_family, rt, 1024)) < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        const struct rt *e = &rt[i];
+        int full = e->len / 8, rem = e->len % 8;
+        if ((oif >= 0 && e->oif != oif) || (type && e->type != type) || e->len > bits || e->len <= best) continue;
+        if (memcmp(a, e->dst, full) || (rem && ((a[full] ^ e->dst[full]) & (0xff << (8 - rem)) & 0xff))) continue;
+        best = e->len;
+        *dev = e->oif;
+    }
+    return best;
+}
+
+int ucs_netlink_route_exists(int if_index, const struct sockaddr *sa_remote, int *netmask_len_p)
+{
+    static int (*real)(int, const struct sockaddr *, int *);
+    int len, dev;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(int, const struct sockaddr *, int *))ucx_sym("libucs", __func__);
+        return real ? real(if_index, sa_remote, netmask_len_p) : 0;
+    }
+    len = rt_len(sa_remote, if_index, 0, &dev);
+    if (netmask_len_p) *netmask_len_p = len;
+    return len > -1;
+}
+
+int ucs_netlink_is_best_route(int if_index, const struct sockaddr *sa_remote)
+{
+    static int (*real)(int, const struct sockaddr *);
+    int len, dev;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(int, const struct sockaddr *))ucx_sym("libucs", __func__);
+        return real ? real(if_index, sa_remote) : 0;
+    }
+    len = rt_len(sa_remote, if_index, 0, &dev);
+    return len > -1 && rt_len(sa_remote, -1, 0, &dev) == len;
+}
+
+int ucs_netlink_get_local_route_ndev_index(const struct sockaddr *sa_remote)
+{
+    static int (*real)(const struct sockaddr *);
+    int dev = -1;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(const struct sockaddr *))ucx_sym("libucs", __func__);
+        return real ? real(sa_remote) : -1;
+    }
+    return rt_len(sa_remote, -1, RTN_LOCAL, &dev) > -1 ? dev : -1;
 }
 
 /* ── Wrappers ─────────────────────────────────────────────────────────── */
