@@ -320,5 +320,52 @@ class Deadlines(QuiesceDeadline):
     test_fabric_abort_ends_the_suspend = None
 
 
+class WithdrawVote(QuiesceDeadline):
+    """A node that voted "ok" and reaches its own deadline takes the vote
+    back before rolling back, and follows a "go" the driver sent before it
+    saw the vote taken back."""
+
+    def setUp(self):
+        w = rank("behind", os.path.join(tempfile.mkdtemp(dir=self.tmp), "stepped"), 0)
+        self.addCleanup(w.stdout.close)
+        self.addCleanup(w.wait)
+        self.addCleanup(w.kill)
+        self.pid = w.pid
+
+    def test_ok_vote_is_taken_back_at_the_deadline(self):
+        fabric = tempfile.mkdtemp(dir=self.tmp)
+        stop = threading.Event()
+        votes = []
+
+        def driver():
+            # Late: it answers only once the node has taken its vote back,
+            # as a driver that decided "go" on the "ok" just before.
+            while not stop.is_set():
+                try:
+                    with open(os.path.join(fabric, "q")) as f:
+                        v = f.read().split()
+                except OSError:
+                    v = []
+                if v and (not votes or votes[-1] != v):
+                    votes.append(v)
+                if v and v[1] == "busy" and ["0", "ok"] in votes:
+                    with open(os.path.join(fabric, "d.tmp"), "w") as f:
+                        f.write("%s go\n" % v[0])
+                    os.rename(os.path.join(fabric, "d.tmp"), os.path.join(fabric, "d"))
+                    return
+                time.sleep(0.05)
+
+        t = threading.Thread(target=driver, daemon=True)
+        t.start()
+        self.addCleanup(stop.set)
+        p, _ = self.run_tool("--timeout-ms", "1000", "--fabric-map", fabric, "suspend", str(self.pid), timeout=120)
+        self.assertEqual(votes[:2], [["0", "ok"], ["0", "busy"]], p.stdout + p.stderr)
+        self.assertIn('"go" for attempt 0 came after the deadline', p.stdout, p.stdout + p.stderr)
+        self.assertNotIn("no verdict", p.stdout + p.stderr)
+
+    test_timeout_is_wall_clock = None
+    test_fabric_abort_ends_the_suspend = None
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

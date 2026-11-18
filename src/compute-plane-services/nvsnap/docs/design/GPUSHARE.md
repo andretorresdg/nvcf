@@ -245,8 +245,22 @@ deleted. Each checkpoint records its pod's IP and index in the instance.
 Limits of the group checkpoint:
 
 - If a member's checkpoint ends before the vote passes, later votes are
-  answered `abort`; the tool treats that as `retry` and rolls back at its own
-  timeout (`--timeout-ms`, 120 s here), not at once.
+  answered `abort`, and the tool rolls back as soon as it reads one. A `go`
+  that some members already have is delivered to the rest first, never
+  overtaken by an `abort`.
+- A node that reaches its own deadline (`--timeout-ms` plus a minute, after
+  the driver's) with an `ok` vote standing takes the vote back first, then
+  waits 2 s for a `go` the driver may already be sending, and follows it.
+  A `go` delivered later than that still splits the nodes (not seen in
+  testing).
+- While the ranks catch up, launches stay held for up to `--timeout-ms`
+  plus a minute. If the tool dies before `release`, each process opens its
+  gates again once the process that sent `hold` has exited. After
+  `release`, the gates stay closed until `resume`.
+- An engine more than about 8 launches behind a rank on another node may
+  not catch up before the deadline: every 8 attempts the ranks are let go
+  and held again at a common instant. The checkpoint then ends in a
+  rollback, not a split.
 - A member whose dump fails still resumes and takes part in the exchange. A
   member that returns without writing a handle list is left out; the others
   resume among themselves.
@@ -363,9 +377,10 @@ Limits of the move:
   distroless static) cannot load the shim.
 - Held calls: while suspended, the shim holds launches, copies, memsets and
   stream memory operations made through the CUDA runtime or the driver's
-  entry-point lookup (as PyTorch, NCCL and vLLM do). Not held: copies to or
-  from CUDA arrays, managed-memory prefetches, batched copies
-  (`cuMemcpyBatchAsync`), and calls a program links directly against
+  entry-point lookup (as PyTorch, NCCL and vLLM do), including batched
+  copies, managed-memory prefetches and stream-ordered allocations. Not
+  held: copies to or from CUDA arrays, `cuMemPrefetchBatchAsync`,
+  `cuLaunchGridAsync`, and calls a program links directly against
   `libcuda`.
 - State files: the tool keeps state in `/tmp/nvsnap-gpu-suspend` and refuses
   to run if it exists and is not owned by its user with mode 0700.

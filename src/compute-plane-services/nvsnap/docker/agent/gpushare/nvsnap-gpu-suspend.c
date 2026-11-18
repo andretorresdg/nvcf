@@ -1119,8 +1119,26 @@ static void undo(const int *pids, int n, int locked, int shared)
  * "<attempt> abort" once the session cannot succeed (a node is gone, or the
  * driver's quiesce deadline passed: it keeps the nodes' deadline, so they
  * stop at the same attempt). Returns 1 for go, 0 for retry, -1 on abort or
- * when deadline (now_ms() time) passes with no verdict. */
+ * when deadline (now_ms() time) passes with no verdict.
+ *
+ * A node that gives up at its deadline first takes back an "ok" vote: left
+ * in DIR/q, a late driver could still count it and send "go" to the other
+ * nodes, which would release while this one rolls back. It then waits a
+ * little for a verdict the driver may already be sending: a "go" decided
+ * before the vote was taken back is followed, not rolled back. */
 static double now_ms(void);
+
+#define VOTE_WITHDRAW_MS 2000  /* the driver polls every 200 ms */
+
+static int write_vote(const char *q, const char *tmp, int attempt, int quiesced)
+{
+    FILE *fp = fopen(tmp, "we");
+    if (!fp || fprintf(fp, "%d %s\n", attempt, quiesced ? "ok" : "busy") < 0 || fclose(fp) != 0 || rename(tmp, q) != 0) {
+        fprintf(stderr, "%s: %s\n", q, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 
 static int node_vote(int attempt, int quiesced, double deadline)
 {
@@ -1128,14 +1146,12 @@ static int node_vote(int attempt, int quiesced, double deadline)
     snprintf(q, sizeof(q), "%s/q", fabric_dir);
     snprintf(tmp, sizeof(tmp), "%s/q.tmp", fabric_dir);
     snprintf(d, sizeof(d), "%s/d", fabric_dir);
-    FILE *fp = fopen(tmp, "we");
-    if (!fp || fprintf(fp, "%d %s\n", attempt, quiesced ? "ok" : "busy") < 0 || fclose(fp) != 0 || rename(tmp, q) != 0) {
-        fprintf(stderr, "%s: %s\n", q, strerror(errno));
-        return -1;
-    }
+    if (write_vote(q, tmp, attempt, quiesced) < 0) return -1;
+    int withdrawn = 0;
     for (;;) {
         int a = -1;
         char verdict[16] = "";
+        FILE *fp;
         if ((fp = fopen(d, "re"))) {
             if (fgets(line, sizeof(line), fp)) sscanf(line, "%d %15s", &a, verdict);
             fclose(fp);
@@ -1145,9 +1161,18 @@ static int node_vote(int attempt, int quiesced, double deadline)
                 printf("quiesce: the vote was aborted at attempt %d: rolling back\n", attempt);
                 return -1;
             }
+            if (!strcmp(verdict, "go") && withdrawn)
+                printf("quiesce: \"go\" for attempt %d came after the deadline, before the vote was taken back: "
+                       "going on\n", attempt);
+            /* A "retry" after the deadline: the caller rolls back. */
             return !strcmp(verdict, "go");
         }
-        if (now_ms() >= deadline) break;
+        if (now_ms() >= deadline) {
+            if (withdrawn || !quiesced) break;
+            if (write_vote(q, tmp, attempt, 0) < 0) return -1;
+            withdrawn = 1;
+            deadline = now_ms() + VOTE_WITHDRAW_MS;
+        }
         usleep(100000);
     }
     fprintf(stderr, "no verdict in %s for attempt %d by the deadline\n", d, attempt);
