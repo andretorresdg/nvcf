@@ -505,7 +505,7 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		// After the network unlock: the NIXL KV connector listens and
 		// ModelExpress republishes over it. The engine takes no requests
 		// until its connector is back: a failed resume fails the restore.
-		if err := resumeRestoredNIXL(ctx, gs, tools.gpuToolText(), toolPID, a.restoredNIXLHostFor(ctx, gs, metadata.SourcePodIP, group), log); err != nil {
+		if err := a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log); err != nil {
 			return nil, err
 		}
 		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
@@ -516,7 +516,7 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		if err := continueTasks(); err != nil {
 			return nil, err
 		}
-		if err := resumeRestoredNIXL(ctx, gs, tools.gpuToolText(), toolPID, a.restoredNIXLHostFor(ctx, gs, metadata.SourcePodIP, group), log); err != nil {
+		if err := a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log); err != nil {
 			return nil, err
 		}
 		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)

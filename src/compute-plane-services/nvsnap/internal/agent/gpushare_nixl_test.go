@@ -104,8 +104,9 @@ func TestPauseNIXL(t *testing.T) {
 		{"tool without nixl", true, mxToolText, "", false, false, false, nil},
 		{"opted in, connector released", true, nixlToolText, "", false, true, false, []string{"nixl-pause@42 [7 8]"}},
 		{"opted in, no connector", true, nixlToolText, noConn, false, false, false, []string{"nixl-pause@42 [7 8]"}},
-		// The tool resumes every pid itself; the agent adds no call.
-		{"refused", true, nixlToolText, "", true, false, true, []string{"nixl-pause@42 [7 8]"}},
+		// The tool resumes every pid itself, but may be stopped before it
+		// does: the agent resumes them too.
+		{"refused", true, nixlToolText, "", true, false, true, []string{"nixl-pause@42 [7 8]", "nixl-resume@42 [7 8]"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := map[string]string{}
@@ -117,13 +118,26 @@ func TestPauseNIXL(t *testing.T) {
 			if paused != tc.wantPaused || (err != nil) != tc.wantErr {
 				t.Errorf("pauseNIXL = %v, %v; want paused %v, err %v", paused, err, tc.wantPaused, tc.wantErr)
 			}
-			if tc.wantErr && (!errors.Is(err, errNIXLPauseRefused) || !strings.Contains(err.Error(), "RDMA device file")) {
-				t.Errorf("err = %v, want errNIXLPauseRefused with the tool's reason", err)
+			if tc.wantErr && (!errors.Is(err, errNIXLPauseRefused) || !strings.Contains(err.Error(), "RDMA device file") || sourceMustBeReplaced(err)) {
+				t.Errorf("err = %v, want errNIXLPauseRefused with the tool's reason, source kept", err)
 			}
 			if !slices.Equal(*calls, tc.wantCalls) {
 				t.Errorf("calls = %v, want %v", *calls, tc.wantCalls)
 			}
 		})
+	}
+}
+
+// A refused pause whose resume also fails leaves an engine that takes no
+// requests: the source is replaced.
+func TestPauseNIXL_RefusedAndNotResumed(t *testing.T) {
+	calls := fakeNIXL(t, nil, map[string]bool{"nixl-pause": true, "nixl-resume": true})
+	paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7}, testLog())
+	if paused || !errors.Is(err, errNIXLPauseRefused) || !sourceMustBeReplaced(err) {
+		t.Errorf("pauseNIXL = %v, %v; want errNIXLPauseRefused and the source replaced", paused, err)
+	}
+	if !slices.Equal(*calls, []string{"nixl-pause@42 [7]", "nixl-resume@42 [7]"}) {
+		t.Errorf("calls = %v", *calls)
 	}
 }
 
@@ -183,15 +197,44 @@ func TestResumeRestoredNIXL(t *testing.T) {
 	}
 }
 
+// The restored engine listens at its pod's new address, keeps the
+// captured one only when the pod kept it, and is not resumed when the
+// pod's address is unknown: the restore fails and starts cold.
 func TestRestoredNIXLHost(t *testing.T) {
-	for _, tc := range []struct{ pod, captured, want string }{
-		{"10.1.253.45", "10.1.245.116", "10.1.253.45"},
-		{"10.1.245.116", "10.1.245.116", ""},
-		{"", "10.1.245.116", ""},
+	for _, tc := range []struct {
+		pod, captured, want string
+		wantErr             bool
+	}{
+		{"10.1.253.45", "10.1.245.116", "10.1.253.45", false},
+		{"10.1.245.116", "10.1.245.116", "", false},
+		{"10.1.253.45", "", "10.1.253.45", false},
+		{"", "10.1.245.116", "", true},
 	} {
-		if got := restoredNIXLHost(tc.pod, tc.captured); got != tc.want {
-			t.Errorf("restoredNIXLHost(%q, %q) = %q, want %q", tc.pod, tc.captured, got, tc.want)
+		got, err := restoredNIXLHost(tc.pod, tc.captured)
+		if got != tc.want || (err != nil) != tc.wantErr {
+			t.Errorf("restoredNIXLHost(%q, %q) = %q, %v; want %q, err %v", tc.pod, tc.captured, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// Without the capture's pause there is nothing to resume, address or not;
+// with it, an unknown address fails the restore before any resume.
+func TestResumeRestoredNIXLFor(t *testing.T) {
+	a := &Agent{}
+	calls := fakeNIXL(t, nil, nil)
+	if err := a.resumeRestoredNIXLFor(context.Background(), &GPUShareInfo{PIDs: []int{7}}, nixlToolText, 99, "10.1.245.116", restoreV2Group{}, testLog()); err != nil {
+		t.Errorf("not paused: err = %v", err)
+	}
+	gs := &GPUShareInfo{PIDs: []int{7}, NIXL: true}
+	if err := a.resumeRestoredNIXLFor(context.Background(), gs, nixlToolText, 99, "10.1.245.116", restoreV2Group{}, testLog()); err == nil {
+		t.Error("paused, pod address unknown: err = nil, want the restore failed")
+	}
+	g := restoreV2Group{InetAddrMap: "10.1.245.116=10.1.253.45"}
+	if err := a.resumeRestoredNIXLFor(context.Background(), gs, nixlToolText, 99, "10.1.245.116", g, testLog()); err != nil {
+		t.Errorf("paused, moved: err = %v", err)
+	}
+	if !slices.Equal(*calls, []string{"--host 10.1.253.45 nixl-resume@99 [7]"}) {
+		t.Errorf("calls = %v, want one resume at the new address", *calls)
 	}
 }
 

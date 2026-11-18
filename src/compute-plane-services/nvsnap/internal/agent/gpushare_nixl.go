@@ -116,8 +116,12 @@ func nixlConnectorFound(out string) bool {
 // tool without nixl-pause, is not paused and captures as before (the
 // preflight refuses RDMA it cannot release). A pod that opted in but has
 // no connector is not paused either. A failed pause returns
-// errNIXLPauseRefused with the tool's reason; the tool has resumed every
-// pid, and the source has not been stopped.
+// errNIXLPauseRefused with the tool's reason, and the source has not been
+// stopped. The tool resumes every pid when the pause fails, but a timeout
+// or a cancel may stop it before it does, so the agent resumes them too
+// (a resume of an engine that is not paused answers "not paused"); if
+// that fails, the error also carries errSourceLeftSuspended and the
+// source is replaced.
 func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, pids []int, log *logrus.Entry) (paused bool, err error) {
 	if !optedIn || len(pids) == 0 {
 		return false, nil
@@ -129,7 +133,7 @@ func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, 
 	t0 := time.Now()
 	out, err := gpushareNIXL(ctx, hostPID, "nixl-pause", "", pids)
 	if err != nil {
-		return false, fmt.Errorf("%w: %w", errNIXLPauseRefused, err)
+		return false, resumeNIXLSource(ctx, hostPID, pids, fmt.Errorf("%w: %w", errNIXLPauseRefused, err), log)
 	}
 	l := log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()})
 	if !nixlConnectorFound(out) {
@@ -183,21 +187,41 @@ func resumeRestoredNIXL(ctx context.Context, gs *GPUShareInfo, toolText string, 
 
 // restoredNIXLHost is the address a restored engine's side channel
 // listens and is advertised at: its pod's own IP, podIP, when the restore
-// moved it off the captured address (as restoredMXHost). "" leaves it.
-func restoredNIXLHost(podIP, capturedIP string) string {
-	if podIP == "" || podIP == capturedIP {
-		return ""
+// moved it off the captured address; "" when it kept that address. An
+// unknown podIP is an error: resumed on the captured address, the engine
+// would advertise one its pod may not own, and decode engines could not
+// reach it, so the restore fails and its replica starts cold.
+func restoredNIXLHost(podIP, capturedIP string) (string, error) {
+	if podIP == "" {
+		return "", errors.New("gpushare: the restored pod's address is unknown, so the NIXL KV connector cannot be resumed at it")
 	}
-	return podIP
+	if podIP == capturedIP {
+		return "", nil
+	}
+	return podIP, nil
 }
 
-// restoredNIXLHostFor is restoredNIXLHost for the placeholder of group,
-// read only when the capture paused the connector.
-func (a *Agent) restoredNIXLHostFor(ctx context.Context, gs *GPUShareInfo, capturedIP string, group restoreV2Group) string {
+// restoredNIXLHostFor is restoredNIXLHost for the placeholder of group
+// (its address from the restore's address map, else from the API), read
+// only when the capture paused the connector.
+func (a *Agent) restoredNIXLHostFor(ctx context.Context, gs *GPUShareInfo, capturedIP string, group restoreV2Group) (string, error) {
 	if gs == nil || !gs.NIXL {
-		return ""
+		return "", nil
 	}
-	return restoredNIXLHost(a.placeholderPodIP(ctx, group.Namespace, group.Pod, "", ""), capturedIP)
+	return restoredNIXLHost(a.placeholderPodIP(ctx, group.Namespace, group.Pod, group.InetAddrMap, capturedIP), capturedIP)
+}
+
+// resumeRestoredNIXLFor resumes the connector of a restore of group at
+// the restored pod's address (resumeRestoredNIXL, restoredNIXLHostFor).
+func (a *Agent) resumeRestoredNIXLFor(ctx context.Context, gs *GPUShareInfo, toolText string, toolPID int, capturedIP string, group restoreV2Group, log *logrus.Entry) error {
+	if gs == nil || !gs.NIXL {
+		return nil
+	}
+	host, err := a.restoredNIXLHostFor(ctx, gs, capturedIP, group)
+	if err != nil {
+		return err
+	}
+	return resumeRestoredNIXL(ctx, gs, toolText, toolPID, host, log)
 }
 
 // nixlPausable are the processes of the container whose init is

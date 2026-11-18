@@ -39,7 +39,7 @@ The agent calls them at the same points as ModelExpress's `mx-pause` / `mx-resum
 | chart `webhook.nixlPause.enabled` (agent flag `--webhook-nixl-pause`) | the cluster operator | `false` | Off: the annotation below is ignored (logged), and such pods are refused as before. |
 | pod annotation `nvsnap.io/nixl-pause: "true"` | the workload owner | absent | Opts the workload in; removing it opts out. |
 
-With both on, the webhook adds two variables to each GPU container of a pod under the gpushare library. A value the pod sets itself is kept.
+With both on, the webhook adds two variables to each GPU container of a pod under the gpushare library, including a pod that already carries the gpushare placement. A value the pod sets itself is kept.
 
 - `NVSNAP_NIXL_PAUSE=1`: the marker the agent reads from the process's environment at capture.
 - `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1`: the library opens its control socket on a process's first CUDA entry-point lookup. vLLM's engine-core process at TP > 1 allocates no GPU memory, and `nixl-pause` reaches the engine through it.
@@ -53,7 +53,7 @@ The variables are added after the process configuration is stamped from the pod 
   - the engine spans nodes: untested, and its remote workers are released through the engine's own RPC.
 
   RDMA of any other process still blocks.
-- **Pause.** Right before the suspend, after the instance is held and the capture claimed, as `mx-pause`, the agent runs `nixl-pause` on the GPU processes. The agent allows 3 minutes. If the tool fails, the capture fails there with the tool's reason, before anything is stopped. The tool has already resumed the engine.
+- **Pause.** Right before the suspend, after the instance is held and the capture claimed, as `mx-pause`, the agent runs `nixl-pause` on the GPU processes. The agent allows 3 minutes. If the tool fails, the capture fails there with the tool's reason, before anything is stopped. The tool resumes the engine on failure, but the agent's timeout could stop it first, so the agent also runs `nixl-resume`; on an engine that is not paused it answers `not paused`. If that resume fails too, the source is replaced.
   - The usual refusal is NCCL at TP > 1 in a pod with RDMA NICs: NCCL opens the RDMA devices even within one node and keeps them open until the process exits.
   - Neither nvsnap nor this document suggests changing the workload's transport to get around a refusal.
 - **No connector.** A pod that opted in but has no NIXL KV connector answers `ok no NIXL KV connector`, and captures as before.
@@ -65,7 +65,7 @@ The variables are added after the process configuration is stamped from the pod 
 When the capture paused the connector:
 
 1. Once the restored processes' GPU launches run and the network is unlocked (after `open` and the network unlock for a group, after `resume` otherwise), the agent runs `nixl-resume`.
-2. If the restore moved the pod, it passes the pod's own IP as `--host`, which becomes the side channel's address. Decode engines learn a prefill engine's address per request, so nothing else needs the new IP.
+2. If the restore moved the pod, it passes the pod's own IP as `--host`, which becomes the side channel's address. The IP comes from the restore's address map, else from the API server. If the pod's address can't be read, the restore fails instead of resuming at the captured address, which the pod may not own. Decode engines learn a prefill engine's address per request, so nothing else needs the new IP.
 3. The resume runs on the restore's path. If it fails, or the node's tool has no `nixl-resume`, **the restore fails and the replica starts cold**.
 
 A restore into another pod also needs the library's UCX route refresh. UCX reads the routing table once per process, and a restored process would otherwise keep the old pod's routes. The library handles UCX 1.22; with another version it logs that UCX keeps the old routes, and `nixl-resume` fails as above.

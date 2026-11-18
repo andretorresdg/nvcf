@@ -437,6 +437,22 @@ func TestGPUSharePatches_NIXLPause(t *testing.T) {
 		})
 	}
 
+	// An opt-in added to a pod that already carries the placement (a
+	// manifest written from an admitted pod) adds only the env.
+	placed := applyPatches(t, gpushareTestPod(true, nil), (&Mutator{}).gpusharePatches(context.Background(), gpushareTestPod(true, nil)))
+	placed.Annotations[NIXLPauseAnnotation] = "true"
+	m0 := &Mutator{NIXLPause: true}
+	got := applyPatches(t, placed, m0.gpusharePatches(context.Background(), placed))
+	if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != "1" {
+		t.Errorf("placed pod: %s = %+v, want 1", nixlPauseEnv, e)
+	}
+	if len(got.Spec.Volumes) != len(placed.Spec.Volumes) || len(got.Spec.Containers[1].VolumeMounts) != len(placed.Spec.Containers[1].VolumeMounts) {
+		t.Errorf("placed pod: the placement was repeated: %d volumes (was %d)", len(got.Spec.Volumes), len(placed.Spec.Volumes))
+	}
+	if ops := m0.gpusharePatches(context.Background(), got); len(ops) != 0 {
+		t.Errorf("placed pod with the env: patched again: %+v", ops)
+	}
+
 	// A pod opted out of gpushare gets nothing, annotation or not.
 	m := &Mutator{NIXLPause: true, GPUShareByDefault: true}
 	pod := annotated(false, nil)
