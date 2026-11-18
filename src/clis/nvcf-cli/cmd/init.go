@@ -42,10 +42,10 @@ This command:
 - Calls the API Keys service endpoint to generate a new JWT admin token
 - Clears any existing function state to start fresh
 - Saves the token for subsequent commands
-- Keeps API keys created by "api-key generate" when the base URL, invoke URL
-  and account match the previous init. The task key also needs the same NVCT
-  URL, and the Event Ledger key the same Event Ledger URL. Keys that no longer
-  match are dropped.
+- Keeps each API key created by "api-key generate" while the account and
+  the route the key is sent to (its URLs and Host overrides) are unchanged.
+  A key whose route changed, or one created by an older release that did
+  not record its route, is dropped.
 - To remove saved keys on purpose, run "api-key clear". That only edits the
   local state. Do not use "api-key clear-all" for this: it revokes every key
   for the owner on the server.
@@ -86,26 +86,6 @@ func runInit(cmd *cobra.Command, args []string) error {
 	logging.Info("Starting fresh session...")
 	logging.Info("Generating admin token from API Keys service...")
 
-	// Clear existing state - init should start fresh, but API keys are
-	// independent of the admin token, so keep them when the target is the
-	// same deployment. Otherwise later function and task commands fall back
-	// to the admin token and fail with 403. Each key is also bound to the
-	// endpoint it is sent to, so a changed NVCT or Event Ledger URL drops
-	// only that key.
-	sm := GetStateManagerForCurrentCommand()
-	account := getConfigValueWithDefault("client_id", "nvcf-default")
-	nvctURL := config.BaseNVCTURL
-	eventLedgerURL := resolveEventLedgerURL(config.BaseHTTPURL)
-	prev := *sm.GetState()
-	sameDeployment := prev.LastBaseURL == config.BaseHTTPURL &&
-		prev.LastInvokeURL == config.BaseInvokeURL &&
-		prev.LastAccount == account
-	keepFunctionKey := sameDeployment
-	keepTaskKey := sameDeployment && prev.LastNVCTURL == nvctURL
-	keepEventLedgerKey := sameDeployment && prev.LastEventLedgerURL == eventLedgerURL
-	sm.ClearFunction()
-	sm.ClearTokens()
-
 	// Generate admin token via API endpoint
 	token, expiration, err := generateAdminTokenViaAPI(config)
 	if err != nil {
@@ -116,23 +96,42 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to extract admin token from API response")
 	}
 
+	// Re-read state after the token request so a change another command made
+	// meanwhile, such as api-key clear, is not overwritten. Then start fresh,
+	// but keep each API key whose recorded route still matches: the keys are
+	// independent of the admin token, and dropping them makes later function
+	// and task commands fall back to the admin token and fail authorization.
+	sm := GetStateManagerForCurrentCommand()
+	if err := sm.Load(); err != nil {
+		logging.Warning("Could not reload state: %v", err)
+	}
+	prev := *sm.GetState()
+	keepFunctionKey := keepKey(prev.APIKey, prev.APIKeyBinding, functionKeyBinding(config))
+	keepTaskKey := keepKey(prev.NVCTAPIKey, prev.NVCTAPIKeyBinding, taskKeyBinding(config))
+	keepEventLedgerKey := keepKey(prev.EventLedgerAPIKey, prev.EventLedgerAPIKeyBinding, eventLedgerKeyBinding(config))
+	sm.ClearFunction()
+	sm.ClearTokens()
+
 	// Save the new token
 	if keepFunctionKey {
 		sm.SetTokens(token, prev.APIKey, expiration, prev.APIKeyExpiration)
+		sm.SetAPIKeyBindings(prev.APIKeyBinding, "", "")
 	} else {
 		sm.SetTokens(token, "", expiration, time.Time{})
 	}
 	if keepTaskKey {
 		sm.SetNVCTAPIKey(prev.NVCTAPIKey, prev.NVCTAPIKeyExpiration)
+		sm.SetAPIKeyBindings("", prev.NVCTAPIKeyBinding, "")
 	}
 	if keepEventLedgerKey {
 		sm.SetEventLedgerAPIKey(prev.EventLedgerAPIKey, prev.EventLedgerAPIKeyExpiration)
+		sm.SetAPIKeyBindings("", "", prev.EventLedgerAPIKeyBinding)
 	}
 	sm.SetConfig("", "", false) // No cluster mode needed anymore
 
-	// Set endpoints
+	// Set endpoints - use configured account or default
+	account := getConfigValueWithDefault("client_id", "nvcf-default")
 	sm.SetEndpoints(config.BaseHTTPURL, config.BaseInvokeURL, account)
-	sm.SetKeyEndpoints(nvctURL, eventLedgerURL)
 
 	if err := SaveStateForCurrentCommand(); err != nil {
 		logging.Warning("Failed to save state: %v", err)
@@ -145,6 +144,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// keepKey reports whether a saved key was generated for the current route.
+// A key without a recorded binding predates route tracking and is dropped.
+func keepKey(key, saved, current string) bool {
+	return key != "" && saved != "" && saved == current
 }
 
 // TokenResponse represents the API response from the token generation endpoint

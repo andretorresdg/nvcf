@@ -644,10 +644,6 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 			ExitCode: 0,
 			Stdout:   "Listing cluster groups...\nFound 1 cluster groups:\n\nID: test-cluster-group-id\n---\n",
 		},
-		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml api-key show": {
-			ExitCode: 0,
-			Stdout:   "Current saved API keys:\nfunction key: nvapi-redacted\n",
-		},
 		invalidHelmFunctionDeployCommand: {
 			ExitCode: 1,
 			Stderr:   "deployment failed: function deployment failed with status: ERROR\n",
@@ -700,7 +696,8 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	decisionRoutes.attach(runner, suite.Config.RepoRoot)
 	requestBody := newVanityRequestBodyFake("", vanityShadow)
 	requestBody.attach(runner)
-	suite.HTTP = requestBody
+	clusterGroups := &clusterGroupsHTTPFake{next: requestBody}
+	suite.HTTP = clusterGroups
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile.feature")
 	var out strings.Builder
@@ -759,8 +756,8 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		"--description bdd-init-keeps-api-keys") {
 		t.Fatal("init key retention scenario did not generate its function API key")
 	}
-	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "api-key show") {
-		t.Fatal("init key retention scenario did not inspect the saved API keys")
+	if !clusterGroups.called {
+		t.Fatal("init key retention scenario did not list cluster groups with the saved function API key")
 	}
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"api-key generate --for function",
@@ -4788,6 +4785,24 @@ func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 			}
 		})
 	}
+}
+
+// clusterGroupsHTTPFake answers the cluster group list for the seeded
+// function API key and passes every other request to next.
+type clusterGroupsHTTPFake struct {
+	next   harness.HTTPClient
+	called bool
+}
+
+func (f *clusterGroupsHTTPFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
+	if method != http.MethodGet || rawURL != "http://api.localhost:8080/v2/nvcf/clusterGroups" {
+		return f.next.Do(ctx, method, rawURL, headers, body)
+	}
+	if headers["Authorization"] != "Bearer wiring-function-api-key" {
+		return harness.HTTPResponse{Status: http.StatusUnauthorized}, nil
+	}
+	f.called = true
+	return harness.HTTPResponse{Status: http.StatusOK, Body: `{"clusterGroups":[]}`}, nil
 }
 
 func seedFunctionAPIKey(t *testing.T, home string) {

@@ -232,13 +232,11 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
         """
-      When I run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key show
-        """
-      Then the command exit code should be 0
-      And the command output should contain "function key:"
-      And the command output should not contain "No API key found in state"
+      # The header step fails when init dropped the saved key, and the request
+      # proves the key still works. The key never reaches argv or logs.
+      Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
+      When I send a "GET" request to "http://api.localhost:8080/v2/nvcf/clusterGroups"
+      Then the HTTP status should be 200
 
       When I successfully run command:
         """

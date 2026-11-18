@@ -83,10 +83,12 @@ type State struct {
 	LastInvokeURL string `json:"lastInvokeUrl,omitempty"`
 	LastAccount   string `json:"lastAccount,omitempty"`
 
-	// Endpoints the task and Event Ledger keys were saved against. init keeps
-	// each key only while its own endpoint is unchanged.
-	LastNVCTURL        string `json:"lastNvctUrl,omitempty"`
-	LastEventLedgerURL string `json:"lastEventLedgerUrl,omitempty"`
+	// Route each saved API key was generated for: the account plus the URLs
+	// and Host overrides the key is sent to. init keeps a key only while its
+	// binding still matches the configuration.
+	APIKeyBinding            string `json:"apiKeyBinding,omitempty"`
+	NVCTAPIKeyBinding        string `json:"nvctApiKeyBinding,omitempty"`
+	EventLedgerAPIKeyBinding string `json:"eventLedgerApiKeyBinding,omitempty"`
 
 	// Self-hosted auth cache: admin token + control-plane fingerprint.
 	// nil when no self-hosted installation has been run, or when the
@@ -158,9 +160,13 @@ func (sm *StateManager) Load() error {
 		return fmt.Errorf("failed to read state file: %w", err)
 	}
 
-	if err := json.Unmarshal(data, sm.state); err != nil {
+	// Decode into a fresh State so fields absent from the file, such as keys
+	// another command cleared, do not survive from an earlier Load.
+	loaded := &State{}
+	if err := json.Unmarshal(data, loaded); err != nil {
 		return fmt.Errorf("failed to parse state file: %w", err)
 	}
+	sm.state = loaded
 
 	return nil
 }
@@ -231,6 +237,9 @@ func (sm *StateManager) ClearTokens() {
 	sm.state.NVCTAPIKeyExpiration = time.Time{}
 	sm.state.EventLedgerAPIKey = ""
 	sm.state.EventLedgerAPIKeyExpiration = time.Time{}
+	sm.state.APIKeyBinding = ""
+	sm.state.NVCTAPIKeyBinding = ""
+	sm.state.EventLedgerAPIKeyBinding = ""
 }
 
 // SetConfig updates configuration settings
@@ -247,11 +256,18 @@ func (sm *StateManager) SetEndpoints(baseURL, invokeURL, account string) {
 	sm.state.LastAccount = account
 }
 
-// SetKeyEndpoints records the NVCT and Event Ledger endpoints that the saved
-// task and Event Ledger keys belong to.
-func (sm *StateManager) SetKeyEndpoints(nvctURL, eventLedgerURL string) {
-	sm.state.LastNVCTURL = nvctURL
-	sm.state.LastEventLedgerURL = eventLedgerURL
+// SetAPIKeyBindings records the route each saved API key was generated for.
+// An empty value leaves that key's binding unchanged.
+func (sm *StateManager) SetAPIKeyBindings(function, task, eventLedger string) {
+	if function != "" {
+		sm.state.APIKeyBinding = function
+	}
+	if task != "" {
+		sm.state.NVCTAPIKeyBinding = task
+	}
+	if eventLedger != "" {
+		sm.state.EventLedgerAPIKeyBinding = eventLedger
+	}
 }
 
 // IsTokenValid checks if the current token is still valid
@@ -310,6 +326,7 @@ func (sm *StateManager) SetNVCTAPIKey(key string, expiration time.Time) {
 func (sm *StateManager) ClearNVCTAPIKey() {
 	sm.state.NVCTAPIKey = ""
 	sm.state.NVCTAPIKeyExpiration = time.Time{}
+	sm.state.NVCTAPIKeyBinding = ""
 }
 
 // HasNVCTAPIKey reports whether an NVCT API key is stored.
@@ -327,6 +344,7 @@ func (sm *StateManager) SetEventLedgerAPIKey(key string, expiration time.Time) {
 func (sm *StateManager) ClearEventLedgerAPIKey() {
 	sm.state.EventLedgerAPIKey = ""
 	sm.state.EventLedgerAPIKeyExpiration = time.Time{}
+	sm.state.EventLedgerAPIKeyBinding = ""
 }
 
 // PrintStatus prints the current state in a human-readable format

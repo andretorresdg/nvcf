@@ -20,9 +20,11 @@ package cmd
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"nvcf-cli/internal/client"
 	"nvcf-cli/internal/state"
 
 	"github.com/spf13/viper"
@@ -30,107 +32,207 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const (
-	initTestBaseURL        = "http://api.test.local:9999"
-	initTestInvokeURL      = "http://invoke.test.local:9999"
-	initTestNVCTURL        = "http://nvct.test.local:9999"
-	initTestEventLedgerURL = "http://events.test.local:9999"
-	initTestAccount        = "nvcf-default"
-)
+// routeConfig is every configuration value that decides a key binding.
+type routeConfig map[string]string
 
-// initPrev is the endpoint set that the seeded state was saved against.
-type initPrev struct {
-	baseURL, invokeURL, account, nvctURL, eventLedgerURL string
-}
-
-func matchingInitPrev() initPrev {
-	return initPrev{
-		baseURL:        initTestBaseURL,
-		invokeURL:      initTestInvokeURL,
-		account:        initTestAccount,
-		nvctURL:        initTestNVCTURL,
-		eventLedgerURL: initTestEventLedgerURL,
+func baseRouteConfig() routeConfig {
+	return routeConfig{
+		"base_http_url":     "http://api.test.local:9999",
+		"api_host":          "",
+		"invoke_url":        "http://invoke.test.local:9999",
+		"invoke_host":       "",
+		"base_grpc_url":     "grpc.test.local:443",
+		"base_nvct_url":     "http://nvct.test.local:9999",
+		"nvct_host":         "",
+		"event_ledger_url":  "http://events.test.local:9999",
+		"event_ledger_host": "",
+		"client_id":         "nvcf-default",
 	}
 }
 
-// seedInitState installs a fresh state manager holding an admin token, the
-// function, task and Event Ledger API keys, a selected function, and the given
-// previous endpoints. It points every API keys URL at a fake server that mints
-// admin tokens and returns the expiration it gave the saved keys.
-func seedInitState(t *testing.T, prev initPrev) time.Time {
+func (c routeConfig) with(key, value string) routeConfig {
+	out := routeConfig{}
+	for k, v := range c {
+		out[k] = v
+	}
+	out[key] = value
+	return out
+}
+
+// applyRouteConfig pins each value in both Viper and the process environment,
+// so neither lookup path can pick up an inherited override.
+func applyRouteConfig(t *testing.T, c routeConfig) {
+	t.Helper()
+	for k, v := range c {
+		t.Setenv(k, v)
+		if v == "" {
+			viper.Set(k, nil)
+			continue
+		}
+		viper.Set(k, v)
+	}
+}
+
+// setupInitTest isolates HOME, Viper, and the state manager, and points every
+// API Keys URL at a fake server. The server mints admin tokens and API keys;
+// onMint runs while an admin token request is in flight.
+func setupInitTest(t *testing.T, onMint func()) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"value":"new-admin-token"}`))
+		switch r.URL.Path {
+		case "/v1/admin/keys":
+			if onMint != nil {
+				onMint()
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"value":"new-admin-token"}`))
+		case "/v1/keys":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"value":"nvapi-` + strings.ToLower(r.Header.Get("Key-Issuer-Service")) + `"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
 	}))
 	t.Cleanup(srv.Close)
 
 	viper.Reset()
-	viper.Set("base_http_url", initTestBaseURL)
-	viper.Set("base_grpc_url", "localhost:50051")
-	viper.Set("invoke_url", initTestInvokeURL)
-	viper.Set("base_nvct_url", initTestNVCTURL)
-	viper.Set("event_ledger_url", initTestEventLedgerURL)
-	viper.Set("client_id", initTestAccount)
 	t.Cleanup(func() { viper.Reset() })
 	t.Setenv("api_keys_service_url", srv.URL)
 	t.Setenv("api_keys_admin_service_url", srv.URL)
+	t.Setenv("API_KEYS_SERVICE_ID", "nvcf-test-service-id")
+	t.Setenv("api_keys_nvct_service_id", "nvct-test-service-id")
+	t.Setenv("API_KEYS_ISSUER_SERVICE", "nvcf-api")
+	t.Setenv("api_keys_nvct_issuer_service", "nvct-api")
 
 	orig := state.DefaultStateManager
-	sm := state.NewStateManager()
-	state.DefaultStateManager = sm
+	state.DefaultStateManager = state.NewStateManager()
 	t.Cleanup(func() { state.DefaultStateManager = orig })
+}
 
+// bindingsFor returns the function, task, and Event Ledger key bindings that
+// api-key generate records under configuration c.
+func bindingsFor(t *testing.T, c routeConfig) (string, string, string) {
+	t.Helper()
+	applyRouteConfig(t, c)
+	cfg, err := client.LoadConfigWithoutAuth()
+	require.NoError(t, err)
+	return functionKeyBinding(cfg), taskKeyBinding(cfg), eventLedgerKeyBinding(cfg)
+}
+
+// seedKeys saves an admin token, all three API keys bound to configuration
+// generatedFor, and a selected function. It returns the keys' expiration.
+func seedKeys(t *testing.T, generatedFor routeConfig, withBindings bool) time.Time {
+	t.Helper()
+	fn, task, el := bindingsFor(t, generatedFor)
+	sm := state.DefaultStateManager
 	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	sm.SetTokens("old-admin-token", "function-key", exp, exp)
 	sm.SetNVCTAPIKey("task-key", exp)
 	sm.SetEventLedgerAPIKey("event-ledger-key", exp)
+	if withBindings {
+		sm.SetAPIKeyBindings(fn, task, el)
+	}
 	sm.SetFunction("fn-id", "ver-id", "fn")
-	sm.SetEndpoints(prev.baseURL, prev.invokeURL, prev.account)
-	sm.SetKeyEndpoints(prev.nvctURL, prev.eventLedgerURL)
 	require.NoError(t, sm.Save())
 	return exp
 }
 
-func TestInit_KeepsAPIKeysForSameDeployment(t *testing.T) {
-	exp := seedInitState(t, matchingInitPrev())
+func generateAllKeys(t *testing.T) {
+	t.Helper()
+	resetApikeyFlags(t)
+	apikeyFor = ""
+	apikeyExpiresIn = "1h"
+	require.NoError(t, runAPIKeyGenerate(nil, nil))
+}
+
+func TestInit_KeepsKeysGeneratedForTheSameRoute(t *testing.T) {
+	setupInitTest(t, nil)
+	applyRouteConfig(t, baseRouteConfig())
+	require.NoError(t, runInit(nil, nil))
+	generateAllKeys(t)
+	before := *state.DefaultStateManager.GetState()
+	require.NotEmpty(t, before.APIKey)
+	require.NotEmpty(t, before.NVCTAPIKey)
+	require.NotEmpty(t, before.EventLedgerAPIKey)
 
 	require.NoError(t, runInit(nil, nil))
 
 	got := state.DefaultStateManager.GetState()
-	assert.Equal(t, "new-admin-token", got.Token, "admin token must be replaced")
-	assert.Equal(t, "function-key", got.APIKey, "function API key must survive init")
-	assert.Equal(t, "task-key", got.NVCTAPIKey, "task API key must survive init")
-	assert.Equal(t, "event-ledger-key", got.EventLedgerAPIKey, "Event Ledger key must survive init")
-	assert.True(t, exp.Equal(got.APIKeyExpiration), "function key expiration must be unchanged")
-	assert.True(t, exp.Equal(got.NVCTAPIKeyExpiration), "task key expiration must be unchanged")
-	assert.True(t, exp.Equal(got.EventLedgerAPIKeyExpiration), "Event Ledger key expiration must be unchanged")
+	assert.Equal(t, "new-admin-token", got.Token)
+	assert.Equal(t, before.APIKey, got.APIKey)
+	assert.Equal(t, before.NVCTAPIKey, got.NVCTAPIKey)
+	assert.Equal(t, before.EventLedgerAPIKey, got.EventLedgerAPIKey)
+	assert.True(t, before.APIKeyExpiration.Equal(got.APIKeyExpiration))
+	assert.True(t, before.NVCTAPIKeyExpiration.Equal(got.NVCTAPIKeyExpiration))
+	assert.True(t, before.EventLedgerAPIKeyExpiration.Equal(got.EventLedgerAPIKeyExpiration))
+}
+
+// A key generated against deployment B must not be restored when init runs
+// against deployment A, even though init last recorded A.
+func TestInit_DropsKeysGeneratedForAnotherDeployment(t *testing.T) {
+	setupInitTest(t, nil)
+	a := baseRouteConfig()
+	b := a.with("base_http_url", "http://api.b.test.local:9999").
+		with("base_nvct_url", "http://nvct.b.test.local:9999").
+		with("event_ledger_url", "http://events.b.test.local:9999")
+
+	applyRouteConfig(t, a)
+	require.NoError(t, runInit(nil, nil))
+	applyRouteConfig(t, b)
+	generateAllKeys(t)
+	applyRouteConfig(t, a)
+
+	require.NoError(t, runInit(nil, nil))
+
+	got := state.DefaultStateManager.GetState()
+	assert.Empty(t, got.APIKey)
+	assert.Empty(t, got.NVCTAPIKey)
+	assert.Empty(t, got.EventLedgerAPIKey)
+}
+
+func TestInit_KeepsSeededKeysWithUnchangedExpiration(t *testing.T) {
+	setupInitTest(t, nil)
+	exp := seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runInit(nil, nil))
+
+	got := state.DefaultStateManager.GetState()
+	assert.Equal(t, "function-key", got.APIKey)
+	assert.Equal(t, "task-key", got.NVCTAPIKey)
+	assert.Equal(t, "event-ledger-key", got.EventLedgerAPIKey)
+	assert.True(t, exp.Equal(got.APIKeyExpiration))
+	assert.True(t, exp.Equal(got.NVCTAPIKeyExpiration))
+	assert.True(t, exp.Equal(got.EventLedgerAPIKeyExpiration))
 	assert.Empty(t, got.FunctionID, "function context is still reset")
 }
 
-// Each case changes exactly one input, so removing any single comparison from
-// runInit makes its case fail.
-func TestInit_DropsAPIKeysWhenTheirTargetChanges(t *testing.T) {
+// Each case changes one value between generation and init. Only the keys
+// whose route uses that value are dropped.
+func TestInit_DropsOnlyKeysWhoseRouteChanged(t *testing.T) {
 	cases := []struct {
-		name                           string
-		mutate                         func(*initPrev)
+		key, value                     string
 		wantFunction, wantTask, wantEL bool
 	}{
-		{"base URL", func(p *initPrev) { p.baseURL = "http://other.test.local:9999" }, false, false, false},
-		{"invoke URL", func(p *initPrev) { p.invokeURL = "http://other-invoke.test.local:9999" }, false, false, false},
-		{"account", func(p *initPrev) { p.account = "other-account" }, false, false, false},
-		{"NVCT URL only", func(p *initPrev) { p.nvctURL = "http://other-nvct.test.local:9999" }, true, false, true},
-		{"Event Ledger URL only", func(p *initPrev) { p.eventLedgerURL = "http://other-events.test.local:9999" }, true, true, false},
-		{"state without recorded NVCT URL", func(p *initPrev) { p.nvctURL = "" }, true, false, true},
+		{"base_http_url", "http://api.other.test.local:9999", false, true, true},
+		{"api_host", "api.other.test", false, true, true},
+		{"invoke_url", "http://invoke.other.test.local:9999", false, true, true},
+		{"invoke_host", "invoke.other.test", false, true, true},
+		{"base_grpc_url", "grpc.other.test.local:443", false, true, true},
+		{"base_nvct_url", "http://nvct.other.test.local:9999", true, false, true},
+		{"nvct_host", "tasks.other.test", true, false, true},
+		{"event_ledger_url", "http://events.other.test.local:9999", true, true, false},
+		{"event_ledger_host", "events.other.test", true, true, false},
+		{"client_id", "other-account", false, false, false},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			prev := matchingInitPrev()
-			tc.mutate(&prev)
-			seedInitState(t, prev)
+		t.Run(tc.key, func(t *testing.T) {
+			setupInitTest(t, nil)
+			seedKeys(t, baseRouteConfig().with(tc.key, tc.value), true)
+			applyRouteConfig(t, baseRouteConfig())
 
 			require.NoError(t, runInit(nil, nil))
 
@@ -139,11 +241,48 @@ func TestInit_DropsAPIKeysWhenTheirTargetChanges(t *testing.T) {
 			assertKey(t, tc.wantFunction, "function-key", got.APIKey, got.APIKeyExpiration)
 			assertKey(t, tc.wantTask, "task-key", got.NVCTAPIKey, got.NVCTAPIKeyExpiration)
 			assertKey(t, tc.wantEL, "event-ledger-key", got.EventLedgerAPIKey, got.EventLedgerAPIKeyExpiration)
-			assert.Equal(t, initTestBaseURL, got.LastBaseURL, "current endpoints are recorded")
-			assert.Equal(t, initTestNVCTURL, got.LastNVCTURL)
-			assert.Equal(t, initTestEventLedgerURL, got.LastEventLedgerURL)
 		})
 	}
+}
+
+// Keys saved by a release that did not record bindings are dropped once.
+func TestInit_DropsKeysWithoutRecordedBinding(t *testing.T) {
+	setupInitTest(t, nil)
+	seedKeys(t, baseRouteConfig(), false)
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runInit(nil, nil))
+
+	got := state.DefaultStateManager.GetState()
+	assert.Empty(t, got.APIKey)
+	assert.Empty(t, got.NVCTAPIKey)
+	assert.Empty(t, got.EventLedgerAPIKey)
+}
+
+// An api-key clear that saves while init waits for the admin token must not
+// be undone by init's final save.
+func TestInit_DoesNotRestoreKeysClearedDuringTokenRequest(t *testing.T) {
+	setupInitTest(t, func() {
+		other := state.NewStateManager()
+		if err := other.Load(); err != nil {
+			t.Errorf("load state in concurrent writer: %v", err)
+			return
+		}
+		other.ClearTokens()
+		if err := other.Save(); err != nil {
+			t.Errorf("save state in concurrent writer: %v", err)
+		}
+	})
+	seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig())
+
+	require.NoError(t, runInit(nil, nil))
+
+	got := state.DefaultStateManager.GetState()
+	assert.Equal(t, "new-admin-token", got.Token)
+	assert.Empty(t, got.APIKey)
+	assert.Empty(t, got.NVCTAPIKey)
+	assert.Empty(t, got.EventLedgerAPIKey)
 }
 
 func assertKey(t *testing.T, keep bool, want, got string, exp time.Time) {
