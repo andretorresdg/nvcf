@@ -17,6 +17,6 @@ IBVERBS_1.12 { global: ibv_reg_dmabuf_mr; } IBVERBS_1.10;
 IBVERBS_1.16 { global: ibv_query_port_speed; } IBVERBS_1.12;
 NVSNAP_IBV_1 {
   global:
-    nvsnap_ibv_suspend; nvsnap_ibv_restore; nvsnap_ibv_map; nvsnap_ibv_connect;
+    nvsnap_ibv_fence; nvsnap_ibv_suspend; nvsnap_ibv_restore; nvsnap_ibv_map; nvsnap_ibv_connect;
     nvsnap_ibv_open; nvsnap_ibv_count;
 };

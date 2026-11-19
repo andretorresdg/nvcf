@@ -120,6 +120,7 @@ static int real_ok(void)
 
 /* Each shadow starts with the struct NCCL sees. */
 struct vctx;
+struct u32map { uint32_t *k, *v; int cap, used; };
 struct vgid { uint8_t port; int index; union ibv_gid old, cur; int cur_index; };
 struct vport { uint8_t port; uint16_t old_lid, cur_lid; int queried; };
 struct vctx {
@@ -129,6 +130,10 @@ struct vctx {
     int wake;                       /* eventfd: wakes the async event wait */
     struct vgid *gids; int n_gids;
     struct vport *ports; int n_ports;
+    /* Keys and queue pair numbers are unique on one device only. */
+    struct u32map lkeys;    /* NCCL's lkey -> real lkey */
+    struct u32map qpn_v;    /* real qpn -> NCCL's qpn */
+    struct u32map qpn_slot; /* real qpn -> slot in qslots, which never move (read without a lock) */
 };
 struct vpd { struct ibv_pd v; struct vctx *c; struct ibv_pd *real; };
 enum { MR_PLAIN, MR_IOVA2, MR_DMABUF };
@@ -141,7 +146,6 @@ struct vcq {
     struct ibv_wc *held; int n_held, cap_held;  /* completions polled at suspend, for NCCL */
 };
 struct recv_rec { uint64_t wr_id; int n; struct ibv_sge sg[4]; };
-struct u32map { uint32_t *k, *v; int cap, used; };
 struct vqp {
     struct ibv_qp v; struct vpd *pd; struct ibv_qp *real;
     struct ibv_qp_init_attr init;
@@ -251,10 +255,6 @@ static int map_get(const struct u32map *m, uint32_t k, uint32_t *v)
  * its new GID and LID, and its keys and queue pair numbers old -> new. */
 struct rport { union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; };
 static struct rport *rports; static int n_rports;
-static struct u32map lkeys;      /* this process: old lkey -> real lkey (all devices) */
-static struct u32map qpn_v;      /* this process: real qpn -> NCCL's qpn */
-/* real qpn -> slot in qslots, which never move (read without a lock) */
-static struct u32map qpn_slot;
 #define QCHUNK 1024
 static struct vqp **qslots[64]; static int n_qslots;
 
@@ -530,8 +530,8 @@ EXPORT struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *
     pthread_mutex_lock(&omu);
     PUSHP(qps, n_qps, q);
     q->slot = qslot_add(q);
-    map_put(&qpn_v, r->qp_num, r->qp_num);
-    if (q->slot >= 0) map_put(&qpn_slot, r->qp_num, q->slot);
+    map_put(&q->pd->c->qpn_v, r->qp_num, r->qp_num);
+    if (q->slot >= 0) map_put(&q->pd->c->qpn_slot, r->qp_num, q->slot);
     pthread_mutex_unlock(&omu);
     return &q->v;
 }
@@ -671,17 +671,17 @@ static void recv_done(struct vqp *q, uint64_t wr_id)
     pthread_mutex_unlock(&q->rmu);
 }
 
-static struct vqp *qp_by_real_num(uint32_t qpn)
+static struct vqp *qp_by_real_num(struct vctx *c, uint32_t qpn)
 {
     uint32_t s;
-    if (map_get(&qpn_slot, qpn, &s)) return NULL;
+    if (map_get(&c->qpn_slot, qpn, &s)) return NULL;
     return __atomic_load_n(&qslots[s / QCHUNK][s % QCHUNK], __ATOMIC_SEQ_CST);
 }
 
-static uint32_t lkey_of(uint32_t k)
+static uint32_t lkey_of(struct vctx *c, uint32_t k)
 {
     uint32_t v;
-    return map_get(&lkeys, k, &v) ? k : v;
+    return map_get(&c->lkeys, k, &v) ? k : v;
 }
 
 static int w_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad)
@@ -705,7 +705,7 @@ static int w_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_sen
             cw[i].sg_list = &cs[s];
             for (int j = 0; j < w->num_sge; j++, s++) {
                 cs[s] = w->sg_list[j];
-                if (!(w->send_flags & IBV_SEND_INLINE)) cs[s].lkey = lkey_of(cs[s].lkey);
+                if (!(w->send_flags & IBV_SEND_INLINE)) cs[s].lkey = lkey_of(q->pd->c, cs[s].lkey);
             }
             uint32_t k;
             if (rp && (w->opcode == IBV_WR_RDMA_WRITE || w->opcode == IBV_WR_RDMA_WRITE_WITH_IMM ||
@@ -743,7 +743,7 @@ static int w_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_rec
             cw[i] = *w;
             cw[i].next = w->next ? &cw[i + 1] : NULL;
             cw[i].sg_list = &cs[s];
-            for (int j = 0; j < w->num_sge; j++, s++) cs[s] = w->sg_list[j], cs[s].lkey = lkey_of(cs[s].lkey);
+            for (int j = 0; j < w->num_sge; j++, s++) cs[s] = w->sg_list[j], cs[s].lkey = lkey_of(q->pd->c, cs[s].lkey);
         }
         struct ibv_recv_wr *cb = NULL;
         r = q->real->context->ops.post_recv(q->real, cw, &cb);
@@ -773,10 +773,10 @@ static int w_poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc)
         for (int i = got; i < got + r; i++) {
             uint32_t v;
             if (wc[i].opcode & IBV_WC_RECV) {
-                struct vqp *x = qp_by_real_num(wc[i].qp_num);
+                struct vqp *x = qp_by_real_num(q->c, wc[i].qp_num);
                 if (x) recv_done(x, wc[i].wr_id);
             }
-            if (!map_get(&qpn_v, wc[i].qp_num, &v)) wc[i].qp_num = v;
+            if (!map_get(&q->c->qpn_v, wc[i].qp_num, &v)) wc[i].qp_num = v;
         }
         got += r;
     }
@@ -803,12 +803,12 @@ static void hold_wc(struct vcq *q, const struct ibv_wc *w)
 }
 
 /* Every send posted before the suspend completes before the queue pair is
- * destroyed: a signaled zero-length write behind them completes after
- * them. Completions polled here are kept for NCCL. */
-static int fence(char *reply, size_t n)
+ * destroyed: a signaled zero-length write behind them (mark) completes
+ * after them. Completions polled here are kept for NCCL. */
+static int fence(char *reply, size_t n, int mark)
 {
     int want = 0;
-    for (int i = 0; i < n_qps; i++) {
+    for (int i = 0; mark && i < n_qps; i++) {
         struct vqp *q = qps[i];
         q->marker_done = 0;
         if (getenv("NVSNAP_IBV_DEBUG")) {
@@ -845,7 +845,7 @@ static int fence(char *reply, size_t n)
             int r = cqs[i]->real->context->ops.poll_cq(cqs[i]->real, 16, wc);
             if (r != 0) last = 0;
             for (int j = 0; j < r; j++) {
-                struct vqp *q = qp_by_real_num(wc[j].qp_num);
+                struct vqp *q = qp_by_real_num(cqs[i]->c, wc[j].qp_num);
                 if (wc[j].status != IBV_WC_SUCCESS && getenv("NVSNAP_IBV_DEBUG"))
                     logf_("fence: completion wr_id %#llx qp %u status %d vendor_err %#x opcode %d",
                           (unsigned long long)wc[j].wr_id, wc[j].qp_num, wc[j].status, wc[j].vendor_err, wc[j].opcode);
@@ -860,7 +860,7 @@ static int fence(char *reply, size_t n)
                 }
                 if ((wc[j].opcode & IBV_WC_RECV) && q) recv_done(q, wc[j].wr_id);
                 uint32_t v;
-                if (!map_get(&qpn_v, wc[j].qp_num, &v)) wc[j].qp_num = v;
+                if (!map_get(&cqs[i]->c->qpn_v, wc[j].qp_num, &v)) wc[j].qp_num = v;
                 hold_wc(cqs[i], &wc[j]);
             }
         }
@@ -881,12 +881,13 @@ static void reopen(void)
     pthread_mutex_unlock(&gmu);
 }
 
-/* Destroy every real object (gpushare "release", after quiesce). */
-EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
+/* Set by nvsnap_ibv_fence, cleared when NCCL's verbs open again. */
+static int fenced;
+
+/* Stop NCCL's verbs calls and wait for those in progress (omu held). */
+static int stop_calls(char *reply, size_t n)
 {
-    pthread_mutex_lock(&omu);
     if (__atomic_load_n(&unsupported, __ATOMIC_SEQ_CST)) {
-        pthread_mutex_unlock(&omu);
         snprintf(reply, n, "err NCCL uses a verbs object this library cannot re-create (see the log)");
         return -1;
     }
@@ -895,18 +896,48 @@ EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
     double t0 = now_s();
     while (__atomic_load_n(&inflight, __ATOMIC_SEQ_CST)) {
         if (now_s() - t0 > 2) {
-            pthread_mutex_unlock(&omu);
             reopen();
             snprintf(reply, n, "err a verbs call did not return in 2 s");
             return -1;
         }
         usleep(1000);
     }
-    if (fence(reply, n) < 0) {
+    return 0;
+}
+
+/* gpushare "quiesce": once the GPU work has drained, every send NCCL
+ * posted completes (see fence), while every peer, on every node, still has
+ * its queue pairs: no node releases before all have quiesced. NCCL's
+ * verbs calls run again after it. */
+EXPORT int nvsnap_ibv_fence(char *reply, size_t n)
+{
+    pthread_mutex_lock(&omu);
+    int r = stop_calls(reply, n);
+    if (r == 0) {
+        r = fence(reply, n, 1);
+        fenced = r == 0;
+        reopen();
+    }
+    pthread_mutex_unlock(&omu);
+    return r;
+}
+
+/* Destroy every real object (gpushare "release", after quiesce). After
+ * nvsnap_ibv_fence only the completions that arrived since are collected:
+ * a fence now could wait on a peer another node has already released. */
+EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
+{
+    pthread_mutex_lock(&omu);
+    if (stop_calls(reply, n) < 0) {
+        pthread_mutex_unlock(&omu);
+        return -1;
+    }
+    if (fence(reply, n, !fenced) < 0) {
         pthread_mutex_unlock(&omu);
         reopen();
         return -1;
     }
+    fenced = 0;
     int bad = 0;
     for (int i = 0; i < n_qps; i++) if (R.destroy_qp(qps[i]->real)) bad++; else qps[i]->real = NULL;
     for (int i = 0; i < n_cqs; i++) if (R.destroy_cq(cqs[i]->real)) bad++; else cqs[i]->real = NULL;
@@ -1048,7 +1079,7 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
             snprintf(reply, n, "err alloc_pd: %s", strerror(errno));
             bad = 1;
         }
-    map_clear(&lkeys);
+    for (int i = 0; i < n_ctxs; i++) map_clear(&ctxs[i]->lkeys);
     for (int i = 0; i < n_mrs && !bad; i++) {
         struct vmr *m = mrs[i];
         if (!m->real) {
@@ -1069,7 +1100,7 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
                 break;
             }
         }
-        map_put(&lkeys, m->v.lkey, m->real->lkey);
+        map_put(&m->pd->c->lkeys, m->v.lkey, m->real->lkey);
     }
     for (int i = 0; i < n_cqs && !bad; i++) {
         struct vcq *q = cqs[i];
@@ -1078,8 +1109,7 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
             bad = 1;
         }
     }
-    map_clear(&qpn_v);
-    map_clear(&qpn_slot);
+    for (int i = 0; i < n_ctxs; i++) map_clear(&ctxs[i]->qpn_v), map_clear(&ctxs[i]->qpn_slot);
     for (int i = 0; i < n_qps && !bad; i++) {
         struct vqp *q = qps[i];
         if (!q->real) {
@@ -1101,7 +1131,7 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
             for (int k = 0; k < q->n_recvs; k++) {
                 struct recv_rec *rr = &q->recvs[k];
                 struct ibv_sge sg[4];
-                for (int j = 0; j < rr->n; j++) sg[j] = rr->sg[j], sg[j].lkey = lkey_of(sg[j].lkey);
+                for (int j = 0; j < rr->n; j++) sg[j] = rr->sg[j], sg[j].lkey = lkey_of(q->pd->c, sg[j].lkey);
                 struct ibv_recv_wr w = { .wr_id = rr->wr_id, .sg_list = sg, .num_sge = rr->n }, *b;
                 if (q->real->context->ops.post_recv(q->real, &w, &b)) {
                     snprintf(reply, n, "err post a receive again on queue pair %u", q->v.qp_num);
@@ -1110,8 +1140,8 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
                 }
             }
         }
-        map_put(&qpn_v, q->real->qp_num, q->v.qp_num);
-        if (q->slot >= 0) map_put(&qpn_slot, q->real->qp_num, q->slot);
+        map_put(&q->pd->c->qpn_v, q->real->qp_num, q->v.qp_num);
+        if (q->slot >= 0) map_put(&q->pd->c->qpn_slot, q->real->qp_num, q->slot);
     }
     int nq = n_qps;
     pthread_mutex_unlock(&omu);
@@ -1255,7 +1285,13 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
 }
 
 /* Let NCCL's verbs calls run again (gpushare "resume"). */
-EXPORT void nvsnap_ibv_open(void) { reopen(); }
+EXPORT void nvsnap_ibv_open(void)
+{
+    pthread_mutex_lock(&omu);
+    fenced = 0;
+    pthread_mutex_unlock(&omu);
+    reopen();
+}
 
 /* How many RDMA devices NCCL has open (it opens them even when it
  * connects no queue pair: one node, NVLink only). */

@@ -1223,6 +1223,38 @@ static void do_poll(char *reply, size_t n, int step)
     }
 }
 
+/* ── NCCL's verbs ─────────────────────────────────────────────────────
+ * With NCCL_IBVERBS_LIB naming libnvsnap_ibv.so, NCCL's RDMA devices,
+ * queue pairs and registrations are destroyed at "release" and created
+ * again at "load", on the NICs the process has then; "quiesce" first
+ * lets every send NCCL posted complete; "fabmap" adds their
+ * new numbers to the exchange and "remap" reconnects them (see
+ * nvsnap_ibv.c). */
+static struct {
+    int (*fence)(char *, size_t), (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
+    int (*connect)(const char *, char *, size_t), (*count)(void);
+    void (*open)(void);
+} ibv;
+
+/* NCCL's RDMA devices open through libnvsnap_ibv (0: none, or not loaded). */
+static int ibv_devices(void)
+{
+    if (!ibv.count) {
+        void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) return 0;
+        *(void **)&ibv.fence = real_dlsym(h, "nvsnap_ibv_fence");
+        *(void **)&ibv.suspend = real_dlsym(h, "nvsnap_ibv_suspend");
+        *(void **)&ibv.restore = real_dlsym(h, "nvsnap_ibv_restore");
+        *(void **)&ibv.map = real_dlsym(h, "nvsnap_ibv_map");
+        *(void **)&ibv.connect = real_dlsym(h, "nvsnap_ibv_connect");
+        *(void **)&ibv.open = real_dlsym(h, "nvsnap_ibv_open");
+        if (!ibv.fence || !ibv.suspend || !ibv.restore || !ibv.map || !ibv.connect || !ibv.open) return 0;
+        *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
+        if (!ibv.count) return 0;
+    }
+    return ibv.count();
+}
+
 /* Hold launches, drain GPU work, and check that "release" can drop every
  * shared mapping. Separate from "release" so that a busy or refusing
  * process leaves every process's mappings untouched. */
@@ -1285,6 +1317,10 @@ static void do_quiesce(char *reply, size_t n)
         if (b->memh && b->memh_released && !(b->ucva = lmap_va(b->memh)))
             snprintf(reply, n, "err memory bound to a multicast object is neither held nor mapped");
     }
+    /* NCCL's sends complete while every peer still has its queue pairs. */
+    char fq[200];
+    if (!reply[0] && ibv_devices() > 0 && ibv.fence(fq, sizeof(fq)) < 0)
+        snprintf(reply, n, "err busy (NCCL verbs: %s)", fq + (strncmp(fq, "err ", 4) ? 0 : 4));
     if (reply[0]) gate_open();
     else {
         verify_log("quiesce");
@@ -1325,36 +1361,6 @@ static int void_export_copies(void)
     if (d) closedir(d);
     if (nul >= 0) close(nul);
     return nv;
-}
-
-/* ── NCCL's verbs ─────────────────────────────────────────────────────
- * With NCCL_IBVERBS_LIB naming libnvsnap_ibv.so, NCCL's RDMA devices,
- * queue pairs and registrations are destroyed at "release" and created
- * again at "load", on the NICs the process has then; "fabmap" adds their
- * new numbers to the exchange and "remap" reconnects them (see
- * nvsnap_ibv.c). */
-static struct {
-    int (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
-    int (*connect)(const char *, char *, size_t), (*count)(void);
-    void (*open)(void);
-} ibv;
-
-/* NCCL's RDMA devices open through libnvsnap_ibv (0: none, or not loaded). */
-static int ibv_devices(void)
-{
-    if (!ibv.count) {
-        void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_NOLOAD);
-        if (!h) return 0;
-        *(void **)&ibv.suspend = real_dlsym(h, "nvsnap_ibv_suspend");
-        *(void **)&ibv.restore = real_dlsym(h, "nvsnap_ibv_restore");
-        *(void **)&ibv.map = real_dlsym(h, "nvsnap_ibv_map");
-        *(void **)&ibv.connect = real_dlsym(h, "nvsnap_ibv_connect");
-        *(void **)&ibv.open = real_dlsym(h, "nvsnap_ibv_open");
-        if (!ibv.suspend || !ibv.restore || !ibv.map || !ibv.connect || !ibv.open) return 0;
-        *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
-        if (!ibv.count) return 0;
-    }
-    return ibv.count();
 }
 
 /* args "<store> <ckpt-dir> [cache]": save the cuMemAlloc allocations to a

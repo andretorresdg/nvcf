@@ -325,12 +325,15 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
 - NCCL gets shadow objects. The queue pair numbers, memory keys, LIDs and GIDs
   it reads, and has sent its peers, keep their values for the life of the
   process. Each post and poll goes to the real object underneath, with the
-  keys and numbers translated to the real ones.
-- `release` first lets every send NCCL posted complete: a signaled
-  zero-length write (a read, on a queue pair that allows only reads)
-  completes after them. It then empties every completion queue, and keeps the
-  completions nobody had polled yet for NCCL. Then every queue pair, completion
-  queue, registration, protection domain and device is destroyed, so the
+  keys and numbers translated to the real ones, per device (two NICs can
+  give out the same key or queue pair number).
+- `quiesce`, once GPU work has drained, lets every send NCCL posted
+  complete: a signaled zero-length write (a read, on a queue pair that allows
+  only reads) completes after them. The sends need their peers' queue pairs,
+  and no node releases before every node has quiesced. Completions nobody had
+  polled yet are kept for NCCL.
+- `release` empties every completion queue, then destroys every queue pair,
+  completion queue, registration, protection domain and device, so the
   process holds no RDMA device file.
 - `load`, once GPU memory is back, opens the devices of the same name and
   creates every object again. GPU memory registered through a dma-buf gets a

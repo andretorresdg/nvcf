@@ -40,9 +40,12 @@ FAKE = r"""
 #include <stdlib.h>
 #include <string.h>
 
-static int epoch, counter, open_ctxs;
-static struct ibv_device dev = { .node_type = IBV_NODE_CA, .transport_type = IBV_TRANSPORT_IB, .name = "fake0" };
-static struct ibv_device *devs[2] = { &dev, NULL };
+/* Two devices that number their keys and queue pairs alike, as NICs do. */
+static int epoch, counter[2], open_ctxs;
+static struct ibv_device dev0 = { .node_type = IBV_NODE_CA, .transport_type = IBV_TRANSPORT_IB, .name = "fake0" };
+static struct ibv_device dev1 = { .node_type = IBV_NODE_CA, .transport_type = IBV_TRANSPORT_IB, .name = "fake1" };
+static struct ibv_device *devs[3] = { &dev0, &dev1, NULL };
+static int di(struct ibv_context *c) { return c->device == &dev1; }
 
 struct fmr { struct ibv_mr m; int live; };
 struct fwc { struct ibv_wc w; };
@@ -53,15 +56,15 @@ struct fqp { struct ibv_qp q; uint32_t dest; union ibv_gid dgid; uint16_t dlid; 
 static struct fmr *mrs[256]; static int n_mrs;
 static struct fqp *qps[256]; static int n_qps;
 
-static void gid_of(int e, union ibv_gid *g)
+static void gid_of(int e, int d, union ibv_gid *g)
 {
     memset(g, 0, sizeof(*g));
     g->raw[10] = g->raw[11] = 0xff;
-    g->raw[12] = 10; g->raw[15] = 1 + e;
+    g->raw[12] = 10; g->raw[14] = d; g->raw[15] = 1 + e;
 }
 
 int fake_open_contexts(void) { return open_ctxs; }
-void fake_move(void) { epoch++; counter = 0; }
+void fake_move(void) { epoch++; counter[0] = counter[1] = 0; }
 
 static void push(struct fcq *c, struct ibv_wc w) { if (c->n < 256) c->q[c->n++] = w; }
 
@@ -75,10 +78,12 @@ static int poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc)
     return k;
 }
 
-static struct fmr *mr_by(uint32_t key, int remote)
+/* A key of device c's (queue pairs here connect within one device). */
+static struct fmr *mr_by(uint32_t key, int remote, struct ibv_context *c)
 {
     for (int i = 0; i < n_mrs; i++)
-        if (mrs[i]->live && (remote ? mrs[i]->m.rkey : mrs[i]->m.lkey) == key) return mrs[i];
+        if (mrs[i]->live && mrs[i]->m.context->device == c->device &&
+            (remote ? mrs[i]->m.rkey : mrs[i]->m.lkey) == key) return mrs[i];
     return NULL;
 }
 
@@ -86,23 +91,24 @@ static int post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_
 {
     struct fqp *s = (struct fqp *)qp;
     union ibv_gid me;
-    gid_of(epoch, &me);
+    gid_of(epoch, di(qp->context), &me);
     for (; wr; wr = wr->next) {
         int status = IBV_WC_SUCCESS;
         struct fqp *d = NULL;
-        for (int i = 0; i < n_qps; i++) if (qps[i]->live && qps[i]->q.qp_num == s->dest) d = qps[i];
+        for (int i = 0; i < n_qps; i++)
+            if (qps[i]->live && qps[i]->q.context->device == qp->context->device && qps[i]->q.qp_num == s->dest) d = qps[i];
         if (s->q.state != IBV_QPS_RTS || !d || (s->global ? memcmp(s->dgid.raw, me.raw, 16) : s->dlid != 1 + epoch))
             status = IBV_WC_RETRY_EXC_ERR;
         size_t len = 0;
         for (int j = 0; j < wr->num_sge; j++) len += wr->sg_list[j].length;
         if (!status && len) {
-            struct fmr *rm = mr_by(wr->wr.rdma.rkey, 1);
+            struct fmr *rm = mr_by(wr->wr.rdma.rkey, 1, qp->context);
             if (!rm || wr->wr.rdma.remote_addr < (uintptr_t)rm->m.addr ||
                 wr->wr.rdma.remote_addr + len > (uintptr_t)rm->m.addr + rm->m.length)
                 status = IBV_WC_REM_ACCESS_ERR;
             char *to = (char *)(uintptr_t)wr->wr.rdma.remote_addr;
             for (int j = 0; !status && j < wr->num_sge; j++) {
-                if (!mr_by(wr->sg_list[j].lkey, 0)) { status = IBV_WC_LOC_PROT_ERR; break; }
+                if (!mr_by(wr->sg_list[j].lkey, 0, qp->context)) { status = IBV_WC_LOC_PROT_ERR; break; }
                 memcpy(to, (void *)(uintptr_t)wr->sg_list[j].addr, wr->sg_list[j].length);
                 to += wr->sg_list[j].length;
             }
@@ -130,7 +136,7 @@ static int post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_recv_
 {
     struct fqp *q = (struct fqp *)qp;
     for (; wr; wr = wr->next) {
-        if (q->nr == 64 || (wr->num_sge && !mr_by(wr->sg_list[0].lkey, 0))) { *bad = wr; return EINVAL; }
+        if (q->nr == 64 || (wr->num_sge && !mr_by(wr->sg_list[0].lkey, 0, qp->context))) { *bad = wr; return EINVAL; }
         q->r[q->nr].wr_id = wr->wr_id;
         if (wr->num_sge) q->r[q->nr].sg = wr->sg_list[0];
         q->nr++;
@@ -138,7 +144,7 @@ static int post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_recv_
     return 0;
 }
 
-struct ibv_device **(ibv_get_device_list)(int *n) { if (n) *n = 1; return devs; }
+struct ibv_device **(ibv_get_device_list)(int *n) { if (n) *n = 2; return devs; }
 void ibv_free_device_list(struct ibv_device **l) { (void)l; }
 const char *ibv_get_device_name(struct ibv_device *d) { return d->name; }
 struct ibv_context *ibv_open_device(struct ibv_device *d)
@@ -163,9 +169,9 @@ int (ibv_query_port)(struct ibv_context *c, uint8_t p, struct _compat_ibv_port_a
 }
 int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g)
 {
-    (void)c; (void)p;
-    if (i != 3) { memset(g, 0, sizeof(*g)); g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[15] = i; return 0; }
-    gid_of(epoch, g);
+    (void)p;
+    if (i != 3) { memset(g, 0, sizeof(*g)); g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return 0; }
+    gid_of(epoch, di(c), g);
     return 0;
 }
 int ibv_query_pkey(struct ibv_context *c, uint8_t p, int i, __be16 *k) { (void)c; (void)p; (void)i; *k = 0xffff; return 0; }
@@ -178,7 +184,8 @@ struct ibv_mr *(ibv_reg_mr)(struct ibv_pd *pd, void *addr, size_t len, int acces
     (void)access;
     struct fmr *m = calloc(1, sizeof(*m));
     m->m.pd = pd; m->m.context = pd->context; m->m.addr = addr; m->m.length = len;
-    m->m.lkey = 5000 + 1000 * epoch + counter; m->m.rkey = 7000 + 1000 * epoch + counter++;
+    int d = di(pd->context);
+    m->m.lkey = 5000 + 1000 * epoch + counter[d]; m->m.rkey = 7000 + 1000 * epoch + counter[d]++;
     m->live = 1;
     mrs[n_mrs++] = m;
     return &m->m;
@@ -196,7 +203,7 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *a)
 {
     struct fqp *q = calloc(1, sizeof(*q));
     q->q.context = pd->context; q->q.pd = pd; q->q.send_cq = a->send_cq; q->q.recv_cq = a->recv_cq;
-    q->q.qp_num = 100 + 1000 * epoch + counter++; q->q.state = IBV_QPS_RESET; q->q.qp_type = a->qp_type;
+    q->q.qp_num = 100 + 1000 * epoch + counter[di(pd->context)]++; q->q.state = IBV_QPS_RESET; q->q.qp_type = a->qp_type;
     q->live = 1;
     qps[n_qps++] = q;
     return &q->q;
@@ -245,6 +252,7 @@ int main(int argc, char **argv)
 {
     void *h = dlopen(argv[1], RTLD_NOW);
     if (!h) { printf("dlopen %s\n", dlerror()); return 2; }
+    int (*fence)(char *, size_t) = dlsym(h, "nvsnap_ibv_fence");
     int (*suspend)(char *, size_t) = dlsym(h, "nvsnap_ibv_suspend");
     int (*restore)(char *, size_t) = dlsym(h, "nvsnap_ibv_restore");
     int (*map)(FILE *) = dlsym(h, "nvsnap_ibv_map");
@@ -263,42 +271,55 @@ int main(int argc, char **argv)
     if (!fake) { printf("the library did not load the real verbs\n"); return 2; }
     int (*open_ctxs)(void) = dlsym(fake, "fake_open_contexts");
     void (*move)(void) = dlsym(fake, "fake_move");
-    struct ibv_context *c = p_ibv_open_device(l[0]);
-    struct ibv_pd *pd = p_ibv_alloc_pd(c);
-    static char src[64], dst[64];
-    struct ibv_mr *ms = regmr(pd, src, sizeof(src), 0), *md = regmr(pd, dst, sizeof(dst), 7);
-    struct ibv_cq *cq = p_ibv_create_cq(c, 64, NULL, NULL, 0);
-    struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
-                                   .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 1 } };
-    struct ibv_qp *a = p_ibv_create_qp(pd, &ia), *b = p_ibv_create_qp(pd, &ia);
-    union ibv_gid gid;
-    p_ibv_query_gid(c, 1, 3, &gid);
-    qport(c, 1, &pa);
-    /* What NCCL keeps and sends its peer: numbers, keys, GID and LID. */
-    uint32_t qa = a->qp_num, qb = b->qp_num, rkey = md->rkey, lkey = ms->lkey;
-    struct ibv_qp *pair[2][2] = { { a, b }, { b, a } };
-    for (int i = 0; i < 2; i++) {
-        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1 };
-        p_ibv_modify_qp(pair[i][0], &x, IBV_QP_STATE | IBV_QP_PORT);
-        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = pair[i][1]->qp_num,
-                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
-                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
-        p_ibv_modify_qp(pair[i][0], &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
-        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
-        p_ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
+    /* The same objects on both devices: their numbers and keys collide. */
+    enum { D = 2 };
+    struct ibv_qp *a[D], *b[D];
+    struct ibv_cq *cq[D];
+    uint32_t qa[D], qb[D], rkey[D], lkey[D];
+    static char src[D][64], dst[D][64];
+    for (int d = 0; d < D; d++) {
+        struct ibv_context *c = p_ibv_open_device(l[d]);
+        struct ibv_pd *pd = p_ibv_alloc_pd(c);
+        struct ibv_mr *ms = regmr(pd, src[d], sizeof(src[d]), 0), *md = regmr(pd, dst[d], sizeof(dst[d]), 7);
+        cq[d] = p_ibv_create_cq(c, 64, NULL, NULL, 0);
+        struct ibv_qp_init_attr ia = { .send_cq = cq[d], .recv_cq = cq[d], .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 1 } };
+        a[d] = p_ibv_create_qp(pd, &ia), b[d] = p_ibv_create_qp(pd, &ia);
+        union ibv_gid gid;
+        p_ibv_query_gid(c, 1, 3, &gid);
+        qport(c, 1, &pa);
+        /* What NCCL keeps and sends its peer: numbers, keys, GID and LID. */
+        qa[d] = a[d]->qp_num, qb[d] = b[d]->qp_num, rkey[d] = md->rkey, lkey[d] = ms->lkey;
+        struct ibv_qp *pair[2][2] = { { a[d], b[d] }, { b[d], a[d] } };
+        for (int i = 0; i < 2; i++) {
+            struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1 };
+            p_ibv_modify_qp(pair[i][0], &x, IBV_QP_STATE | IBV_QP_PORT);
+            struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = pair[i][1]->qp_num,
+                                     .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                                  .grh = { .dgid = gid, .sgid_index = 3 } } };
+            p_ibv_modify_qp(pair[i][0], &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+            struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+            p_ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
+        }
     }
+    printf("same_numbers=%d\n", qa[0] == qa[1] && lkey[0] == lkey[1] && rkey[0] == rkey[1]);
     struct ibv_wc wc[8];
     int got;
+    struct ibv_send_wr *wb;
     for (int round = 0; round < 2; round++) {
-        /* A receive on b, posted now, completed by the write after the suspend. */
-        struct ibv_recv_wr rw = { .wr_id = 40 + round }, *rb;
-        if (b->context->ops.post_recv(b, &rw, &rb)) { printf("post_recv failed\n"); return 1; }
-        /* A signaled write from a nobody polls before the suspend. */
-        struct ibv_sge sg0 = { (uintptr_t)src, 4, lkey };
-        struct ibv_send_wr w0 = { .wr_id = 7, .sg_list = &sg0, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
-                                  .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst + 32, rkey } } }, *wb;
-        if (a->context->ops.post_send(a, &w0, &wb)) { printf("post_send failed\n"); return 1; }
+        for (int d = 0; d < D; d++) {
+            /* A receive on b, posted now, completed by the write after the suspend. */
+            struct ibv_recv_wr rw = { .wr_id = 40 + round }, *rb;
+            if (b[d]->context->ops.post_recv(b[d], &rw, &rb)) { printf("post_recv failed\n"); return 1; }
+            /* A signaled write from a nobody polls before the suspend. */
+            struct ibv_sge sg0 = { (uintptr_t)src[d], 4, lkey[d] };
+            struct ibv_send_wr w0 = { .wr_id = 7, .sg_list = &sg0, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                      .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst[d] + 32, rkey[d] } } };
+            if (a[d]->context->ops.post_send(a[d], &w0, &wb)) { printf("post_send failed\n"); return 1; }
+        }
         char rep[256];
+        /* Round 1 as gpushare does it: fence at "quiesce", then "release". */
+        if (round == 1 && fence(rep, sizeof(rep))) { printf("fence: %s\n", rep); return 1; }
         if (suspend(rep, sizeof(rep))) { printf("suspend: %s\n", rep); return 1; }
         printf("round=%d suspended=%s open_after_suspend=%d\n", round, rep, open_ctxs());
         move();
@@ -311,24 +332,27 @@ int main(int argc, char **argv)
         if (connect(path, rep, sizeof(rep))) { printf("connect: %s\n", rep); return 1; }
         unlink(path);
         open_();
-        printf("lines=%d qa_now=%u qb_now=%u\n", lines, a->qp_num, b->qp_num);
-        /* NCCL's numbers and keys, from before. */
-        snprintf(src, sizeof(src), "hello %d", round);
-        struct ibv_sge sg = { (uintptr_t)src, 8, lkey };
-        struct ibv_send_wr w = { .wr_id = 9, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
-                                 .send_flags = IBV_SEND_SIGNALED, .imm_data = 77,
-                                 .wr = { .rdma = { (uintptr_t)dst, rkey } } };
-        if (a->context->ops.post_send(a, &w, &wb)) { printf("post_send after restore failed\n"); return 1; }
-        int held = 0, wrote = 0, recvd = 0, bad = 0;
-        for (int t = 0; t < 4 && (got = cq->context->ops.poll_cq(cq, 8, wc)) >= 0; t++)
-            for (int i = 0; i < got; i++) {
-                if (wc[i].status) { bad++; printf("wc status %d wr_id %lu\n", wc[i].status, (unsigned long)wc[i].wr_id); }
-                else if (wc[i].wr_id == 7 && wc[i].qp_num == qa) held++;
-                else if (wc[i].wr_id == 9 && wc[i].qp_num == qa) wrote++;
-                else if (wc[i].wr_id == (uint64_t)(40 + round) && wc[i].qp_num == qb && wc[i].imm_data == 77) recvd++;
-                else { bad++; printf("unexpected wc wr_id %lu qp %u\n", (unsigned long)wc[i].wr_id, wc[i].qp_num); }
-            }
-        printf("held=%d wrote=%d recvd=%d bad=%d data=%s\n", held, wrote, recvd, bad, strncmp(dst, src, 8) ? "wrong" : "ok");
+        printf("lines=%d\n", lines);
+        for (int d = 0; d < D; d++) {
+            /* NCCL's numbers and keys, from before. */
+            snprintf(src[d], sizeof(src[d]), "hello%d%d", d, round);
+            struct ibv_sge sg = { (uintptr_t)src[d], 8, lkey[d] };
+            struct ibv_send_wr w = { .wr_id = 9, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+                                     .send_flags = IBV_SEND_SIGNALED, .imm_data = 77,
+                                     .wr = { .rdma = { (uintptr_t)dst[d], rkey[d] } } };
+            if (a[d]->context->ops.post_send(a[d], &w, &wb)) { printf("post_send after restore failed\n"); return 1; }
+            int held = 0, wrote = 0, recvd = 0, bad = 0;
+            for (int t = 0; t < 4 && (got = cq[d]->context->ops.poll_cq(cq[d], 8, wc)) >= 0; t++)
+                for (int i = 0; i < got; i++) {
+                    if (wc[i].status) { bad++; printf("wc status %d wr_id %lu\n", wc[i].status, (unsigned long)wc[i].wr_id); }
+                    else if (wc[i].wr_id == 7 && wc[i].qp_num == qa[d]) held++;
+                    else if (wc[i].wr_id == 9 && wc[i].qp_num == qa[d]) wrote++;
+                    else if (wc[i].wr_id == (uint64_t)(40 + round) && wc[i].qp_num == qb[d] && wc[i].imm_data == 77) recvd++;
+                    else { bad++; printf("unexpected wc wr_id %lu qp %u\n", (unsigned long)wc[i].wr_id, wc[i].qp_num); }
+                }
+            printf("held=%d wrote=%d recvd=%d bad=%d data=%s\n", held, wrote, recvd, bad,
+                   strncmp(dst[d], src[d], 8) ? "wrong" : "ok");
+        }
     }
     return 0;
 }
@@ -368,12 +392,13 @@ class Ibv(unittest.TestCase):
         for r in (0, 1):  # two checkpoints in a row
             sus = [x for x in rounds if x.get("round") == str(r)][0]
             self.assertEqual(sus["open_after_suspend"], "0", p.stdout)
+        self.assertIn("same_numbers=1", p.stdout)  # two NICs, the same keys and queue pair numbers
         done = [x for x in rounds if "held" in x]
-        self.assertEqual(len(done), 2, p.stdout + p.stderr)
+        self.assertEqual(len(done), 4, p.stdout + p.stderr)  # 2 rounds x 2 devices
         for d in done:
             self.assertEqual(d, {"held": "1", "wrote": "1", "recvd": "1", "bad": "0", "data": "ok"}, p.stdout + p.stderr)
         moved = [x for x in rounds if "lines" in x]
-        self.assertGreaterEqual(int(moved[0]["lines"]), 5, p.stdout)  # a port, 2 keys, 2 queue pairs
+        self.assertGreaterEqual(int(moved[0]["lines"]), 10, p.stdout)  # per device: a port, 2 keys, 2 queue pairs
 
 
 if __name__ == "__main__":
