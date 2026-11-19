@@ -92,7 +92,13 @@ jobs:
            assert 'UseBASE64Intrinsics' in server, 'Missing Bazel server JVM flag'
            summary['jvms'].append(server)
           finally:
-           subprocess.run(args+['shutdown'],cwd=root,capture_output=True,timeout=30)
+           # Container teardown may reap a stopped JVM after the Bazel client
+           # has already waited for it. Cleanup must not hide collected facts.
+           try:
+            cleanup=subprocess.run(args+['shutdown'],cwd=root,capture_output=True,timeout=10)
+            summary['bazel_shutdown_exit_code']=cleanup.returncode
+           except subprocess.TimeoutExpired:
+            summary['bazel_shutdown_timed_out']=True
           summary['scope']='System JVM and actual isolated Bazel server; build actions, compiler workers, test JVMs and other runner variants were not exercised.'
           (evidence/'results.json').write_text(json.dumps(summary,indent=2)+'\n')
           print(json.dumps(summary,indent=2))
@@ -186,7 +192,13 @@ jobs:
            assert 'UseBASE64Intrinsics' in server, 'Missing Bazel server JVM flag'
            summary['jvms'].append(server)
           finally:
-           subprocess.run(args+['shutdown'],cwd=root,capture_output=True,timeout=30)
+           # Container teardown may reap a stopped JVM after the Bazel client
+           # has already waited for it. Cleanup must not hide collected facts.
+           try:
+            cleanup=subprocess.run(args+['shutdown'],cwd=root,capture_output=True,timeout=10)
+            summary['bazel_shutdown_exit_code']=cleanup.returncode
+           except subprocess.TimeoutExpired:
+            summary['bazel_shutdown_timed_out']=True
           summary['scope']='System JVM and actual isolated Bazel server; build actions, compiler workers, test JVMs and other runner variants were not exercised.'
           (evidence/'results.json').write_text(json.dumps(summary,indent=2)+'\n')
           print(json.dumps(summary,indent=2))
