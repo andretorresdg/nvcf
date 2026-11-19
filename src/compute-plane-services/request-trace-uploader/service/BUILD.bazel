@@ -81,6 +81,7 @@ go_test(
         "tuning_e2e_test.go",
         "tuning_internal_test.go",
         "unconfirmed_e2e_test.go",
+        "uptime_e2e_test.go",
         "version_e2e_test.go",
         "writer_version_e2e_test.go",
     ],

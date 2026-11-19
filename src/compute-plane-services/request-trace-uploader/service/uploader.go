@@ -391,6 +391,8 @@ func (u *Uploader) Run(ctx context.Context) error {
 		return err
 	}
 	slog.Info("request trace uploader ready", "backend", u.name)
+	readyAt := u.now()
+	u.reportUptime(readyAt)
 
 	// Work runs on its own context, so a create in flight at SIGTERM can
 	// finish and save its job id; the drain timeout bounds it.
@@ -415,7 +417,10 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// never delays it.
 	go func() {
 		defer loops.Done()
-		u.loop(work, stop, u.spoolCheckInterval(), u.checkSpool, nil, nil)
+		u.loop(work, stop, u.spoolCheckInterval(), func(ctx context.Context) error {
+			u.reportUptime(readyAt)
+			return u.checkSpool(ctx)
+		}, nil, nil)
 	}()
 
 	select {
@@ -438,6 +443,13 @@ func (u *Uploader) Run(ctx context.Context) error {
 	}
 	slog.Info("request trace uploader stopped", "drain_cut_short", work.Err() != nil)
 	return nil
+}
+
+// reportUptime sets the uptime gauge to the time since the uploader became
+// ready. It is set only from then on, so an uploader that never starts has
+// no uptime series, which is what the missing-telemetry alert looks for.
+func (u *Uploader) reportUptime(readyAt time.Time) {
+	u.metrics.Set(telemetry.Uptime, u.now().Sub(readyAt).Seconds(), nil)
 }
 
 // loop runs run now and then on every tick until stop or ctx ends. It also
@@ -488,7 +500,42 @@ func (u *Uploader) start(ctx context.Context) error {
 	return u.startErr
 }
 
+// startupFailure tags a startup error with the reason StartupFailureReason
+// reports for it.
+type startupFailure struct {
+	reason string
+	err    error
+}
+
+func (f startupFailure) Error() string { return f.err.Error() }
+func (f startupFailure) Unwrap() error { return f.err }
+
+// StartupFailureReason names why Run stopped before it was ready, as a
+// telemetry.StartupFailureReasons value: "secrets" for the secrets file,
+// "spool" for the spool directories, lock and journal, and "other" for
+// anything else.
+func StartupFailureReason(err error) string {
+	var failure startupFailure
+	if errors.As(err, &failure) {
+		return failure.reason
+	}
+	return "other"
+}
+
+// open runs the startup steps; a failure is a spool failure unless it is
+// the secrets file.
 func (u *Uploader) open(ctx context.Context) error {
+	if err := u.openSpool(ctx); err != nil {
+		var failure startupFailure
+		if errors.As(err, &failure) || errors.Is(err, errNotReady) {
+			return err
+		}
+		return startupFailure{reason: "spool", err: err}
+	}
+	return nil
+}
+
+func (u *Uploader) openSpool(ctx context.Context) error {
 	for _, dir := range []struct{ path, setting string }{
 		{u.cfg.StateDir, config.EnvStateDir},
 		{u.cfg.QuarantineDir, config.EnvQuarantineDir},
@@ -499,10 +546,10 @@ func (u *Uploader) open(ctx context.Context) error {
 	}
 	secret, err := os.Open(u.cfg.SecretsFile)
 	if err != nil {
-		return fmt.Errorf("open uploader secret file: %w", atomicfile.Pathless(err))
+		return startupFailure{reason: "secrets", err: fmt.Errorf("open uploader secret file: %w", atomicfile.Pathless(err))}
 	}
 	if err := secret.Close(); err != nil {
-		return fmt.Errorf("close uploader secret file: %w", atomicfile.Pathless(err))
+		return startupFailure{reason: "secrets", err: fmt.Errorf("close uploader secret file: %w", atomicfile.Pathless(err))}
 	}
 
 	store, err := journalfs.Open(ctx, journalfs.Config{

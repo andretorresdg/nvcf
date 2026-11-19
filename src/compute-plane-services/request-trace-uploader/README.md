@@ -23,7 +23,14 @@ volume, so every step survives a restart.
    an earlier uploader. It loads the journal, repairs what a crash left, and
    reports ready. Files another uploader left on the spool stay where they
    are. A journal entry whose source it cannot identify keeps the process
-   live and not ready until an operator acts.
+   live and not ready until an operator acts. Any other startup error, such
+   as an invalid setting, a missing secrets file or a directory it cannot
+   create, does not end the process either: the uploader logs it, uploads
+   nothing, and tries again after 10 seconds, doubling up to 5 minutes. As a
+   sidecar, an exiting container would make the whole pod unready. Each
+   failed attempt adds one to `startup_failures`, so an alert on its
+   increase finds a stuck uploader; the metrics export starts before the
+   uploader settings load, so a refused setting is counted too.
 2. Intake: each closed segment is fingerprinted (SHA-256) and recorded
    before it is read. The highest indexed segment is never read or deleted.
    Up to `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS` segments are prepared at
@@ -168,6 +175,13 @@ Rate, errors and duration of the export path:
   Dynamo v1.4.0 event type, or `unknown` for an unparseable line, an older
   release's record, or an event type this build does not know.
 
+- `uptime`, seconds: time since the uploader became ready, refreshed on the
+  spool check interval. It is absent while startup has not succeeded.
+- `startup_failures` (`reason`): startup attempts that failed and will be
+  retried: `config` (a refused setting), `backend`, `secrets` (the secrets
+  file), `spool` (directories, lock, journal), or `other`. Until the
+  uploader settings load, the `backend` attribute is the named backend if
+  this build links it, else `unknown`.
 - `backend_calls` (`operation`, `status`) and `backend_call.duration`
   (`operation`, `status`), seconds: each HTTP call a backend makes through
   the transport the core hands it (see Traces), by the operation the
@@ -389,8 +403,9 @@ Object-store submission is synchronous, so its first status poll reports the
 final outcome.
 
 The binary loads configuration strictly. An invalid or incompatible value,
-or an unknown name that starts with `REQUEST_TRACE_UPLOADER_`, stops startup
-with a non-zero exit. Errors name the setting, never its value.
+or an unknown name that starts with `REQUEST_TRACE_UPLOADER_`, stops startup:
+the process logs the error, uploads nothing and retries, counting each
+attempt in `startup_failures`. Errors name the setting, never its value.
 `config.Load` on its own still falls back to defaults with a warning, for
 callers that want that.
 
@@ -448,8 +463,8 @@ and values as the one the earlier shell exporter wrote; its JSON formatting
 can differ. `dropRecord` removes the record.
 
 An unparseable rule list, an unknown action or policy, a missing or repeated
-name, a rule with no value, or NCA ids without NCA id headers stops startup
-with a non-zero exit.
+name, a rule with no value, or NCA ids without NCA id headers stops startup:
+nothing uploads, and the process retries and counts each attempt.
 
 Counters: `records_suppressed` (`rule`, `action`: `strip_payload`,
 `drop_record`, or `strip_unresolved` for a record strict suppression
