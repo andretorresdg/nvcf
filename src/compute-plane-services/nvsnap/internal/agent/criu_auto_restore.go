@@ -87,6 +87,9 @@ type criuAutoRestorer struct {
 	// agentWaitSince: leader pod UID -> when its capture first found a
 	// node of the instance whose agent is not running yet.
 	agentWaitSince sync.Map
+	// bundleMissSince: placeholder pod UID -> bundleMiss, when a fetch
+	// first found the bundle version it needs on no peer.
+	bundleMissSince sync.Map
 	// fetchBundle fetches a bundle version from a peer; nil: the agent's
 	// own (tests stub it).
 	fetchBundle func(ctx context.Context, id string) error

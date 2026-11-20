@@ -46,7 +46,17 @@ deleted:
 5. **A missing version is fetched.** A placeholder scheduled to a node without
    its version cannot start (the hostPath must exist). The node's agent sees
    it and fetches the version from a peer agent that has it (the capture's node
-   always does: its checkpoint keeps the version alive there).
+   does while it is in the cluster: its checkpoint keeps the version alive
+   there). When every agent of the node's architecture answers that it does
+   not have the version, no agent is being replaced, and that still holds two
+   minutes later, the restore cannot run: the agent blocks the checkpoint,
+   records the restore as not run (reason `bundle_unavailable`) and deletes
+   the placeholder (for an instance, all its placeholders), so its
+   replacement starts cold (`restoreWithoutBundle`,
+   `internal/agent/bundle_versions.go`). Any other answer (a peer not
+   answering, an error, a node whose architecture cannot be read) may pass,
+   and the placeholder waits for the next try. A companion, which starts
+   without its version, is never given up this way.
 6. **Unused versions are removed.** The checkpoint reaper deletes a version
    that is not current, not mounted by any pod on the node, not recorded by
    any checkpoint on the node, and older than an hour.

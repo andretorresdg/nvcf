@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -196,7 +197,7 @@ func (a *Agent) bundleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := filepath.Join(a.bundleVersionsDir(), id)
 	if _, err := os.Stat(dir); err != nil { //nolint:gosec // id passed validBundleID: hex, no separators
-		http.Error(w, "no such bundle version on this node", http.StatusNotFound)
+		http.Error(w, bundleAbsentText, http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-tar")
@@ -204,6 +205,11 @@ func (a *Agent) bundleHandler(w http.ResponseWriter, r *http.Request) {
 		a.log.WithError(err).WithField("bundle", id).Warn("serving a bundle version failed")
 	}
 }
+
+// bundleAbsentText is the body of a peer's 404 for a version it does not
+// have. A 404 without it (a route the peer does not serve) says nothing
+// about the version.
+const bundleAbsentText = "no such bundle version on this node"
 
 // writeBundleTar writes the regular files, directories and symlinks under dir
 // as a tar stream.
@@ -405,9 +411,14 @@ func (c *criuAutoRestorer) ensurePlaceholderBundles(ctx context.Context, pod *co
 				fetch = c.a.fetchBundle
 			}
 			if err := fetch(ctx, id); err != nil {
+				if errors.Is(err, errBundleNotOnAnyPeer) && c.restoreWithoutBundle(ctx, pod, id, err, log) {
+					return
+				}
+				c.bundleMissSince.Delete(pod.UID)
 				log.WithError(err).Warn("cannot fetch the bundle version a pod needs; it waits")
 				return
 			}
+			c.bundleMissSince.Delete(pod.UID)
 			log.Info("fetched the bundle version a pod needs from a peer")
 			c.ensureCompanionToolsFor(pod, id)
 		}(id)
@@ -427,8 +438,140 @@ func (c *criuAutoRestorer) ensureCompanionToolsFor(pod *corev1.Pod, id string) {
 	}
 }
 
+// bundleMissConfirm is how long a version must stay on no peer before a
+// placeholder that needs it is given up: a node whose agent is between
+// two pods is not asked, and may have it. Pod events (the informer's
+// resync included) bring the fetch again within it.
+var bundleMissConfirm = 2 * time.Minute
+
+// bundleMiss is when a fetch first found a placeholder's version on no
+// peer (bundleMissConfirm).
+type bundleMiss struct {
+	id string
+	at time.Time
+}
+
+// restoreWithoutBundle ends the restore of placeholder pod, which needs
+// bundle version id that no peer has (errBundleNotOnAnyPeer, cause): the
+// pod cannot start, so its restore would never run and its failure path
+// never be reached. The checkpoint is blocked, as for a restore that
+// failed, and the pod is disposed of (a group's placeholders all), so its
+// replacement starts cold. It reports false for a pod this does not apply
+// to, which waits as before.
+func (c *criuAutoRestorer) restoreWithoutBundle(ctx context.Context, pod *corev1.Pod, id string, cause error, log *logrus.Entry) bool {
+	if !restoreNeedsBundle(pod, id) {
+		return false
+	}
+	now := time.Now()
+	v, _ := c.bundleMissSince.LoadOrStore(pod.UID, bundleMiss{id: id, at: now})
+	miss := v.(bundleMiss)
+	if miss.id != id {
+		miss = bundleMiss{id: id, at: now}
+		c.bundleMissSince.Store(pod.UID, miss)
+	}
+	if now.Sub(miss.at) < bundleMissConfirm {
+		log.WithError(cause).Warn("no peer agent has the bundle version a restore placeholder needs; the pod starts cold if none has it a little later")
+		return true
+	}
+	why, err := c.restoreRefusal(ctx, pod)
+	if err != nil {
+		log.WithError(err).Warn("CRIU restore: no peer has the placeholder's bundle version, but its restore cannot be verified yet; trying again on its next event")
+		return true
+	}
+	if why != "" {
+		// As admitted: a pod naming a restore it may not have gets
+		// nothing, not even its checkpoint blocked.
+		log.WithField("reason", why).Warn("CRIU restore refused: no peer has the placeholder's bundle version, and the pod names a restore it may not have; leaving it as it is")
+		return true
+	}
+	ctx = context.WithoutCancel(ctx)
+	ckpt := pod.Annotations[webhook.CRIURestoreAnnotation]
+	key := pod.Annotations[webhook.CRIUGroupAnnotation]
+	cause = fmt.Errorf("%s: %s: %w", metrics.BundleUnavailableText, id, cause)
+	log = log.WithField("checkpoint", ckpt)
+	// Blocked first: a replacement admitted before the block would be a
+	// placeholder of the same checkpoint, on a node that may lack the
+	// version too. Unblocked, the pod is kept and this is tried again on
+	// its next event.
+	if err := c.markFailed(ctx, ckpt, cause); err != nil {
+		log.WithError(err).Error("CRIU restore: no peer has the placeholder's bundle version, and its checkpoint cannot be blocked; trying again on the pod's next event")
+		return true
+	}
+	if isGroupPlaceholder(pod) {
+		// The webhook admits no rank of an instance once any checkpoint
+		// of its capture is blocked, so ending the group as not run
+		// (failGroup) deletes placeholders whose replacements all start
+		// cold.
+		log.WithError(cause).Error("CRIU group restore cannot run: no peer has a placeholder's bundle version; its checkpoint is blocked and the instance starts cold")
+		c.failGroup(ctx, groupLeaderOf(ctx, c.a, pod, key), key, false, cause, log)
+		return true
+	}
+	log.WithError(cause).Error("CRIU restore cannot run: no peer has the placeholder's bundle version; its checkpoint is blocked and the pod starts cold")
+	c.observeRestore(key, pod, c.a.nodeGPU(ctx, c.a.config.NodeName), 1, metrics.RestoreNotRun, cause, 0, log)
+	c.a.disposeFailedPlaceholder(ctx, pod.Namespace, pod.Name, pod.UID, pod.Annotations[webhook.CRIURestoreContainerAnnotation], log)
+	return true
+}
+
+// restoreNeedsBundle reports whether pod is a restore placeholder, not yet
+// restored or given up, that cannot start without version id: it mounts it
+// for its checkpoint, not only as the version the webhook mounts on every
+// pod (its helper), which an agent rollout stages on every node. A
+// companion starts without its version (companion_tools.go), so it never
+// waits on it.
+func restoreNeedsBundle(pod *corev1.Pod, id string) bool {
+	if pod.Annotations[webhook.CRIURestoreAnnotation] == "" || pod.Annotations[webhook.CRIURestoreContainerAnnotation] == "" ||
+		pod.Annotations[webhook.CRIURestoredAnnotation] != "" || coldStarted(pod) || pod.DeletionTimestamp != nil ||
+		pod.Status.Phase != corev1.PodPending || isCompanion(pod) || mountsAnyCompanionTools(pod) {
+		return false
+	}
+	needs := false
+	for i := range pod.Spec.Volumes {
+		v := &pod.Spec.Volumes[i]
+		if v.HostPath == nil || !strings.HasSuffix(v.HostPath.Path, "/"+webhook.BundleVersionsDir+"/"+id) {
+			continue
+		}
+		if v.Name == modelvolume.HelperVolumeName {
+			return false
+		}
+		needs = true
+	}
+	return needs
+}
+
+// groupLeaderOf is the rank 0 placeholder of pod's instance under group
+// key, whose restore ends the group's; pod itself when it cannot be found.
+func groupLeaderOf(ctx context.Context, a *Agent, pod *corev1.Pod, key string) *corev1.Pod {
+	pods, err := a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return pod
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if o, _, ok := podRank(p, webhook.CRIUGroupOrdinalAnnotation, webhook.CRIUGroupSizeAnnotation); ok && o == 0 &&
+			p.DeletionTimestamp == nil && p.Annotations[webhook.CRIUGroupAnnotation] == key && !isCompanion(p) && groupMember(pod, p) {
+			return p
+		}
+	}
+	return pod
+}
+
+// errBundleNotOnPeer is a peer agent's answer that it does not have the
+// bundle version asked for.
+var errBundleNotOnPeer = errors.New("the peer agent does not have the bundle version")
+
+// errBundleNotOnAnyPeer is a fetch that cannot succeed later either: every
+// agent of this node's architecture but this one was asked and answered
+// that it does not have the version, while no agent was being replaced.
+// A version is staged only as an agent's current one, and a placeholder's
+// own (an older one its checkpoint recorded) is never staged again, so
+// none of them will get it. With no such agent at all, nothing can serve
+// it either: the same answer.
+var errBundleNotOnAnyPeer = errors.New("no peer agent has the bundle version")
+
 // fetchBundle copies bundle version id from the first peer agent that
-// has it.
+// has it. It fails with errBundleNotOnAnyPeer only when no peer could have
+// it; any other failure (a peer not answering, an unreadable node, an
+// agent rollout) may pass.
 func (a *Agent) fetchBundle(ctx context.Context, id string) error {
 	pods, err := a.kubeClient.CoreV1().Pods(a.criuFailedNamespace()).List(ctx, metav1.ListOptions{LabelSelector: agentLabelSelector})
 	if err != nil {
@@ -436,20 +579,59 @@ func (a *Agent) fetchBundle(ctx context.Context, id string) error {
 	}
 	// A version holds one architecture's binaries: only a node of this
 	// node's architecture has the right ones.
-	arch := a.nodeArch(ctx, a.config.NodeName)
+	arch, err := a.nodeArchOf(ctx, a.config.NodeName)
+	if err != nil {
+		return fmt.Errorf("this node's architecture: %w", err)
+	}
 	var errs []error
+	asked, absent := 0, 0
+	unsettled, rev := "", ""
 	for i := range pods.Items {
-		node := pods.Items[i].Spec.NodeName
-		if node == "" || node == a.config.NodeName || a.nodeArch(ctx, node) != arch {
+		p := &pods.Items[i]
+		node := p.Spec.NodeName
+		if node == "" {
 			continue
 		}
+		na, err := a.nodeArchOf(ctx, node)
+		if err != nil {
+			// It may be of this architecture, and have the version.
+			errs = append(errs, fmt.Errorf("%s: %w", node, err))
+			continue
+		}
+		if na != arch {
+			continue
+		}
+		// An agent being replaced may be the one that has the version, and
+		// a node between its old agent and its new one is not listed at
+		// all: no answer is final during a rollout.
+		if h := p.Labels["controller-revision-hash"]; p.DeletionTimestamp != nil {
+			unsettled = "agent " + p.Name + " is terminating"
+		} else if rev != "" && h != rev {
+			unsettled = "the agents run two revisions: a rollout is in progress"
+		} else if rev == "" {
+			rev = h
+		}
+		if node == a.config.NodeName {
+			continue
+		}
+		asked++
 		if err := a.fetchBundleFrom(ctx, node, id); err != nil {
+			if errors.Is(err, errBundleNotOnPeer) {
+				absent++
+			}
 			errs = append(errs, fmt.Errorf("%s: %w", node, err))
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("no peer agent has bundle version %s: %w", id, errors.Join(errs...))
+	joined := errors.Join(errs...)
+	if unsettled == "" && absent == asked && len(errs) == absent {
+		return fmt.Errorf("%w: version %s: %d agents of this node's architecture asked, none has it: %w", errBundleNotOnAnyPeer, id, asked, joined)
+	}
+	if unsettled != "" {
+		joined = errors.Join(joined, errors.New(unsettled))
+	}
+	return fmt.Errorf("no peer agent has bundle version %s: %w", id, joined)
 }
 
 func (a *Agent) fetchBundleFrom(ctx context.Context, node, id string) error {
@@ -468,6 +650,12 @@ func (a *Agent) fetchBundleFrom(ctx context.Context, node, id string) error {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if strings.Contains(string(body), bundleAbsentText) {
+			return fmt.Errorf("%w: %s", errBundleNotOnPeer, resp.Status)
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s", resp.Status)
 	}
@@ -505,11 +693,21 @@ func (a *Agent) fetchBundleFrom(ctx context.Context, node, id string) error {
 
 // nodeArch is a node's CPU architecture label, "" when unreadable.
 func (a *Agent) nodeArch(ctx context.Context, node string) string {
+	arch, _ := a.nodeArchOf(ctx, node)
+	return arch
+}
+
+// nodeArchOf is a node's CPU architecture label, or why it cannot be told.
+func (a *Agent) nodeArchOf(ctx context.Context, node string) (string, error) {
 	n, err := a.kubeClient.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return n.Labels[corev1.LabelArchStable]
+	arch := n.Labels[corev1.LabelArchStable]
+	if arch == "" {
+		return "", fmt.Errorf("node %s has no %s label", node, corev1.LabelArchStable)
+	}
+	return arch, nil
 }
 
 // publishBuildInfo sets nvsnap_build_info to the bundle this agent serves

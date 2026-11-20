@@ -316,6 +316,11 @@ const (
 	NoGPUProcessText = "no process of this pod runs on the gpu"
 )
 
+// BundleUnavailableText leads the error of a restore that cannot run
+// because no node has the bundle version its checkpoint recorded (lower
+// case, as Reason matches it).
+const BundleUnavailableText = "bundle version unavailable"
+
 // Reason classes a failure's text into a bounded label value.
 func Reason(text string) string {
 	t := strings.ToLower(text)
@@ -332,6 +337,8 @@ func Reason(text string) string {
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):
 		return "no_agent"
+	case strings.Contains(t, BundleUnavailableText):
+		return "bundle_unavailable"
 	case strings.Contains(t, "rdma") || strings.Contains(t, "infiniband"):
 		return "rdma"
 	case strings.Contains(t, "gpushare"):

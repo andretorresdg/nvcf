@@ -59,7 +59,9 @@ Labels:
   `17+`; companions (etcd, NATS) are not ranks.
 - `reason`: the class of a failure or refusal: `mptcp`, `rdma`, `gpushare`,
   `fetch`, `timeout`, `criu`, `other`; `no_agent` for an instance refused
-  because a companion of it runs on a node no nvsnap agent runs on; and two
+  because a companion of it runs on a node no nvsnap agent runs on;
+  `bundle_unavailable` for a restore not run because no node has the bundle
+  version its checkpoint recorded (the placeholder starts cold); and two
   that are the workload's own doing, not a fault of nvsnap's:
   `workload_exited` (the container's process had ended when its dump failed:
   it is gone, or a later process holds its pid; `internal/agent/checkpoint_v2.go`
