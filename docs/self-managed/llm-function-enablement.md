@@ -40,7 +40,9 @@ When enabled, the stack creates:
 - `llm-api-gateway` in the `nvcf` namespace.
 - `llm-request-router` in the `nvcf` namespace.
 - The `llm.<domain>` and `llm.invocation.<domain>` HTTPRoutes when Gateway API
-  ingress is enabled.
+  ingress is enabled. To skip either route, for example when callers reach the
+  gateway in-cluster, set `ingress.gatewayApi.routes.llmApiGateway.enabled` or
+  `ingress.gatewayApi.routes.llmInvocation.enabled` to `false`.
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
 
@@ -61,6 +63,23 @@ log-forwarder sidecars wait for the same pause, so telemetry from requests
 served during the pause is still sent. They use the Kubernetes `sleep`
 lifecycle action, which is stable since Kubernetes 1.34. The function
 container's own shutdown output after the pause may not be sent.
+
+A new worker registers with `llm-request-router` at a fixed 100 input tokens
+per second. To start it at a measured rate instead, set
+`PYLON_DO_CALIBRATION: "true"` in `agent.functionEnvOverrides` of the
+`nvca-operator` chart values. `pylon` then measures each model's input rate
+before it registers. Older `pylon` versions ignore this variable and start at
+100. A model whose calibration fails starts at 100 and logs a warning.
+Calibration adds about 5 to 15 seconds per model name to worker startup. The
+worker pod can be Ready during that time. If the function has no other
+registered worker, a request then gets `404` with `no_eligible_candidates`.
+
+To change the time limit for each calibration load step, 5 seconds by default,
+set `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` there. `PYLON_DO_CALIBRATION` must
+be `true` or `false`, and `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` must be a
+positive number of milliseconds. The overrides apply to every LLM function on
+the cluster, so an invalid value stops `pylon` on every new LLM worker there.
+Both variables apply to worker pods created after NVCA picks up the new values.
 
 ## Enable on an Existing Installation
 
@@ -287,7 +306,7 @@ For a split control-plane and compute-plane deployment, override this value
 with a host and port that worker pods can reach.
 
 The stack maps the configured or default address to
-`api.remoteConfig.configData.nvcf.llm-request-router.worker-address`. The NVCF
+`api.remoteConfig.configData.nvcf.llm.request-router.worker-address`. The NVCF
 API then includes the address in LLM worker configuration. Do not configure
 the worker address under `api.env`. When the LLM addon is disabled, the stack
 does not pass a staged endpoint to the API chart.
