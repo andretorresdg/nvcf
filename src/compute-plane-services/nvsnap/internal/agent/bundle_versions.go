@@ -425,7 +425,10 @@ func (c *criuAutoRestorer) ensurePlaceholderBundles(ctx context.Context, pod *co
 			if fetch == nil {
 				fetch = c.a.fetchBundle
 			}
-			if err := fetch(ctx, id); err != nil {
+			fctx, cancel := c.bundleFetchContext(ctx, pod, id)
+			err := fetch(fctx, id)
+			cancel()
+			if err != nil {
 				c.bundleFetchFailed(ctx, pod, id, err, log)
 				return
 			}
@@ -515,6 +518,28 @@ func (c *criuAutoRestorer) considerStuckRefused(ctx context.Context, pod *corev1
 // bundleRefusedPrefix marks, in attempted, a pod and version whose restore
 // the pod may not have: its version is not fetched for it again.
 const bundleRefusedPrefix = "bundle-refused/"
+
+// bundleSweepMin is the least time a fetch of a placeholder's version is
+// given once its wait is past bundleUndecidedMax: it may still succeed.
+const bundleSweepMin = time.Minute
+
+// bundleFetchContext bounds a fetch of version id for restore placeholder
+// pod by the end of its wait (bundleUndecidedMax from its first fetch),
+// so that peers that accept a request and stall do not stretch the wait
+// past it: the give-up is decided when the fetch returns. The wait starts
+// with the first fetch. Any other pod's fetch is not bounded here.
+func (c *criuAutoRestorer) bundleFetchContext(ctx context.Context, pod *corev1.Pod, id string) (context.Context, context.CancelFunc) {
+	if !restoreNeedsBundle(pod, id) {
+		return context.WithCancel(ctx)
+	}
+	now := time.Now()
+	first, _ := c.bundleFailingSince.LoadOrStore(bundleMissKey(pod.UID, id), now)
+	deadline := first.(time.Time).Add(bundleUndecidedMax)
+	if deadline.Before(now.Add(bundleSweepMin)) {
+		deadline = now.Add(bundleSweepMin)
+	}
+	return context.WithDeadline(ctx, deadline)
+}
 
 // bundleFetchFailed handles a failed fetch of version id for pod. A
 // restore placeholder that cannot start without it is started cold once
@@ -807,6 +832,7 @@ func (a *Agent) fetchBundle(ctx context.Context, id string) error {
 	var errs []error
 	asked, absent := 0, 0
 	unsettled, rev, selfListed := "", "", false
+	listed := map[string]bool{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		node := p.Spec.NodeName
@@ -827,6 +853,7 @@ func (a *Agent) fetchBundle(ctx context.Context, id string) error {
 		}
 		self := node == a.config.NodeName
 		selfListed = selfListed || self
+		listed[node] = true
 		down := !self && peerDown(n, p, now)
 		// An agent being replaced may be the one that has the version, and
 		// a node between its old agent and its new one is not listed at
@@ -867,6 +894,9 @@ func (a *Agent) fetchBundle(ctx context.Context, id string) error {
 		// surely not the whole set.
 		unsettled = "this node's agent is not listed"
 	}
+	if unsettled == "" && absent == asked && len(errs) == absent {
+		unsettled = a.agentMissingOn(ctx, arch, listed, now)
+	}
 	joined := errors.Join(errs...)
 	if unsettled == "" && absent == asked && len(errs) == absent {
 		return fmt.Errorf("%w: version %s: %d agents of this node's architecture asked or down, none has it: %w", errBundleNotOnAnyPeer, id, asked, joined)
@@ -875,6 +905,35 @@ func (a *Agent) fetchBundle(ctx context.Context, id string) error {
 		joined = errors.Join(joined, errors.New(unsettled))
 	}
 	return fmt.Errorf("no peer agent has bundle version %s: %w", id, joined)
+}
+
+// agentMissingOn returns why the agents listed (by node) may not be all of
+// this architecture's: a Ready node of arch that the agent DaemonSet runs
+// on but that has no agent listed (one not created yet, or deleted and
+// not replaced), which may have the version. "" when there is none. A
+// node not Ready for longer than peerDownBound could not serve anyway.
+func (a *Agent) agentMissingOn(ctx context.Context, arch string, listed map[string]bool, now time.Time) string {
+	nodes, err := a.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "cannot list the nodes: " + err.Error()
+	}
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if listed[n.Name] || n.Labels[corev1.LabelArchStable] != arch {
+			continue
+		}
+		if peerDown(n, &corev1.Pod{}, now) {
+			continue
+		}
+		places, err := a.placesAgent(n)
+		if err != nil {
+			return "agent placement: " + err.Error()
+		}
+		if places {
+			return "node " + n.Name + " runs no listed agent"
+		}
+	}
+	return ""
 }
 
 // peerDown reports whether a peer agent pod p, on node n, has been unable

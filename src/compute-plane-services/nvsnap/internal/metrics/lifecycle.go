@@ -316,7 +316,7 @@ const (
 	NoGPUProcessText = "no process of this pod runs on the gpu"
 )
 
-// BundleUnavailableText leads the error of a restore that cannot run
+// BundleUnavailableText starts the error of a restore that cannot run
 // because no node has the bundle version its checkpoint recorded (lower
 // case, as Reason matches it).
 const BundleUnavailableText = "bundle version unavailable"
@@ -327,6 +327,10 @@ func Reason(text string) string {
 	switch {
 	case t == "":
 		return ""
+	// An outcome the agent names itself, ahead of any text it carries
+	// (a peer's name may hold "mptcp" or "gpushare").
+	case strings.HasPrefix(t, BundleUnavailableText):
+		return "bundle_unavailable"
 	// The workload's own doing, checked first: the rest of the text is
 	// what the capture ran into because of it.
 	case strings.Contains(t, WorkloadExitedText):
@@ -337,8 +341,6 @@ func Reason(text string) string {
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):
 		return "no_agent"
-	case strings.Contains(t, BundleUnavailableText):
-		return "bundle_unavailable"
 	case strings.Contains(t, "rdma") || strings.Contains(t, "infiniband"):
 		return "rdma"
 	case strings.Contains(t, "gpushare"):

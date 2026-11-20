@@ -60,8 +60,11 @@ Labels:
 - `reason`: the class of a failure or refusal: `mptcp`, `rdma`, `gpushare`,
   `fetch`, `timeout`, `criu`, `other`; `no_agent` for an instance refused
   because a companion of it runs on a node no nvsnap agent runs on;
-  `bundle_unavailable` for a restore not run because no node has the bundle
-  version its checkpoint recorded (the placeholder starts cold); and two
+  `bundle_unavailable` for a restore not run because its node could not get
+  or install the bundle version its checkpoint recorded (the placeholder is
+  deleted; its checkpoint is blocked, and the replacement starts cold, only
+  when no node has the version: see
+  [VERSIONED-NODE-BUNDLE.md](../design/VERSIONED-NODE-BUNDLE.md)); and two
   that are the workload's own doing, not a fault of nvsnap's:
   `workload_exited` (the container's process had ended when its dump failed:
   it is gone, or a later process holds its pid; `internal/agent/checkpoint_v2.go`

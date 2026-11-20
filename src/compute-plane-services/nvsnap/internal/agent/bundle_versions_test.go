@@ -28,6 +28,7 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -585,6 +586,12 @@ func TestFetchBundle_DefinitiveMiss(t *testing.T) {
 				}
 			}
 		}},
+		{name: "a node the agents run on has none listed", setup: func(t *testing.T, kc *fake.Clientset) {
+			addGPUNode(t, kc, "n5", corev1.ConditionTrue, 0)
+		}},
+		{name: "a node the agents run on, down past the bound, has none listed", want: true, setup: func(t *testing.T, kc *fake.Clientset) {
+			addGPUNode(t, kc, "n5", corev1.ConditionUnknown, peerDownBound+time.Minute)
+		}},
 		// No other agent of this architecture: none can serve the version.
 		{name: "no peer of this architecture", want: true, setup: func(t *testing.T, kc *fake.Clientset) {
 			for _, name := range []string{"agent-n2", "agent-n3"} {
@@ -928,9 +935,13 @@ func TestEnsurePlaceholderBundles_GroupEndedOnce(t *testing.T) {
 	if got := remainingPods(t, kc); len(got) != 1 || got[0] != "other-0" {
 		t.Errorf("pods left = %v, want only the other instance", got)
 	}
-	// A claim that has outlived its owner is taken over.
-	if !c.claimGroupEnd(ctx, "k1", "kimi-0", time.Now().Add(groupEndClaimTTL+time.Minute), logrus.NewEntry(logrus.New())) {
-		t.Error("a stale claim was not taken over")
+	// The instance's claim holds until it expires, and is then taken over.
+	log := logrus.NewEntry(logrus.New())
+	if c.claimGroupEnd(ctx, "k1", instanceIdentity(r1), time.Now(), log) {
+		t.Error("the instance's live claim was taken again")
+	}
+	if !c.claimGroupEnd(ctx, "k1", instanceIdentity(r1), time.Now().Add(groupEndClaimTTL+time.Minute), log) {
+		t.Error("an expired claim was not taken over")
 	}
 }
 
@@ -1136,5 +1147,40 @@ func TestEnsurePlaceholderBundles_ServedThenMissingIsNotBlocked(t *testing.T) {
 	}
 	if c.Blocked(context.Background(), "t0") {
 		t.Error("the checkpoint was blocked although a peer had served its version")
+	}
+}
+
+// addGPUNode adds an amd64 node with GPUs (one the agents run on by
+// default) whose Ready condition is ready since ago, and no agent.
+func addGPUNode(t *testing.T, kc *fake.Clientset, name string, ready corev1.ConditionStatus, ago time.Duration) {
+	t.Helper()
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{corev1.LabelArchStable: "amd64"}},
+		Status: corev1.NodeStatus{
+			Allocatable: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("8")},
+			Conditions:  []corev1.NodeCondition{{Type: corev1.NodeReady, Status: ready, LastTransitionTime: metav1.NewTime(time.Now().Add(-ago))}},
+		}}
+	if _, err := kc.CoreV1().Nodes().Create(context.Background(), n, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A fetch is bounded by the end of the placeholder's wait, so peers that
+// accept and stall cannot stretch the wait past bundleUndecidedMax.
+func TestEnsurePlaceholderBundles_FetchBoundedByTheWait(t *testing.T) {
+	defer func(d time.Duration) { bundleUndecidedMax = d }(bundleUndecidedMax)
+	bundleUndecidedMax = time.Hour
+	c, _, pod := lostBundleFixture(t, nil)
+	first := time.Now().Add(-bundleUndecidedMax + 5*time.Minute)
+	c.bundleFailingSince.Store(bundleMissKey(pod.UID, "lost"), first)
+	ctx, cancel := c.bundleFetchContext(context.Background(), pod, "lost")
+	defer cancel()
+	if d, ok := ctx.Deadline(); !ok || !d.Equal(first.Add(bundleUndecidedMax)) {
+		t.Errorf("deadline = %v (%v), want the end of the wait %v", d, ok, first.Add(bundleUndecidedMax))
+	}
+	c.bundleFailingSince.Store(bundleMissKey(pod.UID, "lost"), time.Now().Add(-2*bundleUndecidedMax))
+	ctx2, cancel2 := c.bundleFetchContext(context.Background(), pod, "lost")
+	defer cancel2()
+	if d, ok := ctx2.Deadline(); !ok || time.Until(d) < bundleSweepMin-time.Second {
+		t.Errorf("a fetch past the wait gets %v, want at least %v", time.Until(d), bundleSweepMin)
 	}
 }
