@@ -63,6 +63,8 @@ type PreflightFinding struct {
 	Severity  string `json:"severity"`
 	Check     string `json:"check"`
 	Detail    string `json:"detail"`
+	// PID is the process an RDMA finding is about (host numbering).
+	PID int `json:"pid,omitempty"`
 }
 
 // PreflightReport is the preflight of one instance.
@@ -176,8 +178,11 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	if err := a.ensureCompanionToolsIn(procBase, int(info.PID)); err != nil {
 		a.log.WithError(err).WithField("pod", ns+"/"+pod).Warn("node bundle: cannot mount the tools into a pod without GPUs yet; its capture waits for them")
 	}
-	if _, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir()); err != nil {
+	tools, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir())
+	if err != nil {
 		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
+	} else if gpushareMXSupported(tools.gpuToolText()) {
+		fs = releasedByMXPause(fs, mxPausable(procBase, int(info.PID)))
 	}
 	return fs, nil
 }
@@ -361,12 +366,12 @@ func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []Pref
 	for _, pid := range pids {
 		comm, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "comm"))
 		if mapsIBVLib(procBase, pid) {
-			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightWarn, Check: "rdma",
+			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightWarn, Check: "rdma", PID: pid,
 				Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s through %s: NCCL's are released at the GPU suspend; any other RDMA user in it fails the dump, and the workload is rolled back",
 					pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "), ibvLibName)})
 			continue
 		}
-		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "rdma",
+		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "rdma", PID: pid,
 			Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s: a checkpoint cannot save RDMA state (checkpoint-restore/criu#267); the workload has to release them before it is captured",
 				pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "))})
 	}

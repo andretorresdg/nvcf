@@ -91,10 +91,10 @@ struct Args {
     /// Defaults to INFERENCE_READY_TIMEOUT when set, otherwise 60000
     #[arg(long, value_name = "MS")]
     upstream_health_wait_ms: Option<u64>,
-    /// Run local input-TPS calibration before contacting Stargate. Use only when this is the cluster's sole Pylon
-    #[arg(long, default_value_t = false)]
+    /// Run local input-TPS calibration before contacting Stargate. Use only when this is the cluster's sole Pylon. With --initial-input-tps, a 529 ends a model's ramp, and a model whose calibration fails starts at that rate
+    #[arg(long, default_value_t = false, env = "PYLON_DO_CALIBRATION")]
     do_calibration: bool,
-    /// Bootstrap input TPS for every configured model instead of running calibration
+    /// Bootstrap input TPS for every configured model. With --do-calibration, used only for a model whose calibration fails or measures nothing
     #[arg(long, value_name = "TPS")]
     initial_input_tps: Option<f64>,
     /// Force exact usage in streaming Chat Completions requests sent upstream
@@ -121,9 +121,14 @@ struct Args {
     /// Timeout for canary requests in milliseconds. A canary that times out or gets an overload reply while requests for any model name on this Pylon make progress does not mark the model unavailable; this assumes the names share workers, as aliases do
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     bringup_canary_timeout_ms: u64,
-    /// Timeout for calibration requests in milliseconds
-    #[arg(long, default_value_t = 30000, value_name = "MS")]
-    bringup_calibration_timeout_ms: u64,
+    /// Time limit in milliseconds for each calibration load step. A step that takes longer ends the model's ramp. Defaults to 5000 with --initial-input-tps and 30000 without it
+    #[arg(
+        long,
+        env = "PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        value_name = "MS"
+    )]
+    bringup_calibration_timeout_ms: Option<u64>,
     /// Upstream HTTP path to poll for KV-cache stats. Omit to disable KV metric polling
     #[arg(long, value_name = "PATH")]
     kv_cache_stats_path: Option<String>,
@@ -259,6 +264,18 @@ struct Args {
         value_name = "MS"
     )]
     pylon_output_chunk_timeout_ms: u64,
+    /// Longest wait for in-flight requests after SIGTERM, counted from the
+    /// signal. It also bounds the window of up to 2 s that still accepts tunnel
+    /// streams and the final tunnel wait. Pylon needs up to 5 s more to stop, so set it
+    /// at least 5 s below the worker pod termination grace period
+    #[arg(
+        long,
+        default_value_t = pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..),
+        env = "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS",
+        value_name = "MS"
+    )]
+    pylon_shutdown_drain_timeout_ms: u64,
     /// Collect post-stream output quality metrics (gibberish checks)
     #[arg(long, default_value_t = false)]
     collect_quality_metrics: bool,
@@ -369,6 +386,34 @@ mod tests {
             argument.get_env(),
             Some(std::ffi::OsStr::new("STARGATE_GRPC_TLS_CA_CERT_PATH"))
         );
+    }
+
+    #[test]
+    fn calibration_flags_declare_environment_bindings() {
+        let command = <Args as clap::CommandFactory>::command();
+        for (id, env) in [
+            ("do_calibration", "PYLON_DO_CALIBRATION"),
+            (
+                "bringup_calibration_timeout_ms",
+                "PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS",
+            ),
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} argument should exist"));
+
+            assert_eq!(argument.get_env(), Some(std::ffi::OsStr::new(env)), "{id}");
+        }
+    }
+
+    #[test]
+    fn calibration_defaults_to_off_and_rejects_a_zero_step_limit() {
+        let args = parse_args("");
+
+        assert!(!args.do_calibration);
+        assert_eq!(args.bringup_calibration_timeout_ms, None);
+        assert!(try_parse_argv(&["--bringup-calibration-timeout-ms", "0"]).is_err());
     }
 
     #[test]
@@ -505,6 +550,7 @@ mod tests {
     fn pylon_stream_timeouts_reject_zero() {
         assert!(try_parse_argv(&["--pylon-first-output-timeout-ms", "0"]).is_err());
         assert!(try_parse_argv(&["--pylon-output-chunk-timeout-ms", "0"]).is_err());
+        assert!(try_parse_argv(&["--pylon-shutdown-drain-timeout-ms", "0"]).is_err());
     }
 
     #[test]
@@ -563,16 +609,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_conflicting_input_tps_bootstrap_sources() {
-        let neither = parse_args("");
-        let both = parse_args("--do-calibration --initial-input-tps 2200");
-
-        assert!(startup::PylonStartupPlan::from_args(&neither).is_ok());
-        assert!(startup::PylonStartupPlan::from_args(&both).is_err());
-        assert!(startup::PylonStartupPlan::from_args(&parse_args("--do-calibration")).is_ok());
-        assert!(
-            startup::PylonStartupPlan::from_args(&parse_args("--initial-input-tps 2200")).is_ok()
-        );
+    fn startup_accepts_every_input_tps_bootstrap_combination() {
+        for args in [
+            "",
+            "--do-calibration",
+            "--initial-input-tps 2200",
+            "--do-calibration --initial-input-tps 2200",
+        ] {
+            assert!(
+                startup::PylonStartupPlan::from_args(&parse_args(args)).is_ok(),
+                "{args:?} must be accepted"
+            );
+        }
     }
 
     #[test]

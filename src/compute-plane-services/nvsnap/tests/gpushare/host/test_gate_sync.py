@@ -15,7 +15,9 @@ SYNC_MS and counts its calls. The test checks that
     it was called;
   * a quiesce that finds the GPU busy while launches are held keeps them
     held (the ranks are catching up), and opens the gates otherwise;
-  * when the process that sent "hold" exits, the gates open again;
+  * when the process that sent "hold" exits, the gates open again, also
+    when the state lock is busy at that moment (retried until it is free),
+    and also after a "resume" from it that failed;
   * a batched copy (CUDA 12 and 13 entry points) waits at the memory gate.
 
 Run: python3 -I tests/gpushare/host/test_gate_sync.py
@@ -142,6 +144,39 @@ int main(int argc, char **argv)
         printf("closed_after_exit=%d\n", lgate.closed);
         return 0;
     }
+    if (argc > 1 && (!strcmp(argv[1], "leasebusy") || !strcmp(argv[1], "resumefail"))) {
+        /* leasebusy: the holder exits while the state lock is busy.
+         * resumefail: the holder's "resume" fails on the busy state lock,
+         * then the holder exits while the lock is still busy. Either way
+         * the gates must open once the lock is free. */
+        int resume = !strcmp(argv[1], "resumefail");
+        start_ctl();
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return 3;
+        pid_t c = fork();
+        if (!c) {
+            char b, rr[256] = "";
+            int ok = request(getppid(), "hold", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok held");
+            if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
+            if (resume) {
+                request(getppid(), "resume", -1, rr, sizeof(rr), NULL);
+                if (write(up[1], rr[0] == 'o' ? "o" : "e", 1) != 1) _exit(1);
+            }
+            _exit(0);
+        }
+        char b = 0, rb = '-';
+        if (read(up[0], &b, 1) != 1) return 4;
+        pthread_mutex_lock(&mu);
+        if (write(down[1], "x", 1) != 1) return 5;
+        if (resume && read(up[0], &rb, 1) != 1) return 6;
+        waitpid(c, NULL, 0);
+        usleep(2600000);  /* lock_ctl gives up after 2 s */
+        printf("hold=%c resume=%c closed_while_locked=%d\n", b, rb, lgate.closed);
+        pthread_mutex_unlock(&mu);
+        for (int i = 0; i < 300 && lgate.closed; i++) usleep(10000);
+        printf("closed_after_unlock=%d\n", lgate.closed);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "batch")) {
         /* cuGetProcAddress("cuMemcpyBatchAsync") returns the CUDA 12
          * function or, for CUDA 13, _v2: each gets its own wrapper. */
@@ -216,6 +251,18 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["hold"], "1", out)
         self.assertEqual(out["closed_while_alive"], "1", out)
         self.assertEqual(out["closed_after_exit"], "0", "launches stayed held after the tool that held them exited")
+
+    def test_gates_open_when_the_holder_exits_on_a_busy_lock(self):
+        out = self.probe("leasebusy")
+        self.assertEqual(out["hold"], "1", out)
+        self.assertEqual(out["closed_while_locked"], "1", out)
+        self.assertEqual(out["closed_after_unlock"], "0", "launches stayed held after the state lock was free again")
+
+    def test_failed_resume_keeps_the_lease(self):
+        out = self.probe("resumefail")
+        self.assertEqual(out["hold"], "1", out)
+        self.assertEqual(out["resume"], "e", "resume was expected to fail on the busy state lock: %s" % out)
+        self.assertEqual(out["closed_after_unlock"], "0", "a failed resume ended the lease: launches stayed held")
 
     def test_batched_copy_waits_at_the_memory_gate(self):
         out = self.probe("batch")

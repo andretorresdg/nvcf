@@ -177,7 +177,10 @@ namespaces, and dumps with CRIU without the CUDA plugin and with
 `--image-io-mode direct`. It moves the chunk store into
 `<checkpoint>/gpushare` and records the pids, store path and shim path in the
 checkpoint metadata. A process that uses the GPU without the shim fails the
-capture.
+capture. So does a GPU process under the shim outside the dumped session
+(an engine started with `setsid`): a workload under the library is captured
+through it or not at all, so its configuration falls back to the cachedir and
+never to the CUDA plugin (`gpushare_outside.go`).
 
 At restore, the placeholder mounts the bundle at the shim's path and the
 checkpoint's `gpushare` directory at `/nvsnap-gpushare` (the agent's
@@ -233,7 +236,8 @@ That agent starts each member's checkpoint on its node with a new session id.
 Each member's agent creates a fresh session directory in the pod's store,
 passes it as `--fabric-map`, and serves it at
 `/v1/gpushare/fabric/<session>/<namespace>/<pod>`. The driving agent answers
-each vote round (`go` once every member is quiesced, `retry` otherwise) and,
+each vote round (`go` once every member is quiesced, `retry` otherwise,
+`abort` once the vote cannot pass in time) and,
 once every member has written its handle list, delivers the concatenated lists
 to all of them, once. A fresh directory per session means a list from an
 earlier cycle is never merged.
@@ -251,13 +255,22 @@ Limits of the group checkpoint:
   overtaken by an `abort`.
 - A node that reaches its own deadline (`--timeout-ms` plus a minute, after
   the driver's) with an `ok` vote standing takes the vote back first, then
-  waits 2 s for a `go` the driver may already be sending, and follows it.
-  A `go` delivered later than that still splits the nodes (not seen in
-  testing).
+  waits up to 20 s for a `go` the driver may already be sending, and
+  follows it (`node_vote`, `VOTE_WITHDRAW_MS` in `nvsnap-gpu-suspend.c`).
+  The driver retries a verdict every 200 ms (`fabricVoter.finish` in
+  `internal/agent/gpushare_fabric.go`). A `go` that cannot reach a node for
+  longer than that, because its agent is unreachable, still splits the
+  nodes.
 - While the ranks catch up, launches stay held for up to `--timeout-ms`
   plus a minute. If the tool dies before `release`, each process opens its
-  gates again once the process that sent `hold` has exited. After
-  `release`, the gates stay closed until `resume`.
+  gates again once the process that sent `hold` has exited (`lease_take`,
+  `lease_expired` in `gpushare.c`); if the state lock is busy then, it
+  retries every second until it is free (`lease_recover`). A `resume` or
+  `open` that fails keeps the lease, so the tool's exit still reopens the
+  gates. After `release`, the gates stay closed until `resume`. The lease
+  needs `pidfd_open` (Linux 5.3): where that fails, the process logs "no
+  lease" and a tool that dies leaves the launches held until a `resume` or
+  `open`.
 - An engine more than about 8 launches behind a rank on another node may
   not catch up before the deadline: every 8 attempts the ranks are let go
   and held again at a common instant. The checkpoint then ends in a
@@ -393,7 +406,15 @@ covered: their devices still fail the dump, which rolls the workload back.
   node) coordinates the nodes through whoever drives them:
   - Quiesce vote: each attempt, the tool writes `DIR/q` (`<attempt> ok` or
     `<attempt> busy`) and waits for `DIR/d`; once every node has voted the
-    driver writes `<attempt> go` if all are quiesced, else `<attempt> retry`.
+    driver writes `<attempt> go` if all are quiesced, else `<attempt> retry`,
+    or `<attempt> abort` once the session cannot succeed: a member ended, or
+    the vote has not gone 2 minutes after the first vote
+    (`internal/agent/gpushare.go` `gpushareQuiesceTimeout`), so every node
+    is told to stop at the same attempt. A tool that rolls back on `abort`
+    then stops at once; one that reads any verdict but `go` as `retry` goes
+    on to its own `--timeout-ms`. The tool's side (rolling back on `abort`,
+    a wall-clock deadline, and catching up ranks held mid-collective) is
+    [#3522](https://github.com/dsx-ai-factory/nvcf/pull/3522).
   - Handle exchange: after `load`, the tool writes its new fabric handles to
     `DIR/out` and waits for `DIR/in` (all nodes' `out` files concatenated) to
     re-import from at `remap`. The driver must remove `DIR/out` and `DIR/in`
@@ -442,6 +463,34 @@ covered: their devices still fail the dump, which rolls the workload back.
   for example, ModelExpress peer-to-peer over RDMA (NIXL/UCX) and NCCL over
   InfiniBand or RoCE. A workload that has released its RDMA devices by
   capture time is not blocked.
+- ModelExpress: a worker that loads its weights through ModelExpress
+  (`MODEL_EXPRESS_URL` in a process's environment, or `--load-format mx` or `modelexpress`)
+  holds RDMA only to serve its weights to peers, and can drop it. When its
+  node bundle's GPU tool has `mx-pause` (ModelExpress 0.7 or later in the
+  worker), the preflight reports its RDMA as information, not a block, and
+  each member's agent runs `mx-pause` on the GPU processes right before the
+  suspend, after the instance is held and the capture claimed, so a
+  skipped or retried capture never pauses a serving worker. `mx-pause`
+  fails while any RDMA device is still held (NCCL or NIXL KV over RDMA
+  outside ModelExpress): the capture fails there, before anything is
+  stopped, with the tool's reason, and the agent runs `mx-resume`. Every
+  way the source runs on after a pause (a failed capture, a leave-running
+  dump) runs `mx-resume` after the source's resume. The capture records
+  that it paused (`modelExpress` in the checkpoint's gpushare metadata); its
+  restore runs `mx-resume` once the GPU launches run and the network is
+  unlocked: after `open` and the network unlock for a group, after `resume`
+  otherwise (mx refuses while launches are held, and republishes over the
+  network). It runs in the background, off the restore's path. A failed
+  `mx-resume` is logged and does not fail the restore: the worker serves,
+  but does not share its weights with peers. A restored pod keeps its captured
+  address as a local one (RESTORE-POD-ADDRESS.md), so ModelExpress would
+  republish that, which a peer outside the instance cannot reach: when the
+  restore moved the pod and the tool takes `--host`, the agent passes the pod's
+  own IP (`mx-resume --host <pod IP>`). The preflight passes the RDMA
+  of the processes mx-pause addresses only (the GPU processes under the
+  library that use ModelExpress); any other process's RDMA still blocks.
+  A source whose GPU resume failed gets no `mx-resume`: it is replaced.
+  `internal/agent/gpushare_mx.go`.
 
 ## Validation
 

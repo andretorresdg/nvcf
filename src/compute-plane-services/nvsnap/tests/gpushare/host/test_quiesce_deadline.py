@@ -285,13 +285,14 @@ class PartialHold(CatchUp):
 class Deadlines(QuiesceDeadline):
     def test_vote_wait_ends_at_the_deadline(self):
         # No driver answers: the node gives up at its own deadline
-        # (--timeout-ms plus a minute with --fabric-map), not after 600 s.
+        # (--timeout-ms plus a minute with --fabric-map, plus the 20 s it
+        # waits for a verdict after taking its vote back), not after 600 s.
         fabric = tempfile.mkdtemp(dir=self.tmp)
         p, took = self.run_tool("--timeout-ms", "1000", "--fabric-map", fabric, "suspend", str(self.pid),
                                 timeout=120)
         self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("no verdict", p.stdout + p.stderr)
-        self.assertLess(took, 75, p.stdout + p.stderr)
+        self.assertLess(took, 100, p.stdout + p.stderr)
 
     def test_timeout_zero_keeps_trying(self):
         # --timeout-ms 0 is "wait forever": still retrying after several

@@ -2152,6 +2152,11 @@ static void do_ipcget(unsigned long long base, int s)
 #endif
 static int lease_fd = -1;
 static pid_t lease_pid;
+/* The holder exited while the state lock was busy: the gates are reopened
+ * once the lock is free (ctl_main retries every second). A new "hold", or a
+ * "release", "resume" or "open" that succeeded, takes over the gates and
+ * clears it. */
+static pid_t expiry_pid;
 
 static void lease_end(void)
 {
@@ -2166,23 +2171,37 @@ static void lease_take(int s)
     socklen_t l = sizeof(c);
     if (getsockopt(s, SOL_SOCKET, SO_PEERCRED, &c, &l) != 0 || (lease_fd >= 0 && c.pid == lease_pid)) return;
     lease_end();
+    expiry_pid = 0;
     int fd = (int)syscall(SYS_pidfd_open, c.pid, 0);
     if (fd < 0) { logf_("hold: no lease on pid %d (pidfd_open: %s)", c.pid, strerror(errno)); return; }
     lease_fd = fd;
     lease_pid = c.pid;
 }
 
-/* The process that held the launches exited. */
-static void lease_expired(void)
+/* Reopen the gates after the holder's exit, once the state lock is free.
+ * Returns 0 when done, -1 while the lock stays busy (retried). */
+static int lease_recover(void)
 {
-    pid_t pid = lease_pid;
-    lease_end();
-    if (lock_ctl()) { logf_("hold: pid %d exited, but the state lock is busy: launches stay held", pid); return; }
+    pid_t pid = expiry_pid;
+    if (!pid) return 0;
+    if (lock_ctl()) return -1;
     if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
         gate_open();
         logf_("hold: pid %d, which held the launches, exited: launches run again", pid);
     }
+    expiry_pid = 0;
     pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* The process that held the launches exited. */
+static void lease_expired(void)
+{
+    expiry_pid = lease_pid;
+    lease_end();
+    if (lease_recover() < 0)
+        logf_("hold: pid %d exited, but the state lock is busy: launches stay held until it is free (retrying)",
+              expiry_pid);
 }
 
 /* A reply's longest form ("ok remapped ...", do_remap) fits: the tool
@@ -2215,8 +2234,16 @@ static void serve(int s)
     else if (!strncmp(buf, "whosefab ", 9)) do_whosefab(buf + 9, s);
     else if (!strncmp(buf, "ipcget ", 7)) do_ipcget(strtoull(buf + 7, NULL, 10), s);
     else msg_send(s, "err unknown command", -1);
+    /* "release" ends the lease whatever its reply: reopening the gates over
+     * memory that may be partly released could corrupt it. "resume" and
+     * "open" end it only once they reopened the gates: if one fails (a busy
+     * state lock), the holder's exit still reopens them. */
     if (!strcmp(buf, "hold") && !strcmp(rep, "ok held")) lease_take(s);
-    else if (!strncmp(buf, "release", 7) || !strncmp(buf, "resume", 6) || !strcmp(buf, "open")) lease_end();
+    else if (!strncmp(buf, "release", 7) ||
+             ((!strncmp(buf, "resume", 6) || !strcmp(buf, "open")) && !strncmp(rep, "ok", 2))) {
+        lease_end();
+        expiry_pid = 0;
+    }
     if (fd >= 0) close(fd);
     if (strncmp(buf, "export", 6) && strncmp(buf, "whose", 5) && strncmp(buf, "ipcget", 6) &&
         strcmp(buf, "poll") && strcmp(buf, "step"))
@@ -2272,8 +2299,10 @@ static void *ctl_main(void *arg)
     wc_thread_init();
     for (;;) {
         struct pollfd p[2] = { { listen_fd, POLLIN, 0 }, { lease_fd, POLLIN, 0 } };
-        if (poll(p, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+        int r = poll(p, 2, expiry_pid ? 1000 : -1);
+        if (r < 0) { if (errno == EINTR) continue; break; }
         if (p[1].revents) lease_expired();
+        else if (expiry_pid && lease_recover() == 0) logf_("hold: the state lock is free again: launches run");
         if (!p[0].revents) continue;
         int s = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if (s < 0) { if (errno == EINTR || errno == ECONNABORTED) continue; break; }

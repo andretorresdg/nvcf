@@ -1169,11 +1169,13 @@ static void undo(const int *pids, int n, int locked, int shared)
  * A node that gives up at its deadline first takes back an "ok" vote: left
  * in DIR/q, a late driver could still count it and send "go" to the other
  * nodes, which would release while this one rolls back. It then waits a
- * little for a verdict the driver may already be sending: a "go" decided
- * before the vote was taken back is followed, not rolled back. */
+ * while for a verdict the driver may already be sending: a "go" decided
+ * before the vote was taken back is followed, not rolled back. The wait
+ * covers a delivery the driver retries for a while (an agent unreachable
+ * for a moment); it ends as soon as any verdict arrives. */
 static double now_ms(void);
 
-#define VOTE_WITHDRAW_MS 2000  /* the driver polls every 200 ms */
+#define VOTE_WITHDRAW_MS 20000  /* the driver polls every 200 ms: 100 delivery attempts */
 
 static int write_vote(const char *q, const char *tmp, int attempt, int quiesced)
 {
