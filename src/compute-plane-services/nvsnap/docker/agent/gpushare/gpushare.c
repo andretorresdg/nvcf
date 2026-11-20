@@ -2153,8 +2153,9 @@ static void do_ipcget(unsigned long long base, int s)
 static int lease_fd = -1;
 static pid_t lease_pid;
 /* The holder exited while the state lock was busy: the gates are reopened
- * once the lock is free (ctl_main retries every second). A new "hold", or a
- * "release", "resume" or "open" that succeeded, takes over the gates and
+ * once the lock is free (ctl_main retries about every 3 s: a second's wait,
+ * then up to 2 s for the lock). A new "hold", a "release" that got past its
+ * checks, or a "resume" or "open" that succeeded takes over the gates and
  * clears it. */
 static pid_t expiry_pid;
 
@@ -2234,12 +2235,13 @@ static void serve(int s)
     else if (!strncmp(buf, "whosefab ", 9)) do_whosefab(buf + 9, s);
     else if (!strncmp(buf, "ipcget ", 7)) do_ipcget(strtoull(buf + 7, NULL, 10), s);
     else msg_send(s, "err unknown command", -1);
-    /* "release" ends the lease whatever its reply: reopening the gates over
-     * memory that may be partly released could corrupt it. "resume" and
-     * "open" end it only once they reopened the gates: if one fails (a busy
-     * state lock), the holder's exit still reopens them. */
+    /* "release" ends the lease unless it refused before changing anything
+     * (busy state lock, not quiesced): reopening the gates over memory that
+     * may be partly released could corrupt it. "resume" and "open" end it
+     * only once they reopened the gates: if one fails (a busy state lock),
+     * the holder's exit still reopens them. */
     if (!strcmp(buf, "hold") && !strcmp(rep, "ok held")) lease_take(s);
-    else if (!strncmp(buf, "release", 7) ||
+    else if ((!strncmp(buf, "release", 7) && strcmp(rep, "err busy (state lock)") && strcmp(rep, "err not quiesced")) ||
              ((!strncmp(buf, "resume", 6) || !strcmp(buf, "open")) && !strncmp(rep, "ok", 2))) {
         lease_end();
         expiry_pid = 0;

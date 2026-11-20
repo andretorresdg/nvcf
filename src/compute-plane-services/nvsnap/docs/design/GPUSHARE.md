@@ -257,15 +257,18 @@ Limits of the group checkpoint:
   the driver's) with an `ok` vote standing takes the vote back first, then
   waits up to 20 s for a `go` the driver may already be sending, and
   follows it (`node_vote`, `VOTE_WITHDRAW_MS` in `nvsnap-gpu-suspend.c`).
-  The driver retries a verdict every 200 ms (`fabricVoter.finish` in
-  `internal/agent/gpushare_fabric.go`). A `go` that cannot reach a node for
-  longer than that, because its agent is unreachable, still splits the
-  nodes.
+  The driver retries a verdict on each poll (`fabricVoter.finish` in
+  `internal/agent/gpushare_fabric.go`): every 200 ms when the agent refuses
+  the connection, about every 20 s when it does not answer at all
+  (`fabricMemberTimeout` per request). A `go` that cannot reach a node
+  within the 20 s still splits the nodes.
 - While the ranks catch up, launches stay held for up to `--timeout-ms`
-  plus a minute. If the tool dies before `release`, each process opens its
+  plus a minute, plus the 20 s wait after a vote is taken back. If the tool dies before `release`, each process opens its
   gates again once the process that sent `hold` has exited (`lease_take`,
   `lease_expired` in `gpushare.c`); if the state lock is busy then, it
-  retries every second until it is free (`lease_recover`). A `resume` or
+  retries about every 3 s until it is free (`lease_recover`). A `release`
+  that refused before changing anything (busy state lock, not quiesced)
+  keeps the lease too. A `resume` or
   `open` that fails keeps the lease, so the tool's exit still reopens the
   gates. After `release`, the gates stay closed until `resume`. The lease
   needs `pidfd_open` (Linux 5.3): where that fails, the process logs "no
