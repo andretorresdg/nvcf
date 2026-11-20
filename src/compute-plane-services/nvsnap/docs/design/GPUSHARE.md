@@ -254,13 +254,22 @@ Limits of the group checkpoint:
   overtaken by an `abort`.
 - A node that reaches its own deadline (`--timeout-ms` plus a minute, after
   the driver's) with an `ok` vote standing takes the vote back first, then
-  waits 2 s for a `go` the driver may already be sending, and follows it.
-  A `go` delivered later than that still splits the nodes (not seen in
-  testing).
+  waits up to 20 s for a `go` the driver may already be sending, and
+  follows it (`node_vote`, `VOTE_WITHDRAW_MS` in `nvsnap-gpu-suspend.c`).
+  The driver retries a verdict every 200 ms (`fabricVoter.finish` in
+  `internal/agent/gpushare_fabric.go`). A `go` that cannot reach a node for
+  longer than that, because its agent is unreachable, still splits the
+  nodes.
 - While the ranks catch up, launches stay held for up to `--timeout-ms`
   plus a minute. If the tool dies before `release`, each process opens its
-  gates again once the process that sent `hold` has exited. After
-  `release`, the gates stay closed until `resume`.
+  gates again once the process that sent `hold` has exited (`lease_take`,
+  `lease_expired` in `gpushare.c`); if the state lock is busy then, it
+  retries every second until it is free (`lease_recover`). A `resume` or
+  `open` that fails keeps the lease, so the tool's exit still reopens the
+  gates. After `release`, the gates stay closed until `resume`. The lease
+  needs `pidfd_open` (Linux 5.3): where that fails, the process logs "no
+  lease" and a tool that dies leaves the launches held until a `resume` or
+  `open`.
 - An engine more than about 8 launches behind a rank on another node may
   not catch up before the deadline: every 8 attempts the ranks are let go
   and held again at a common instant. The checkpoint then ends in a
