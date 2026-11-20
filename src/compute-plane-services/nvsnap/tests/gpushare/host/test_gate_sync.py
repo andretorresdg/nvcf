@@ -144,12 +144,14 @@ int main(int argc, char **argv)
         printf("closed_after_exit=%d\n", lgate.closed);
         return 0;
     }
-    if (argc > 1 && (!strcmp(argv[1], "leasebusy") || !strcmp(argv[1], "resumefail"))) {
+    if (argc > 1 && (!strcmp(argv[1], "leasebusy") || !strcmp(argv[1], "resumefail") || !strcmp(argv[1], "releasefail"))) {
         /* leasebusy: the holder exits while the state lock is busy.
          * resumefail: the holder's "resume" fails on the busy state lock,
-         * then the holder exits while the lock is still busy. Either way
-         * the gates must open once the lock is free. */
-        int resume = !strcmp(argv[1], "resumefail");
+         * then the holder exits while the lock is still busy. releasefail:
+         * the same with a "release" refused on the busy lock (nothing was
+         * released). Each way the gates must open once the lock is free. */
+        const char *cmd2 = !strcmp(argv[1], "resumefail") ? "resume" : !strcmp(argv[1], "releasefail") ? "release" : NULL;
+        int resume = cmd2 != NULL;
         start_ctl();
         int up[2], down[2];
         if (pipe(up) || pipe(down)) return 3;
@@ -159,7 +161,7 @@ int main(int argc, char **argv)
             int ok = request(getppid(), "hold", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok held");
             if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
             if (resume) {
-                request(getppid(), "resume", -1, rr, sizeof(rr), NULL);
+                request(getppid(), cmd2, -1, rr, sizeof(rr), NULL);
                 if (write(up[1], rr[0] == 'o' ? "o" : "e", 1) != 1) _exit(1);
             }
             _exit(0);
@@ -263,6 +265,12 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["hold"], "1", out)
         self.assertEqual(out["resume"], "e", "resume was expected to fail on the busy state lock: %s" % out)
         self.assertEqual(out["closed_after_unlock"], "0", "a failed resume ended the lease: launches stayed held")
+
+    def test_refused_release_keeps_the_lease(self):
+        out = self.probe("releasefail")
+        self.assertEqual(out["hold"], "1", out)
+        self.assertEqual(out["resume"], "e", "release was expected to be refused on the busy state lock: %s" % out)
+        self.assertEqual(out["closed_after_unlock"], "0", "a refused release ended the lease: launches stayed held")
 
     def test_batched_copy_waits_at_the_memory_gate(self):
         out = self.probe("batch")

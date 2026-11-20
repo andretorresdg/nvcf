@@ -1130,7 +1130,8 @@ static void undo(const int *pids, int n, int locked, int shared)
  * for a moment); it ends as soon as any verdict arrives. */
 static double now_ms(void);
 
-#define VOTE_WITHDRAW_MS 20000  /* the driver polls every 200 ms: 100 delivery attempts */
+#define VOTE_WITHDRAW_MS 20000  /* the driver retries a verdict each poll: every 200 ms to an agent that
+                                  * refuses, about every 20 s to one that does not answer */
 
 static int write_vote(const char *q, const char *tmp, int attempt, int quiesced)
 {
