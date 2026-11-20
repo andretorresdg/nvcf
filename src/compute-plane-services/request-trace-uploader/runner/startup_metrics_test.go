@@ -106,14 +106,6 @@ func TestRunCountsEveryFailedStartupByReason(t *testing.T) {
 			},
 			wantKey: "debug/config",
 		},
-		"missing secrets file": {
-			change: func(t *testing.T, env map[string]string) {
-				if err := os.Remove(env[config.EnvSecretsFile]); err != nil {
-					t.Fatal(err)
-				}
-			},
-			wantKey: "debug/secrets",
-		},
 		"state dir that cannot be created": {
 			change: func(t *testing.T, env map[string]string) {
 				file := filepath.Join(t.TempDir(), "a-file")
@@ -218,5 +210,26 @@ func TestRunCountsNoStartupFailureWhenItStarts(t *testing.T) {
 	}
 	if keys := received.keys(); keys != "" {
 		t.Fatalf("startup_failures counted [%s] for an uploader that started", keys)
+	}
+}
+
+// A missing secrets file is not a startup failure: the uploader starts and
+// the backend waits for the file, so nothing is counted.
+func TestRunStartsAndCountsNothingWithoutTheSecretsFile(t *testing.T) {
+	logs := captureLog(t)
+	received := &failureCollector{values: map[string]float64{}}
+	server := httptest.NewServer(received)
+	defer server.Close()
+	env := validEnv(t)
+	env[otlp.EnvMetricsEndpoint] = server.URL + "/v1/metrics"
+	env[otlp.EnvMetricsProtocol] = "http/protobuf"
+	if err := os.Remove(env[config.EnvSecretsFile]); err != nil {
+		t.Fatal(err)
+	}
+	if code := serve(t, env, "test-build", WithDefaultBackend(config.BackendDebug)); code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, logs.String())
+	}
+	if keys := received.keys(); keys != "" {
+		t.Fatalf("startup_failures counted [%s] without the secrets file", keys)
 	}
 }

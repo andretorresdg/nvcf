@@ -23,9 +23,15 @@ volume, so every step survives a restart.
    an earlier uploader. It loads the journal, repairs what a crash left, and
    reports ready. Files another uploader left on the spool stay where they
    are. A journal entry whose source it cannot identify keeps the process
-   live and not ready until an operator acts. Any other startup error, such
-   as an invalid setting, a missing secrets file or a directory it cannot
-   create, does not end the process either: the uploader logs it, uploads
+   live and not ready until an operator acts. A missing or unreadable
+   secrets file is not a startup error: the uploader starts, logs a
+   warning, and the backend waits for the file at each call, as it does
+   when the file goes away at runtime, so intake and the spool bounds keep
+   running. That holds for a backend that reads the file at each call; the
+   bundled `objectstore` backend reads its credentials once when it is
+   built, so it still needs the file at startup and counts a missing one
+   under `startup_failures` reason `backend`. Any other startup error, such as an invalid setting or a
+   directory it cannot create, does not end the process either: the uploader logs it, uploads
    nothing, and tries again after 10 seconds, doubling up to 5 minutes. As a
    sidecar, an exiting container would make the whole pod unready. Each
    failed attempt adds one to `startup_failures`, so an alert on its
@@ -178,8 +184,8 @@ Rate, errors and duration of the export path:
 - `uptime`, seconds: time since the uploader became ready, refreshed on the
   spool check interval. It is absent while startup has not succeeded.
 - `startup_failures` (`reason`): startup attempts that failed and will be
-  retried: `config` (a refused setting), `backend`, `secrets` (the secrets
-  file), `spool` (directories, lock, journal), or `other`. Until the
+  retried: `config` (a refused setting), `backend`, `spool` (directories,
+  lock, journal), or `other`. Until the
   uploader settings load, the `backend` attribute is the named backend if
   this build links it, else `unknown`.
 - `backend_calls` (`operation`, `status`) and `backend_call.duration`
@@ -412,7 +418,8 @@ callers that want that.
 The uploader reads only the names listed in this README. It has no aliases,
 so a deployment sets these names directly.
 
-Missing paths and unreadable secret files prevent readiness.
+Missing paths prevent readiness. A missing or unreadable secrets file does
+not, for a backend that reads it at each call (see How it works).
 
 ## Record suppression
 

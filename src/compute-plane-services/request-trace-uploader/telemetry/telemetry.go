@@ -191,8 +191,9 @@ var SuppressionActions = []string{"strip_payload", "drop_record", "strip_unresol
 
 // StartupFailureReasons are the reason label values of StartupFailures:
 // a setting the uploader refuses, the backend that could not be built, the
-// secrets file, the spool (directories, lock, journal), or anything else.
-var StartupFailureReasons = []string{"config", "backend", "secrets", "spool", "other"}
+// spool (directories, lock, journal), or anything else. A missing secrets
+// file is not one: the uploader starts and the backend waits for the file.
+var StartupFailureReasons = []string{"config", "backend", "spool", "other"}
 
 // QuarantineReasons are the reason label values of SegmentsQuarantined: the
 // reasons prepare, batching and the fault policy record, and the backend

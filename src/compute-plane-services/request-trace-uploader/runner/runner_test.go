@@ -367,16 +367,17 @@ func TestRunSendsTheLastMetricsAfterTheDrain(t *testing.T) {
 	}
 }
 
-// A cause that clears, such as a secrets file mounted after the container
-// started, needs no restart: the next attempt starts the uploader.
+// A cause that clears, such as a volume that is not writable yet, needs no
+// restart: the next attempt starts the uploader.
 func TestRunStartsOnceAStartupFaultClears(t *testing.T) {
 	fastStartRetry(t)
 	logs := captureLog(t)
 	env := validEnv(t)
-	secrets := env[config.EnvSecretsFile]
-	if err := os.Remove(secrets); err != nil {
+	blocker := filepath.Join(t.TempDir(), "not-a-directory-yet")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	env[config.EnvStateDir] = filepath.Join(blocker, "state")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	exited := make(chan int, 1)
@@ -387,7 +388,7 @@ func TestRunStartsOnceAStartupFaultClears(t *testing.T) {
 	for strings.Count(logs.String(), `"msg":"request trace uploader did not start; retrying"`) < 2 {
 		select {
 		case code := <-exited:
-			t.Fatalf("run exited %d without the secrets file, want it to stay up\n%s", code, logs.String())
+			t.Fatalf("run exited %d while the state dir cannot be created, want it to stay up\n%s", code, logs.String())
 		default:
 		}
 		if time.Now().After(deadline) {
@@ -395,7 +396,7 @@ func TestRunStartsOnceAStartupFaultClears(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := os.WriteFile(secrets, []byte("{}"), 0o600); err != nil {
+	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
 	for {
@@ -407,7 +408,7 @@ func TestRunStartsOnceAStartupFaultClears(t *testing.T) {
 			}
 		}
 		if time.Now().After(deadline.Add(5 * time.Second)) {
-			t.Fatalf("not ready after the secrets file appeared\n%s", logs.String())
+			t.Fatalf("not ready after the state dir could be created\n%s", logs.String())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

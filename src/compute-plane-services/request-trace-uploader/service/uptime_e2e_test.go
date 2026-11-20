@@ -48,9 +48,7 @@ func TestUptimeIsReportedOnlyOnceTheUploaderIsReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			logs := &uptimeLogs{}
-			previous := slog.Default()
-			slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
-			t.Cleanup(func() { slog.SetDefault(previous) })
+			captureInto(t, logs)
 			listener, base := listen(t)
 			uploader := newUploader(t, spool, backendtest.NewFake(), service.Options{Listener: listener, Metrics: metrics}, nil)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -85,6 +83,14 @@ func TestUptimeIsReportedOnlyOnceTheUploaderIsReady(t *testing.T) {
 			}
 		})
 	}
+}
+
+// captureInto sends the default logger to logs for the test.
+func captureInto(t *testing.T, logs *uptimeLogs) {
+	t.Helper()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
 }
 
 // uptimeLogs is a log buffer the uploader's goroutines may write while the
