@@ -92,6 +92,9 @@ type criuAutoRestorer struct {
 	// -> when its fetch first failed, for any reason (bundle_versions.go).
 	bundleMissSince    sync.Map
 	bundleFailingSince sync.Map
+	// bundleServed: placeholder pod UID/version -> struct{}: a peer served
+	// the version while its fetch was failing, so it exists.
+	bundleServed sync.Map
 	// fetchBundle fetches a bundle version from a peer; nil: the agent's
 	// own (tests stub it).
 	fetchBundle func(ctx context.Context, id string) error

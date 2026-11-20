@@ -845,9 +845,10 @@ func TestEnsurePlaceholderBundles_MissConfirmation(t *testing.T) {
 	})
 }
 
-// A lone placeholder whose fetch keeps failing without a final answer is
-// given up after bundleUndecidedMax, as when the agent cannot decide; an
-// instance's placeholder is left to its group's own wait.
+// A placeholder whose fetch keeps failing without a final answer is given
+// up after bundleUndecidedMax, as when the agent cannot decide. For an
+// instance whose stuck pod is rank 0 (its group's own wait never starts:
+// rank 0 drives it once running), the group is ended.
 func TestEnsurePlaceholderBundles_UndecidedGivesUp(t *testing.T) {
 	defer func(d time.Duration) { bundleUndecidedMax = d }(bundleUndecidedMax)
 	bundleUndecidedMax = 300 * time.Millisecond
@@ -861,7 +862,7 @@ func TestEnsurePlaceholderBundles_UndecidedGivesUp(t *testing.T) {
 		t.Fatal("a lone placeholder undecided past the bound was not started cold")
 	}
 	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(context.Background(), criuRestoreFailedConfigMap, metav1.GetOptions{})
-	if err != nil || !strings.Contains(cm.Data["t0"], "without an answer") {
+	if err != nil || !strings.Contains(cm.Data["t0"], "without a final answer") {
 		t.Errorf("the block does not say why: %v %v", cm, err)
 	}
 
@@ -869,11 +870,18 @@ func TestEnsurePlaceholderBundles_UndecidedGivesUp(t *testing.T) {
 	gc.a.config.NodeName = "n1"
 	gc.a.config.Webhook.HostBundleRoot = t.TempDir()
 	gc.fetchBundle = (&fetchScript{errs: map[string]error{"lost": errMayPass}}).fetch
-	rank := groupRank(t, gc, gkc, "kimi-1", 1)
+	setRecord(t, gkc, map[string]string{"bundle.0": "lost"})
+	rank := groupRank(t, gc, gkc, "kimi-0", 0)
 	settle(t, gc, rank, "lost")
+	assertUntouched(t, gc, gkc, "fn", "kimi-0", "c0")
 	time.Sleep(bundleUndecidedMax + 50*time.Millisecond)
 	settle(t, gc, rank, "lost")
-	assertUntouched(t, gc, gkc, "fn", "kimi-1", "c1")
+	if !gc.Blocked(context.Background(), "c0") {
+		t.Error("the stuck rank 0's checkpoint was not blocked")
+	}
+	if got := remainingPods(t, gkc); len(got) != 1 || got[0] != "other-0" {
+		t.Errorf("pods left = %v, want only the other instance", got)
+	}
 }
 
 // groupRank makes groupFixture's pod name rank ordinal of a 2-rank group
@@ -978,4 +986,155 @@ func notReadySince(d time.Duration) []corev1.NodeCondition {
 // podNotReadySince is a pod's conditions, not Ready since d ago.
 func podNotReadySince(d time.Duration) []corev1.PodCondition {
 	return []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().Add(-d))}}
+}
+
+// servingPeer is a peer agent that has bundle version id staged, with its
+// digest recorded for this cluster's amd64 nodes, serving it through the
+// real handler.
+func servingPeer(t *testing.T, kc *fake.Clientset, id string) http.Handler {
+	t.Helper()
+	peer := bundleAgent(t)
+	stageVersion(t, peer, id, time.Minute)
+	digest, err := bundleDigest(filepath.Join(peer.bundleVersionsDir(), id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Create(context.Background(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: bundleDigestsConfigMap, Namespace: "nvsnap-system"},
+		Data:       map[string]string{bundleDigestKey(id, "amd64"): digest}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r := mux.NewRouter()
+	r.HandleFunc("/v1/bundles/{id}", peer.bundleHandler).Methods("GET")
+	return r
+}
+
+// A peer whose node has not been Ready for long can still serve (a dead
+// kubelet, a partition from the control plane): it is asked, and when it
+// serves the version the fetch succeeds.
+func TestFetchBundle_DownPeerThatServesIsAsked(t *testing.T) {
+	peers := map[string]http.Handler{}
+	c, kc, _ := lostBundleFixture(t, peers)
+	peers["n3"] = servingPeer(t, kc, "lost")
+	editNode(t, kc, "n3", func(n *corev1.Node) { n.Status.Conditions = notReadySince(peerDownBound + time.Minute) })
+	if err := c.a.fetchBundle(context.Background(), "lost"); err != nil {
+		t.Fatalf("a down peer that has the version was not fetched from: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(c.a.bundleVersionsDir(), "lost")); err != nil {
+		t.Errorf("the version is not installed: %v", err)
+	}
+}
+
+// A peer that serves the version, but whose copy cannot be installed here
+// (a fault of this node, or of the transfer), says the version exists: past
+// the bound the pod is deleted so its replacement may land elsewhere, and
+// the checkpoint is not blocked.
+func TestEnsurePlaceholderBundles_ServedButNotInstalledIsNotBlocked(t *testing.T) {
+	defer func(d time.Duration) { bundleUndecidedMax = d }(bundleUndecidedMax)
+	bundleUndecidedMax = 300 * time.Millisecond
+	c, kc, pod := lostBundleFixture(t, map[string]http.Handler{"n2": http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-tar")
+		_, _ = w.Write([]byte("not a tar stream"))
+	})})
+	settle(t, c, pod, "lost")
+	assertUntouched(t, c, kc, "tenant", "fn-0", "t0")
+	time.Sleep(bundleUndecidedMax + 50*time.Millisecond)
+	settle(t, c, pod, "lost")
+	if !podGone(t, kc) {
+		t.Fatal("a placeholder whose version could not be installed was not deleted past the bound")
+	}
+	if c.Blocked(context.Background(), "t0") {
+		t.Error("the checkpoint was blocked although a peer has its version")
+	}
+}
+
+// The end of a group is claimed for its instance, not for whichever rank
+// a lookup finds as leader: with rank 0 already being deleted, a late rank
+// 0 event does not end the instance a second time.
+func TestEnsurePlaceholderBundles_GroupClaimSurvivesLeaderDeletion(t *testing.T) {
+	defer func(d time.Duration) { bundleMissConfirm = d }(bundleMissConfirm)
+	bundleMissConfirm = 0
+	c, kc, _ := groupFixture(t)
+	c.a.config.NodeName = "n1"
+	c.a.config.Webhook.HostBundleRoot = t.TempDir()
+	c.fetchBundle = notOnAnyPeer
+	setRecord(t, kc, map[string]string{"bundle.0": "lost", "bundle.1": "lost"})
+	r0, r1 := groupRank(t, c, kc, "kimi-0", 0), groupRank(t, c, kc, "kimi-1", 1)
+	ctx := context.Background()
+	terminating := r0.DeepCopy()
+	now := metav1.Now()
+	terminating.DeletionTimestamp, terminating.Finalizers = &now, []string{"test"}
+	if _, err := kc.CoreV1().Pods("fn").Update(ctx, terminating, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	settle(t, c, r1, "lost")
+	settle(t, c, r0, "lost") // seen before it was marked for deletion
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil || cm.Data["stalls"] != "1" {
+		t.Errorf("stalls = %q, want one for the instance: %v", cm.Data["stalls"], err)
+	}
+}
+
+// A capture record gone (or no longer naming the version) since the pod
+// was admitted says nothing about the capture: once the pod has waited
+// past the bound it is deleted, and no checkpoint is blocked.
+func TestEnsurePlaceholderBundles_RecordGoneDeletesOnly(t *testing.T) {
+	defer func(d, u time.Duration) { bundleMissConfirm, bundleUndecidedMax = d, u }(bundleMissConfirm, bundleUndecidedMax)
+	bundleMissConfirm, bundleUndecidedMax = 0, 300*time.Millisecond
+	c, kc, pod := lostBundleFixture(t, nil)
+	recordBundle(t, c, "tenant", "t0", "")
+	c.fetchBundle = notOnAnyPeer
+	settle(t, c, pod, "lost")
+	assertUntouched(t, c, kc, "tenant", "fn-0", "t0")
+	time.Sleep(bundleUndecidedMax + 50*time.Millisecond)
+	settle(t, c, pod, "lost")
+	if !podGone(t, kc) {
+		t.Fatal("a placeholder whose record is gone was left waiting past the bound")
+	}
+	if c.Blocked(context.Background(), "t0") {
+		t.Error("a checkpoint was blocked although its record does not name the version")
+	}
+}
+
+// A pod refused for its tenant scope is not fetched for again, but is not
+// left waiting for good either: past the bound it alone is deleted.
+func TestEnsurePlaceholderBundles_RefusedDeletedPastTheBound(t *testing.T) {
+	defer func(d, u time.Duration) { bundleMissConfirm, bundleUndecidedMax = d, u }(bundleMissConfirm, bundleUndecidedMax)
+	bundleMissConfirm, bundleUndecidedMax = 0, 300*time.Millisecond
+	c, kc, pod := lostBundleFixture(t, nil)
+	c.fetchBundle = notOnAnyPeer
+	pod.Annotations[webhook.CRIURestoreAnnotation] = "v0" // the other tenant's
+	if _, err := kc.CoreV1().Pods("tenant").Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	settle(t, c, pod, "lost")
+	assertUntouched(t, c, kc, "tenant", "fn-0", "v0")
+	time.Sleep(bundleUndecidedMax + 50*time.Millisecond)
+	c.ensurePlaceholderBundles(context.Background(), pod)
+	if !podGone(t, kc) {
+		t.Fatal("a refused placeholder was left waiting past the bound")
+	}
+	if c.Blocked(context.Background(), "v0") {
+		t.Error("another tenant's checkpoint was blocked")
+	}
+}
+
+// A peer that served the version says it exists even when the miss later
+// becomes final: the pod is deleted, the checkpoint not blocked.
+func TestEnsurePlaceholderBundles_ServedThenMissingIsNotBlocked(t *testing.T) {
+	defer func(d time.Duration) { bundleMissConfirm = d }(bundleMissConfirm)
+	bundleMissConfirm = 0
+	c, kc, pod := lostBundleFixture(t, nil)
+	f := &fetchScript{errs: map[string]error{"lost": fmt.Errorf("n2: %w: digest mismatch", errBundleInstall)}}
+	c.fetchBundle = f.fetch
+	settle(t, c, pod, "lost")
+	assertUntouched(t, c, kc, "tenant", "fn-0", "t0")
+	f.set("lost", fmt.Errorf("%w: test", errBundleNotOnAnyPeer))
+	settle(t, c, pod, "lost")
+	if !podGone(t, kc) {
+		t.Fatal("the placeholder was not deleted")
+	}
+	if c.Blocked(context.Background(), "t0") {
+		t.Error("the checkpoint was blocked although a peer had served its version")
+	}
 }

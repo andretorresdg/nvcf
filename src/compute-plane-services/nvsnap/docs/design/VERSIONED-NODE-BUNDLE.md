@@ -49,7 +49,8 @@ deleted:
    does while it is in the cluster: its checkpoint keeps the version alive
    there). When every agent of the node's architecture either answers that
    it does not have the version or has been down for more than ten minutes
-   (its node or its agent pod not Ready), this node's agent is listed, no
+   (its node or its agent pod not Ready) and does not serve it (every peer is
+   asked, a down one too), this node's agent is listed, no
    agent is unplaced or being replaced, and that still holds two minutes
    later, the restore cannot run: the agent blocks the checkpoint, records
    the restore as not run (reason `bundle_unavailable`) and deletes the
@@ -58,9 +59,13 @@ deleted:
    (`restoreWithoutBundle`, `internal/agent/bundle_versions.go`). Only the
    version the capture recorded counts. Any other answer (a peer not
    answering for now, an error, a node whose architecture cannot be read)
-   may pass, and the placeholder waits for the next try; a lone placeholder
-   that has waited so for 30 minutes starts cold too. A companion, which
-   starts without its version, is never given up this way.
+   may pass, and the placeholder waits for the next try. A placeholder that
+   has waited for 30 minutes is given up the same way, but its checkpoint is
+   blocked only when the capture is at fault: no peer served the version
+   (one that served a copy this node could not install shows it exists), and
+   the capture record still names it. Otherwise only the pod (or the
+   instance's placeholders) is deleted. A companion, which starts without its
+   version, is never given up this way.
 6. **Unused versions are removed.** The checkpoint reaper deletes a version
    that is not current, not mounted by any pod on the node, not recorded by
    any checkpoint on the node, and older than an hour.
