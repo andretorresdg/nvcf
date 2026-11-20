@@ -7,15 +7,15 @@ package agent
 // group capture's decision on which setup its placeholders may skip
 // (webhook/unused_volumes.go). The dump records every file its processes
 // hold: open descriptors, memory mappings, cwd and root, the executable,
-// deleted files (ghosts), each with the id of the mount it is on, and the
-// mount table those ids resolve in. A path-bound unix socket is on the
-// mount whose mountpoint is the longest prefix of its path.
+// deleted files (ghosts), and path-bound unix sockets, each with the id of
+// the mount it is on, and the mount table those ids resolve in.
 //
 // Anything the reading cannot account for (a descriptor kind that names a
 // file another way, a mount id the table does not have, more than one
 // mount namespace) makes the use unknown, and the group skips nothing.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // pathlessFileTypes are the descriptor kinds of a dump's files.img that
@@ -32,12 +33,17 @@ var pathlessFileTypes = map[string]bool{
 	"INETSK": true, "PACKETSK": true, "NETLINKSK": true,
 	"PIPE": true, "FIFO": true, "EVENTFD": true, "EVENTPOLL": true,
 	"SIGNALFD": true, "TIMERFD": true, "MEMFD": true, "IO_URING": true,
-	"TUNF": true, "EXT": true, "NS": true, "BPFMAP": true, "PIDFD": true,
+	"TUNF": true, "NS": true, "BPFMAP": true, "PIDFD": true,
 }
+
+// critTimeout bounds one crit decode; a member's capture waits on it.
+const critTimeout = 2 * time.Minute
 
 // critShow decodes a CRIU image to JSON; a variable for tests.
 var critShow = func(img string) ([]byte, error) {
-	return exec.Command("crit", "show", img).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), critTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "crit", "show", img).Output()
 }
 
 // dumpUsedMounts returns the mountpoints, in the dumped container's view,
@@ -73,11 +79,8 @@ func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 		return nil, fmt.Errorf("mount table: %w", err)
 	}
 	byID := map[uint32]string{}
-	var points []string
 	for _, e := range mt.Entries {
-		mp := path.Clean(e.Mountpoint)
-		byID[e.MntID] = mp
-		points = append(points, mp)
+		byID[e.MntID] = path.Clean(e.Mountpoint)
 	}
 	var fs struct {
 		Entries []struct {
@@ -87,7 +90,8 @@ func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 				MntID *int64 `json:"mnt_id"`
 			} `json:"reg"`
 			Usk *struct {
-				Name string `json:"name"`
+				Name  string `json:"name"`
+				MntID *int64 `json:"mnt_id"`
 			} `json:"usk"`
 		} `json:"entries"`
 	}
@@ -107,16 +111,20 @@ func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 			}
 			used[mp] = true
 		case e.Type == "UNIXSK" && e.Usk != nil:
-			name := e.Usk.Name
-			if i := strings.Index(name, "=00"); i >= 0 {
-				name = name[:i] // CRIU's encoding of the trailing NUL
+			// Abstract (a leading NUL, which crit writes "=00") or unbound:
+			// on no mount. A bound one, by an absolute or a relative name,
+			// carries the id of the mount it is on.
+			if e.Usk.Name == "" || strings.HasPrefix(e.Usk.Name, "=00") {
+				continue
 			}
-			if !strings.HasPrefix(name, "/") {
-				continue // abstract or unbound
+			if e.Usk.MntID == nil || *e.Usk.MntID < 0 {
+				return nil, fmt.Errorf("unix socket %q has no mount id", e.Usk.Name)
 			}
-			if mp := longestMountPrefix(points, path.Clean(name)); mp != "" {
-				used[mp] = true
+			mp, ok := byID[uint32(*e.Usk.MntID)]
+			if !ok {
+				return nil, fmt.Errorf("unix socket %q is on mount %d, not in the dump's mount table", e.Usk.Name, *e.Usk.MntID)
 			}
+			used[mp] = true
 		case pathlessFileTypes[e.Type]:
 		default:
 			return nil, fmt.Errorf("descriptor kind %s is not understood", e.Type)
@@ -128,15 +136,4 @@ func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
-}
-
-// longestMountPrefix returns the mountpoint among points that holds p.
-func longestMountPrefix(points []string, p string) string {
-	best := ""
-	for _, mp := range points {
-		if (p == mp || mp == "/" || strings.HasPrefix(p, mp+"/")) && len(mp) > len(best) {
-			best = mp
-		}
-	}
-	return best
 }

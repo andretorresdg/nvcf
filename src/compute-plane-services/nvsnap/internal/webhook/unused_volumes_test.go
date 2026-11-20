@@ -151,6 +151,36 @@ func TestVolumesAt(t *testing.T) {
 	}
 }
 
+// Through admission, a pod that must keep its setup keeps it whatever
+// the record says: a Job's (which stops replacing its pods), one nothing
+// recreates (which starts cold in place), one opted out.
+func TestCRIUGroupRestore_KeepsSetupWhereAFailedRestoreNeedsIt(t *testing.T) {
+	g := CRIUGroup{Checkpoints: []string{"r0__1", "r1__1"}, Nodes: []string{"n0", "n1"}, UnusedVolumes: []string{"ngc-models"}}
+	for name, mutate := range map[string]func(p *corev1.Pod){
+		"Job":       func(p *corev1.Pod) { p.OwnerReferences[0].Kind = "Job" },
+		"bare":      func(p *corev1.Pod) { p.OwnerReferences = nil },
+		"opted out": func(p *corev1.Pod) { p.Annotations[KeepInitsAnnotation] = "true" },
+	} {
+		m, _ := groupMutator(t, g, "")
+		m.SkipUnusedInits = true
+		pod := kimiWorker("1")
+		mutate(pod)
+		patches, err := m.Mutate(context.Background(), pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := applyPatches(t, pod, patches)
+		if got.Annotations[CRIURestoreAnnotation] != "r1__1" {
+			t.Fatalf("%s: not admitted as a placeholder", name)
+		}
+		for _, c := range got.Spec.InitContainers {
+			if c.Name == "download-ngc-model" && c.Command[0] == HelperBin {
+				t.Errorf("%s: download skipped", name)
+			}
+		}
+	}
+}
+
 // Through admission: with the flag and a recorded decision, a rank's
 // placeholder skips the download; without the flag it does not.
 func TestCRIUGroupRestore_SkipsUnusedSetupOnlyWithTheFlag(t *testing.T) {

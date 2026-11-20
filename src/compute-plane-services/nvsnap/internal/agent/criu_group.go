@@ -1139,7 +1139,9 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	defer metrics.Active("checkpoint")()
 	capture := time.Now().UTC().Format("20060102T150405.000000000")
 	reqs := make([]CheckpointRequest, 0, len(ranks)+len(companions))
-	use := c.a.config.Webhook.SkipUnusedInits
+	// Only an instance of several members restores as a group, whose
+	// placeholders may skip setup.
+	use := c.a.config.Webhook.SkipUnusedInits && len(ranks)+len(companions) > 1
 	for _, p := range ranks {
 		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use})
 	}

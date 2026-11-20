@@ -46,17 +46,28 @@ func TestUsedMounts(t *testing.T) {
 	// entry on the model's mount; a socket bound under a mount uses it.
 	got, err = usedMounts(dumpFiles(
 		`{"type":"REG","reg":{"name":"/config/models/model-00001.safetensors","mnt_id":11153}}`,
-		`{"type":"UNIXSK","usk":{"name":"/run/sock/zmq.ipc=00"}}`), []byte(dumpMounts))
+		`{"type":"UNIXSK","usk":{"name":"/run/sock/zmq.ipc=00","mnt_id":11160}}`), []byte(dumpMounts))
 	if err != nil || !reflect.DeepEqual(got, []string{"/", "/config/models", "/dev/shm", "/run/sock"}) {
 		t.Fatalf("got %v, %v", got, err)
 	}
+	// Placed by its mount id: a relative name, or a long one crit wrapped.
+	got, err = usedMounts(dumpFiles(`{"type":"UNIXSK","usk":{"name":"/run/so=\nck/zmq.ipc","mnt_id":11153}}`), []byte(dumpMounts))
+	if err != nil || !reflect.DeepEqual(got, []string{"/", "/config/models", "/dev/shm"}) {
+		t.Fatalf("by mount id: got %v, %v", got, err)
+	}
 	// What cannot be accounted for makes the use unknown.
 	for name, extra := range map[string]string{
-		"unknown mount":    `{"type":"REG","reg":{"name":"/x","mnt_id":99}}`,
-		"no mount id":      `{"type":"REG","reg":{"name":"/x"}}`,
-		"inotify watch":    `{"type":"INOTIFY","ify":{}}`,
-		"unknown kind":     `{"type":"SOMETHING_NEW"}`,
-		"fanotify watches": `{"type":"FANOTIFY","ffy":{}}`,
+		"unknown mount": `{"type":"REG","reg":{"name":"/x","mnt_id":99}}`,
+		"no mount id":   `{"type":"REG","reg":{"name":"/x"}}`,
+		"inotify watch": `{"type":"INOTIFY","ify":{}}`,
+		"unknown kind":  `{"type":"SOMETHING_NEW"}`,
+		// A plugin's file (EXT) may be on any mount.
+		"plugin file": `{"type":"EXT","ext":{}}`,
+		// A socket bound by a relative name, or one whose long name crit
+		// broke across lines, is placed by its mount id, never its name.
+		"socket without a mount id":  `{"type":"UNIXSK","usk":{"name":"zmq.ipc"}}`,
+		"socket on an unknown mount": `{"type":"UNIXSK","usk":{"name":"/run/sock/x","mnt_id":99}}`,
+		"fanotify watches":           `{"type":"FANOTIFY","ffy":{}}`,
 	} {
 		if got, err := usedMounts(dumpFiles(extra), []byte(dumpMounts)); err == nil {
 			t.Errorf("%s: got %v, want an error", name, got)
@@ -104,7 +115,7 @@ func volumeUsePod(name string) *corev1.Pod {
 			InitContainers: []corev1.Container{{Name: "download-ngc-model", Command: []string{"download"},
 				VolumeMounts: []corev1.VolumeMount{{Name: "ngc-models", MountPath: "/config/models"}}}},
 			Containers: []corev1.Container{{Name: "main", Image: "vllm",
-				Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}},
+				Resources:    corev1.ResourceRequirements{Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}},
 				VolumeMounts: []corev1.VolumeMount{{Name: "ngc-models", MountPath: "/config/models"}}}},
 		},
 	}
@@ -142,6 +153,18 @@ func TestRecordUnusedVolumes(t *testing.T) {
 	recordUnusedVolumes(d, members, 2, nil, r, log)
 	if _, ok := d[groupUnusedVolumesKey]; ok {
 		t.Errorf("recorded with a member's use unknown: %v", d)
+	}
+	// Ranks first, then companions, in results' order: a companion's
+	// container is the one its record names. Here the companion (etcd)
+	// mounts no model, and the decision stands.
+	etcd := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "fn", OwnerReferences: members[0].OwnerReferences},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sidecar"}, {Name: "etcd"}}}}
+	none := []string{"/"}
+	r = append(results(), &CheckpointResult{CheckpointID: "c2", UsedMounts: &none})
+	d = map[string]string{}
+	recordUnusedVolumes(d, append(members, etcd), 2, map[string]string{"etcd": "etcd"}, r, log)
+	if d[groupUnusedVolumesKey] != "ngc-models" {
+		t.Errorf("with a companion: %v", d)
 	}
 	// A member that uses the model: nothing recorded.
 	withModel := []string{"/", "/config/models"}

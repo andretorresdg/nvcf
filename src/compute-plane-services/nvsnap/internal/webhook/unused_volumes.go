@@ -161,7 +161,9 @@ func GroupUnusedVolumes(members []MemberVolumeUse) ([]string, string) {
 // unusedVolumeSkips returns the inits pod's group placeholder skips for
 // unused that it would run without, and the name of an init it still runs
 // that writes one of them ("" for none): one some other container's reads
-// keep, which a restore would still wait for.
+// keep, which a restore would still wait for. A native sidecar that writes
+// one does not hold the restore back (the pod's containers start once it
+// has started), so it does not count, and runs as it did before.
 func unusedVolumeSkips(pod *corev1.Pod, container string, unused map[string]bool) (skips []string, blocked string) {
 	keep := initsToKeep(pod, container, unused)
 	base := initsToKeep(pod, container, nil)
