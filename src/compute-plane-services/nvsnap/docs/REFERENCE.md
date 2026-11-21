@@ -91,6 +91,9 @@ where the files column says.
 | `nvsnap.io/leader-uid` | `LeaderUIDAnnotation` (internal/election/election.go) | On the Lease is the UID of the leader pod, bound once the pod exists (see ResolveLeader). |
 | `nvsnap.io/lease-kind` | inline: internal/agent/replication_poll.go, internal/checkpointstore/percapture_pvc.go |  |
 | `nvsnap.io/model` | `IdentityLabel` (internal/modelvolume/modelvolume.go)<br>`annModel` (internal/server/manifests.go) | Is the short identity key on claims, PVs and pods. |
+| `nvsnap.io/model-cache-init` | `ModelCacheInitAnnotation` (internal/webhook/node_model_cache.go) | Names the wrapped download init, whose successful exit tells the agent the volume is complete. |
+| `nvsnap.io/model-cache-key` | `ModelCacheKeyLabel` (internal/webhook/node_model_cache.go) | Carries the download's cache key, for the agent on the pod's node (harvest, peer fetch, eviction pins). |
+| `nvsnap.io/model-cache-volume` | `ModelCacheVolumeAnnotation` (internal/webhook/node_model_cache.go) | Names the download volume the agent harvests from. |
 | `nvsnap.io/model-capture` | `CaptureLabel` (internal/modelvolume/modelvolume.go) | Is "true" on a pod whose engine downloads an artifact nvsnap has no download recipe for (a chart script pulling an NGC model) into a pod volume. |
 | `nvsnap.io/model-capture-volume` | `CaptureVolumeAnnotation` (internal/modelvolume/modelvolume.go) | Names the pod volume the engine downloads into. |
 | `nvsnap.io/model-complete` | `CompleteLabel` (internal/modelvolume/modelvolume.go) | Is "true" on the writer claim once the download exited 0. |
