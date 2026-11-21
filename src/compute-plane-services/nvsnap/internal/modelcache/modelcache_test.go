@@ -6,6 +6,7 @@ package modelcache
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -305,7 +306,7 @@ func TestHarvestRefusesATreeWrittenAfterTheDownload(t *testing.T) {
 func TestHarvestPublishesOnlyTheTreeTheDownloadFinishedWith(t *testing.T) {
 	s := &Store{Root: t.TempDir()}
 	src := modelTree(t)
-	ents, err := Scan(src)
+	ents, err := Scan(src, 0)
 	must(t, err)
 	fp := Fingerprint(ents)
 	if _, err := s.Harvest("k1", src, Limits{Fingerprint: fp}); err != nil {
@@ -331,7 +332,7 @@ func TestHarvestDoesNotFollowADirectorySwappedForASymlink(t *testing.T) {
 	outside := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(outside, "secret"), []byte("host"), 0o600))
 	var copied []string
-	err := walkNoFollow(src, func(n node) error {
+	err := walkNoFollow(src, 0, func(n node) error {
 		copied = append(copied, n.rel)
 		if n.rel == "a" { // examined; now swapped before it is entered
 			must(t, os.Rename(filepath.Join(src, "a"), filepath.Join(src, "a.old")))
@@ -385,9 +386,15 @@ func TestSeedRestoresModesAndMtimes(t *testing.T) {
 	if err != nil || fi.Mode().Perm() != 0o600 || !fi.ModTime().Equal(when) {
 		t.Fatalf("seeded config.json mode %v mtime %v, %v; want 0600 at %v", fi.Mode().Perm(), fi.ModTime(), err, when)
 	}
-	// The seeded tree has the download's fingerprint.
-	a, _ := Scan(src)
-	b, _ := Scan(dst)
+	// The seeded tree is the download's in everything but change times.
+	a, _ := Scan(src, 0)
+	b, _ := Scan(dst, 0)
+	for i := range a {
+		a[i].ctime = 0
+	}
+	for i := range b {
+		b[i].ctime = 0
+	}
 	if Fingerprint(a) != Fingerprint(b) {
 		t.Fatal("the seeded tree differs from the download in path, size, mode, owner or mtime")
 	}
@@ -407,5 +414,61 @@ func TestSeedRefusesAnotherUsersTreeWhenNotRoot(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(dst); len(ents) != 0 {
 		t.Fatal("the refused seed wrote files")
+	}
+}
+
+// A writer that rewrites a file with same-length bytes and puts its mtime
+// back still changes its ctime.
+func TestHarvestRefusesAFileRewrittenWithItsMtimeRestored(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	src := modelTree(t)
+	ents, err := Scan(src, 0)
+	must(t, err)
+	fp := Fingerprint(ents)
+	p := filepath.Join(src, "m/config.json")
+	fi, err := os.Stat(p)
+	must(t, err)
+	time.Sleep(20 * time.Millisecond)
+	must(t, os.WriteFile(p, []byte(`{"a":2}`), 0o644))
+	must(t, os.Chtimes(p, fi.ModTime(), fi.ModTime()))
+	if _, err := s.Harvest("k1", src, Limits{Fingerprint: fp}); !errors.Is(err, ErrChanged) {
+		t.Fatalf("err = %v, want ErrChanged", err)
+	}
+}
+
+func TestHarvestOfAnEmptyMeasuredTreeCopiesNoBytes(t *testing.T) {
+	src := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(src, "grew"), []byte("x"), 0o644))
+	_, err := (&Store{Root: t.TempDir()}).Harvest("k1", src, Limits{MaxBytes: 0, ExactBytes: true})
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestSeedGivesTheVolumeItsRecordedMode(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	src := modelTree(t)
+	must(t, unix.Chmod(src, 0o2770))
+	harvest(t, s, "k1", src)
+	gen, m, _ := s.Latest("k1")
+	dst := t.TempDir()
+	must(t, Seed(gen, m, dst))
+	fi, err := os.Stat(dst)
+	must(t, err)
+	if fi.Mode()&(os.ModePerm|os.ModeSetgid) != 0o770|os.ModeSetgid {
+		t.Fatalf("volume mode = %v, want setgid 0770", fi.Mode())
+	}
+}
+
+func TestScanStopsAtItsBound(t *testing.T) {
+	src := t.TempDir()
+	for i := 0; i < 10; i++ {
+		must(t, os.WriteFile(filepath.Join(src, fmt.Sprint(i)), nil, 0o644))
+	}
+	if _, err := Scan(src, 5); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+	if ents, err := Scan(src, 20); err != nil || len(ents) != 11 {
+		t.Fatalf("%d entries, %v; want the root and 10", len(ents), err)
 	}
 }

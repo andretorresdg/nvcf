@@ -556,17 +556,17 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 		log.WithError(err).Warn("model cache: no volume to harvest")
 		return
 	}
-	ents, err := modelcache.Scan(src)
+	ents, err := modelcache.Scan(src, modelCacheMaxEntries)
+	if errors.Is(err, modelcache.ErrTooLarge) {
+		log.Info("model cache: not harvesting a tree of that many entries")
+		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+		return
+	}
 	if err != nil {
 		log.WithError(err).Warn("model cache: reading the volume failed")
 		return
 	}
-	if len(ents) == 0 {
-		return
-	}
-	if len(ents) > modelCacheMaxEntries {
-		log.WithField("entries", len(ents)).Info("model cache: not harvesting a tree of that many entries")
-		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+	if len(ents) <= 1 { // the root alone
 		return
 	}
 	var size int64
@@ -583,7 +583,7 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 	start := time.Now()
 	// Anything written after the init finished (one-second resolution,
 	// so a second of slack) is the engine's, not the download's.
-	gen, err := c.store.Harvest(d.Key, src, modelcache.Limits{MaxBytes: size, MaxEntries: modelCacheMaxEntries,
+	gen, err := c.store.Harvest(d.Key, src, modelcache.Limits{MaxBytes: size, ExactBytes: true, MaxEntries: modelCacheMaxEntries,
 		NotAfter: finishedAt.Add(time.Second), Fingerprint: fingerprint})
 	if err != nil {
 		log.WithError(err).Warn("model cache: harvest failed; the next cold pod downloads")

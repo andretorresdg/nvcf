@@ -126,6 +126,22 @@ func TestNodeModelCacheKeyIsPerTenantAndPerRecipe(t *testing.T) {
 				}
 			}
 		},
+		"envFrom order": func(p *corev1.Pod) {
+			c := initByName(p, "download-ngc-model")
+			c.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "b"}}},
+				{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "a"}}}}
+		},
+		"fsGroup": func(p *corev1.Pod) {
+			g := int64(2000)
+			p.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &g}
+		},
+		"configmap items": func(p *corev1.Pod) {
+			for i := range p.Spec.Volumes {
+				if p.Spec.Volumes[i].Name == "scripts" {
+					p.Spec.Volumes[i].ConfigMap.Items = []corev1.KeyToPath{{Key: "v2.sh", Path: "start.sh"}}
+				}
+			}
+		},
 		"ngc env": func(p *corev1.Pod) {
 			initByName(p, "download-ngc-model").Env = append(initByName(p, "download-ngc-model").Env, corev1.EnvVar{Name: "NGC_CLI_MAX_CONCURRENCY", Value: "3"})
 		},
@@ -163,14 +179,6 @@ func TestNodeModelCacheLeavesOtherPodsAlone(t *testing.T) {
 			p := ngcFunctionPod()
 			c := initByName(p, "download-ngc-model")
 			c.VolumeMounts[0].SubPath = "data"
-			return p
-		}(),
-		"init writes another volume main reads": func() *corev1.Pod {
-			p := ngcFunctionPod()
-			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "rendered", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
-			c := initByName(p, "download-ngc-model")
-			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "rendered", MountPath: "/config/rendered"})
-			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "rendered", MountPath: "/config/rendered"})
 			return p
 		}(),
 		"already wrapped": func() *corev1.Pod {
@@ -252,6 +260,24 @@ func TestModelCacheKeyIsTheSameBeforeAndAfterWrapping(t *testing.T) {
 	}
 }
 
+// Another writable volume the init mounts and a later container reads may
+// be an output: the helper is told to watch it.
+func TestNodeModelCacheWatchesOtherWritableVolumes(t *testing.T) {
+	m := nodeCacheMutator(t)
+	p := ngcFunctionPod()
+	p.Spec.Volumes = append(p.Spec.Volumes,
+		corev1.Volume{Name: "rendered", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		corev1.Volume{Name: "ro-pvc", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "in", ReadOnly: true}}})
+	c := initByName(p, "download-ngc-model")
+	c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "rendered", MountPath: "/config/rendered"}, corev1.VolumeMount{Name: "ro-pvc", MountPath: "/in"})
+	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "rendered", MountPath: "/r"}, corev1.VolumeMount{Name: "ro-pvc", MountPath: "/in"})
+	out := applyPatches(t, p, m.nodeModelCachePatches(context.Background(), p, true))
+	cmd := strings.Join(initByName(out, "download-ngc-model").Command, " ")
+	if !strings.Contains(cmd, "--watch /config/rendered --") || strings.Contains(cmd, "--watch /in") {
+		t.Fatalf("command %q: want /config/rendered watched and the read-only claim not", cmd)
+	}
+}
+
 // A writable volume an earlier init filled is an input of the download,
 // not an output: the pod stays eligible (NVCA's merged certificates).
 func TestNodeModelCacheAcceptsAnInputVolumeFromAnEarlierInit(t *testing.T) {
@@ -265,5 +291,39 @@ func TestNodeModelCacheAcceptsAnInputVolumeFromAnEarlierInit(t *testing.T) {
 	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, certs)
 	if ops := m.nodeModelCachePatches(context.Background(), p, true); ops == nil {
 		t.Fatal("a pod whose download reads an earlier init's volume was left alone")
+	}
+}
+
+func TestModelCacheKeyFollowsEnvFromOrder(t *testing.T) {
+	key := func(names ...string) string {
+		p := ngcFunctionPod()
+		c := initByName(p, "download-ngc-model")
+		for _, n := range names {
+			c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: n}}})
+		}
+		d, ok := ResolveModelCacheDownload(context.Background(), nil, p, 0)
+		if !ok {
+			t.Fatal("not a cache download")
+		}
+		return d.Key
+	}
+	if key("a", "b") == key("b", "a") {
+		t.Fatal("envFrom order does not change the key; the last source wins in Kubernetes")
+	}
+}
+
+// A pod whose gpushare placement is already in its spec uses the bundle
+// even though the gpushare step adds nothing.
+func TestMutateTreatsAnAlreadyPlacedBundleAsPlaced(t *testing.T) {
+	m := nodeCacheMutator(t)
+	m.HostBundleRoot = "/bundle"
+	pod := ngcFunctionPod()
+	pod.Spec.Volumes = append(pod.Spec.Volumes, m.helperVolume())
+	ops, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := initByName(applyPatches(t, pod, ops), "download-ngc-model"); len(c.Command) < 2 || c.Command[1] != "model-cache" {
+		t.Fatalf("a pod already on the bundle was not wrapped: %q", c.Command)
 	}
 }

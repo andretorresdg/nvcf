@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache"
@@ -32,6 +33,9 @@ func modelCacheCmd(args []string) (int, error) {
 	wait := fs.Int("wait", 600, "most seconds to wait for a peer fetch in progress")
 	stale := fs.Int("stale", 20, "seconds after which the fetch heartbeat counts as dead")
 	poll := fs.Duration("poll", 2*time.Second, "how often to look again while waiting")
+	maxEntries := fs.Int("max-entries", 500000, "most entries a tree may have to be reported for caching")
+	var watch tryFlags
+	fs.Var(&watch, "watch", "another writable volume a later container reads: if the download changes it, the download is not cached (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
@@ -44,12 +48,17 @@ func modelCacheCmd(args []string) (int, error) {
 		return 0, nil
 	}
 	fmt.Println("nvsnap: model cache: downloading")
+	before := treesOf(watch, *maxEntries)
 	code, err := run(argv)
 	if code == 0 {
 		// What the download left, for the agent: it keeps a copy only if
-		// the volume still has exactly this tree when it reads it.
+		// the volume still has exactly this tree when it reads it. A
+		// download that also wrote another volume a later container reads
+		// is not cached: a seed would not produce that output.
 		msg := modelcache.InitDownloaded
-		if ents, serr := modelcache.Scan(*to); serr == nil {
+		if after := treesOf(watch, *maxEntries); after != before {
+			fmt.Println("nvsnap: model cache: the download changed another volume; it is not cached")
+		} else if ents, serr := modelcache.Scan(*to, *maxEntries); serr == nil {
 			msg += " " + modelcache.TreeField + modelcache.Fingerprint(ents)
 		}
 		report(msg)
@@ -95,6 +104,21 @@ func seedFromCache(cache, to string, wait, stale, poll time.Duration) bool {
 		}
 		time.Sleep(poll)
 	}
+}
+
+// treesOf fingerprints the watched volumes, in order; a volume that
+// cannot be read counts as changed.
+func treesOf(paths []string, max int) string {
+	var b strings.Builder
+	for _, p := range paths {
+		ents, err := modelcache.Scan(p, max)
+		if err != nil {
+			fmt.Fprintf(&b, "%s:unreadable %d;", p, time.Now().UnixNano())
+			continue
+		}
+		fmt.Fprintf(&b, "%s:%s;", p, modelcache.Fingerprint(ents))
+	}
+	return b.String()
 }
 
 func heartbeatFresh(p string, stale time.Duration) bool {

@@ -169,7 +169,7 @@ func TestModelCacheReportsTheDownloadedTree(t *testing.T) {
 	if code, err := modelCacheCmd(append([]string{"--cache", t.TempDir(), "--to", to, "--"}, download(to)...)); code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
-	ents, err := modelcache.Scan(to)
+	ents, err := modelcache.Scan(to, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,5 +213,26 @@ func TestModelCacheWaitIsCapped(t *testing.T) {
 func TestModelCacheNeedsACommand(t *testing.T) {
 	if code, err := modelCacheCmd([]string{"--cache", t.TempDir(), "--to", t.TempDir()}); code == 0 || err == nil {
 		t.Fatalf("no download command: code %d err %v, want an error", code, err)
+	}
+}
+
+// A download that also writes another volume a later container reads is
+// not reported for caching: a seed would skip that output.
+func TestModelCacheDoesNotReportADownloadThatWroteAnotherVolume(t *testing.T) {
+	to, other := t.TempDir(), t.TempDir()
+	dl := []string{"/bin/sh", "-c", "echo w > " + filepath.Join(to, "w") + "; echo lic > " + filepath.Join(other, "license")}
+	if code, err := modelCacheCmd(append([]string{"--cache", t.TempDir(), "--to", to, "--watch", other, "--"}, dl...)); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if got := modelcache.DownloadedTree(read(t, terminationLog)); got != "" {
+		t.Fatalf("reported tree %q for a download with another output", got)
+	}
+	// Reading the other volume is fine.
+	to2 := t.TempDir()
+	if code, err := modelCacheCmd(append([]string{"--cache", t.TempDir(), "--to", to2, "--watch", other, "--"}, download(to2)...)); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if modelcache.DownloadedTree(read(t, terminationLog)) == "" {
+		t.Fatal("a download that only read the other volume was not reported")
 	}
 }

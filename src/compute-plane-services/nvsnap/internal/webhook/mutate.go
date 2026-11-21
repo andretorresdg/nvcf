@@ -649,7 +649,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	bundled := false
 	if !isFallback || (fallback.Reason != FallbackGPUShareFailed && fallback.Reason != FallbackDriver) {
 		gp := m.gpusharePatches(ctx, pod)
-		bundled = len(gp) > 0
+		bundled = len(gp) > 0 || podHasVolume(pod, gpushareLibVolume) || podHasVolume(pod, helperVolumeName)
 		injectPatches = append(injectPatches, gp...)
 		injectPatches = append(injectPatches, m.captureHoldPatches(ctx, pod, len(gp) > 0)...)
 	}

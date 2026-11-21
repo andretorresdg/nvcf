@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 
@@ -29,17 +30,35 @@ type node struct {
 // that a running workload changes under the walk therefore cannot lead it
 // outside the tree (a directory swapped for a symlink to /), only to an
 // error.
-func walkNoFollow(root string, fn func(n node) error) error {
+//
+// max bounds the entries walked (0: no bound); past it the walk stops with
+// ErrTooLarge, before reading the rest, so a tree of millions of entries
+// costs neither memory nor time.
+func walkNoFollow(root string, max int, fn func(n node) error) error {
 	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
-	return walkDirFD(fd, "", fn)
+	seen := 0
+	return walkDirFD(fd, "", &walkBudget{max: max, seen: &seen}, fn)
 }
 
-func walkDirFD(dirfd int, prefix string, fn func(n node) error) error {
-	names, err := readNames(dirfd)
+type walkBudget struct {
+	max  int
+	seen *int
+}
+
+func (b *walkBudget) add(n int) error {
+	*b.seen += n
+	if b.max > 0 && *b.seen > b.max {
+		return fmt.Errorf("%w: over %d entries", ErrTooLarge, b.max)
+	}
+	return nil
+}
+
+func walkDirFD(dirfd int, prefix string, b *walkBudget, fn func(n node) error) error {
+	names, err := readNames(dirfd, b)
 	if err != nil {
 		return err
 	}
@@ -63,7 +82,7 @@ func walkDirFD(dirfd int, prefix string, fn func(n node) error) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
-		err = walkDirFD(sub, rel, fn)
+		err = walkDirFD(sub, rel, b, fn)
 		unix.Close(sub)
 		if err != nil {
 			return err
@@ -91,19 +110,34 @@ func openSame(dirfd int, name string, st *unix.Stat_t, flags int) (int, error) {
 	return fd, nil
 }
 
-func readNames(dirfd int) ([]string, error) {
+// readNames reads a directory's names in batches, counting them against
+// the walk's budget as it goes.
+func readNames(dirfd int, b *walkBudget) ([]string, error) {
 	dup, err := unix.Dup(dirfd)
 	if err != nil {
 		return nil, err
 	}
 	f := os.NewFile(uintptr(dup), "")
 	defer f.Close()
-	return f.Readdirnames(-1)
+	var names []string
+	for {
+		batch, err := f.Readdirnames(4096)
+		names = append(names, batch...)
+		if berr := b.add(len(batch)); berr != nil {
+			return nil, berr
+		}
+		if err == io.EOF || len(batch) == 0 {
+			return names, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // entryOf describes n, without its checksum.
 func entryOf(n node, target string) (Entry, error) {
-	e := Entry{Path: n.rel, Mode: n.st.Mode & 0o7777, UID: int(n.st.Uid), GID: int(n.st.Gid), Mtime: n.st.Mtim.Nano()}
+	e := Entry{Path: n.rel, Mode: n.st.Mode & 0o7777, UID: int(n.st.Uid), GID: int(n.st.Gid), Mtime: n.st.Mtim.Nano(), ctime: n.st.Ctim.Nano()}
 	switch n.st.Mode & unix.S_IFMT {
 	case unix.S_IFDIR:
 		e.Type = TypeDir
@@ -129,11 +163,29 @@ func readLink(n node) (string, error) {
 	return string(buf[:k]), nil
 }
 
-// Scan describes the tree at root without reading file contents: every
-// entry's path, type, size, mode, owner, mtime and link target.
-func Scan(root string) ([]Entry, error) {
-	var out []Entry
-	err := walkNoFollow(root, func(n node) error {
+// rootEntry describes the tree's root directory itself ("."): the volume
+// a download may have given its own owner and mode.
+func rootEntry(root string) (Entry, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(root, &st); err != nil {
+		return Entry{}, err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return Entry{}, fmt.Errorf("%w: %s is not a directory", ErrUnsupported, root)
+	}
+	return Entry{Path: ".", Type: TypeDir, Mode: st.Mode & 0o7777, UID: int(st.Uid), GID: int(st.Gid), Mtime: st.Mtim.Nano(), ctime: st.Ctim.Nano()}, nil
+}
+
+// Scan describes the tree at root without reading file contents: the root
+// (path ".") and every entry's path, type, size, mode, owner, mtime and
+// link target, at most max entries (0: no bound).
+func Scan(root string, max int) ([]Entry, error) {
+	r, err := rootEntry(root)
+	if err != nil {
+		return nil, err
+	}
+	out := []Entry{r}
+	err = walkNoFollow(root, max, func(n node) error {
 		var target string
 		if n.st.Mode&unix.S_IFMT == unix.S_IFLNK {
 			t, err := readLink(n)
@@ -152,16 +204,19 @@ func Scan(root string) ([]Entry, error) {
 	return out, err
 }
 
-// Fingerprint identifies a tree's shape and metadata: every entry's path,
-// type, size, mode, owner, mtime and link target, in walk order. The
-// download init records it when its download finishes; a harvest
-// publishes only a copy with the same fingerprint, so nothing the engine
-// changed afterwards (a file removed, added, rewritten) is cached.
+// Fingerprint identifies a tree as it lies on disk: every entry's path,
+// type, size, mode, owner, mtime, change time and link target, in walk
+// order. The download init records it when its download finishes; a
+// harvest publishes only a copy with the same fingerprint, so nothing
+// changed afterwards (a file removed, added, rewritten) is cached. The
+// change time is what makes that hold against a writer: any write, chmod
+// or chown sets it, and no unprivileged call sets it back, as one can an
+// mtime.
 func Fingerprint(entries []Entry) string {
 	h := sha256.New()
 	for _, e := range entries {
-		fmt.Fprintf(h, "%s\t%d:%s\t%d\t%o\t%d\t%d\t%d\t%d:%s\n",
-			e.Type, len(e.Path), e.Path, e.Size, e.Mode, e.UID, e.GID, e.Mtime, len(e.Target), e.Target)
+		fmt.Fprintf(h, "%s\t%d:%s\t%d\t%o\t%d\t%d\t%d\t%d\t%d:%s\n",
+			e.Type, len(e.Path), e.Path, e.Size, e.Mode, e.UID, e.GID, e.Mtime, e.ctime, len(e.Target), e.Target)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

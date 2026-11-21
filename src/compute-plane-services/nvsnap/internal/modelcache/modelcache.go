@@ -122,11 +122,17 @@ type Entry struct {
 	UID   int   `json:"uid"`
 	GID   int   `json:"gid"`
 	Mtime int64 `json:"mtime"`
+	// ctime is the entry's change time when it was read: part of a
+	// Fingerprint, never stored (a copy has its own).
+	ctime int64
 }
 
 // Manifest is a generation's list of entries, parents before children.
 type Manifest struct {
-	Version int     `json:"version"`
+	Version int `json:"version"`
+	// Root is the tree's root directory (path "."): its owner, mode and
+	// mtime, given to the volume a seed fills.
+	Root    *Entry  `json:"root,omitempty"`
 	Entries []Entry `json:"entries"`
 	// Bytes is the sum of the file sizes.
 	Bytes int64 `json:"bytes"`
@@ -136,6 +142,9 @@ type Manifest struct {
 type Limits struct {
 	MaxBytes   int64
 	MaxEntries int
+	// ExactBytes makes MaxBytes a bound even when it is 0: a harvest of a
+	// tree measured as empty may not copy a byte.
+	ExactBytes bool
 	// NotAfter, for a harvest, is when the download finished: an entry
 	// changed later was written by something else (the engine, once it
 	// started), so the tree is not the download's and is not cached.
@@ -276,6 +285,9 @@ func (m Manifest) Check(lim Limits) error {
 	if lim.MaxEntries > 0 && len(m.Entries) > lim.MaxEntries {
 		return fmt.Errorf("%w: %d entries", ErrTooLarge, len(m.Entries))
 	}
+	if m.Root != nil && (m.Root.Path != "." || m.Root.Type != TypeDir || m.Root.Mode > 0o7777) {
+		return fmt.Errorf("%w: manifest root", ErrUnsupported)
+	}
 	seen := map[string]string{}
 	var total int64
 	for _, e := range m.Entries {
@@ -404,17 +416,15 @@ func (s *Store) Harvest(key, src string, lim Limits) (string, error) {
 // after lim.NotAfter.
 func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	m := Manifest{Version: ManifestVersion}
-	var root unix.Stat_t
-	if err := unix.Lstat(src, &root); err != nil {
+	root, err := rootEntry(src)
+	if err != nil {
 		return m, err
 	}
-	if !lim.NotAfter.IsZero() && time.Unix(0, root.Mtim.Nano()).After(lim.NotAfter) {
+	m.Root = &root
+	if !lim.NotAfter.IsZero() && time.Unix(0, root.Mtime).After(lim.NotAfter) {
 		return m, fmt.Errorf("%w: the volume root", ErrWrittenAfter)
 	}
-	err := walkNoFollow(src, func(n node) error {
-		if lim.MaxEntries > 0 && len(m.Entries) >= lim.MaxEntries {
-			return fmt.Errorf("%w: over %d entries", ErrTooLarge, lim.MaxEntries)
-		}
+	err = walkNoFollow(src, lim.MaxEntries, func(n node) error {
 		if !lim.NotAfter.IsZero() && time.Unix(0, n.st.Mtim.Nano()).After(lim.NotAfter) {
 			return fmt.Errorf("%w: %s", ErrWrittenAfter, n.rel)
 		}
@@ -445,7 +455,7 @@ func copyIn(src, dst string, lim Limits) (Manifest, error) {
 			}
 		case TypeFile:
 			budget := int64(-1)
-			if lim.MaxBytes > 0 {
+			if lim.MaxBytes > 0 || lim.ExactBytes {
 				budget = lim.MaxBytes - m.Bytes
 			}
 			sum, err := copyFile(n, out, budget)
@@ -461,7 +471,7 @@ func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	if err != nil {
 		return m, err
 	}
-	if lim.Fingerprint != "" && Fingerprint(m.Entries) != lim.Fingerprint {
+	if lim.Fingerprint != "" && Fingerprint(append([]Entry{root}, m.Entries...)) != lim.Fingerprint {
 		return m, fmt.Errorf("%w: the tree is not the one the download finished with", ErrChanged)
 	}
 	return m, nil
@@ -598,6 +608,32 @@ func Seed(gen string, m Manifest, dst string) error {
 		if err := unix.UtimesNanoAt(unix.AT_FDCWD, p, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 			return err
 		}
+	}
+	if r := m.Root; r != nil {
+		// The volume itself, as the download left it: files the engine
+		// creates later inherit its group and are checked against its mode.
+		var st unix.Stat_t
+		if err := unix.Stat(dst, &st); err != nil {
+			return err
+		}
+		if int(st.Uid) != r.UID || int(st.Gid) != r.GID {
+			uid := r.UID
+			if !root {
+				uid = -1
+			}
+			if err := unix.Chown(dst, uid, r.GID); err != nil {
+				return fmt.Errorf("%w: the volume: %v", ErrOwner, err)
+			}
+		}
+		if st.Mode&0o7777 != r.Mode {
+			if err := unix.Chmod(dst, r.Mode); err != nil {
+				return fmt.Errorf("%w: the volume's mode: %v", ErrOwner, err)
+			}
+		}
+		// Its mtime only matters to nothing the engine does; a volume the
+		// helper does not own may refuse it.
+		ts := []unix.Timespec{unix.NsecToTimespec(r.Mtime), unix.NsecToTimespec(r.Mtime)}
+		_ = unix.UtimesNanoAt(unix.AT_FDCWD, dst, ts, 0)
 	}
 	return nil
 }

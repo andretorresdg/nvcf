@@ -116,7 +116,7 @@ func (n *mcNode) downloaded(t *testing.T, pod *corev1.Pod, files map[string]stri
 	}
 	// The init reports the tree it left, as the helper does.
 	if len(pod.Status.InitContainerStatuses) > 0 && pod.Status.InitContainerStatuses[0].State.Terminated != nil {
-		ents, err := modelcache.Scan(dir)
+		ents, err := modelcache.Scan(dir, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

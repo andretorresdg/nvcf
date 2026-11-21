@@ -58,10 +58,13 @@ cluster would need an elected writer and a wait on it; it is not built (section 
 - the model identity and its layout in the volume (`modelid` `ShareKey`);
 - the download init's image;
 - its command and arguments;
-- its env, except the platform's per-instance metadata (`GROVE_*`, `NVCF_*`, `KUBERNETES_*`, `POD_*`, `NODE_*`,
-  `HOSTNAME`, `OTEL_*`), which would split every redeploy's key;
-- its `envFrom` sources and its volume mounts with their sources, by name. A Secret or ConfigMap whose content
-  changes under the same name is the same recipe.
+- its env in declared order, except the platform's per-instance metadata (`GROVE_*`, `NVCF_*`, `KUBERNETES_*`,
+  `POD_*`, `NODE_*`, `HOSTNAME`, `OTEL_*`), which would split every redeploy's key;
+- its `envFrom` sources in order (the last one wins);
+- its volume mounts, each with its volume's full source;
+- the pod's and the init's security contexts (`fsGroup` and the users decide the owners a download leaves).
+
+A Secret or ConfigMap whose content changes under the same name is the same recipe.
 
 Admission and the agent both compute the key from the pod spec and the namespace (`ResolveModelCacheDownload`). The
 agent never takes it from the label admission sets: a pod that labels itself with another key is ignored.
@@ -86,8 +89,10 @@ It wraps an init only when all of these hold:
 - The pod already uses the node's nvsnap bundle, because the gpushare library is placed. The helper comes from the
   same bundle, so a pod that did not depend on the bundle does not start to.
 - The init mounts its download volume whole, with no `subPath`.
-- The init writes no other volume that a later container reads, unless an earlier init also mounts that volume, as
-  an input prepared for it. A seed fills the download volume only.
+
+Any other volume the init can write and a later container reads might be an output that a seed would not produce.
+Admission cannot tell, so it passes each one to the helper with `--watch`. The helper fingerprints these volumes
+before and after the download; a download that changed one is not cached.
 
 **The helper**, in the init:
 1. If the volume already has content, a restarted init, it runs the download, which knows how to continue.
@@ -97,9 +102,13 @@ It wraps an init only when all of these hold:
 4. Otherwise it runs the download unchanged, and passes its exit code through.
 
 It reports `seeded` or `downloaded` as the init's termination message. After a download it adds the tree's
-fingerprint: a hash of every entry's path, type, size, mode, owner, mtime and link target.
+fingerprint: a hash of the volume root and every entry's path, type, size, mode, owner, mtime, change time and link
+target, over at most 500,000 entries. The change time is what makes the fingerprint hold against a writer: any write,
+`chmod` or `chown` sets it, and no unprivileged call sets it back, as one can an mtime. A runtime that relabels the
+volume's files when the main container starts would change every change time; the agent then keeps nothing (it logs
+the mismatch) and pods download as before.
 
-A seed gives every entry its recorded owner, mode (special bits included) and mtime. If the helper runs as root, it
+A seed gives every entry, and the volume itself, its recorded owner, mode (special bits included) and mtime. If the helper runs as root, it
 sets any owner. If not, every entry must belong to the helper's own user, as when the download ran as that user;
 otherwise it refuses before writing and the pod downloads. The cache's own copies are readable by any user.
 

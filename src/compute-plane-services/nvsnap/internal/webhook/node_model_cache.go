@@ -5,9 +5,9 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -93,7 +93,11 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 	if wait <= 0 {
 		wait = 600
 	}
-	argv := append([]string{HelperBin, "model-cache", "--cache", ModelCacheMount, "--to", to, "--wait", strconv.Itoa(wait), "--"}, containerArgv(init)...)
+	argv := []string{HelperBin, "model-cache", "--cache", ModelCacheMount, "--to", to, "--wait", strconv.Itoa(wait)}
+	for _, w := range d.Watch {
+		argv = append(argv, "--watch", w)
+	}
+	argv = append(append(argv, "--"), containerArgv(init)...)
 	base := fmt.Sprintf("/spec/initContainers/%d", idx)
 	patches := []PatchOp{{Op: "replace", Path: base + "/command", Value: argv}}
 	if init.Args != nil {
@@ -128,6 +132,10 @@ type ModelCacheDownload struct {
 	// Download is the init's own download command, with the helper's
 	// wrapping removed.
 	Download []string
+	// Watch are the mount paths, in the init, of the other writable
+	// volumes a later container reads: the helper checks the download
+	// left them as it found them before the download is cached.
+	Watch []string
 	// Wrapped reports whether the init already runs under the helper.
 	Wrapped bool
 }
@@ -139,9 +147,14 @@ var modelCachePrefix = []string{HelperBin, "model-cache"}
 // cache key, from the pod spec and the namespace's tenant only. The agent
 // calls it too, on the admitted pod: it never takes a key from a label a
 // pod could set itself, so no pod can put its files in another tenant's
-// or another model's cache.
+// or another model's cache. A wrapped init is resolved as it was before
+// admission wrapped it, so both find the same init and key.
 func ResolveModelCacheDownload(ctx context.Context, tenants TenantScoper, pod *corev1.Pod, mainContainer int) (ModelCacheDownload, bool) {
 	var d ModelCacheDownload
+	pod, wrapped, ok := unwrapModelCache(pod)
+	if !ok {
+		return d, false
+	}
 	res, ok := modelid.Resolve(pod, mainContainer)
 	if !ok || res.Identity.Scheme == "path" {
 		return d, false
@@ -160,42 +173,67 @@ func ResolveModelCacheDownload(ctx context.Context, tenants TenantScoper, pod *c
 		return d, false
 	}
 	init := pod.Spec.InitContainers[idx]
-	if why := notSeedable(pod, idx, land.VolumeName); why != "" {
+	// Without its own command the init runs its image's entrypoint, which
+	// cannot be wrapped; another helper step is not a download.
+	if len(init.Command) == 0 || init.Command[0] == HelperBin {
 		return d, false
 	}
-	argv := containerArgv(&init)
-	if len(argv) >= 2 && argv[0] == modelCachePrefix[0] && argv[1] == modelCachePrefix[1] {
-		dash := -1
-		for i, a := range argv {
-			if a == "--" {
-				dash = i
-				break
-			}
-		}
-		if dash < 0 || dash == len(argv)-1 {
-			return d, false
-		}
-		argv, d.Wrapped = argv[dash+1:], true
-	} else if len(init.Command) == 0 || init.Command[0] == HelperBin {
-		// Without its own command the init runs its image's entrypoint,
-		// which cannot be wrapped; another helper step is not a download.
+	watch, ok := seedable(pod, idx, land.VolumeName)
+	if !ok {
 		return d, false
 	}
 	scope := "namespace:" + pod.Namespace
 	if tenants != nil {
 		scope = tenants.Scope(ctx, pod.Namespace)
 	}
-	init.Command, init.Args = argv, nil
 	d.Key = modelcache.Key(scope, res.ShareKey(), init.Image, downloadRecipe(pod, &init))
-	d.ShareKey, d.Landing, d.InitIndex, d.Download = res.ShareKey(), land, idx, argv
+	d.ShareKey, d.Landing, d.InitIndex, d.Download, d.Watch, d.Wrapped = res.ShareKey(), land, idx, containerArgv(&init), watch, wrapped
 	return d, true
 }
 
-// notSeedable says why the download init at idx cannot be replaced by a
-// seed of its volume vol, or "" when it can. A seed fills vol and nothing
-// else, so the init must write nothing else a later container reads, and
-// must see vol whole (a subPath mount sees part of what a harvest keeps).
-func notSeedable(pod *corev1.Pod, idx int, vol string) string {
+// unwrapModelCache returns pod as it was before admission wrapped its
+// download init: the init's own command back, nvsnap's mounts gone. A pod
+// with no wrapped init is returned as is; a malformed wrapper is not ok.
+func unwrapModelCache(pod *corev1.Pod) (*corev1.Pod, bool, bool) {
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		argv := containerArgv(c)
+		if len(argv) < 2 || argv[0] != modelCachePrefix[0] || argv[1] != modelCachePrefix[1] {
+			continue
+		}
+		dash := -1
+		for j, a := range argv {
+			if a == "--" {
+				dash = j
+				break
+			}
+		}
+		if dash < 0 || dash == len(argv)-1 {
+			return nil, false, false
+		}
+		out := pod.DeepCopy()
+		oc := &out.Spec.InitContainers[i]
+		oc.Command, oc.Args = append([]string{}, argv[dash+1:]...), nil
+		var mounts []corev1.VolumeMount
+		for _, vm := range oc.VolumeMounts {
+			if vm.Name != ModelCacheVolume && vm.Name != helperVolumeName {
+				mounts = append(mounts, vm)
+			}
+		}
+		oc.VolumeMounts = mounts
+		return out, true, true
+	}
+	return pod, false, true
+}
+
+// seedable reports whether the download init at idx can be replaced by a
+// seed of its volume vol, and which other volumes to watch. The init must
+// see vol whole (a subPath mount sees part of what a harvest keeps). Every
+// other volume it can write and a later container reads might be an
+// output a seed would not produce; nothing at admission tells, so the
+// helper fingerprints each before and after the download, and a download
+// that changed one is not cached.
+func seedable(pod *corev1.Pod, idx int, vol string) ([]string, bool) {
 	init := &pod.Spec.InitContainers[idx]
 	sources := map[string]*corev1.Volume{}
 	for i := range pod.Spec.Volumes {
@@ -211,43 +249,42 @@ func notSeedable(pod *corev1.Pod, idx int, vol string) string {
 		}
 		return false
 	}
+	var watch []string
 	for _, vm := range init.VolumeMounts {
 		if vm.Name == vol {
 			if vm.SubPath != "" || vm.SubPathExpr != "" {
-				return "the init mounts its download volume with a subPath"
+				return nil, false
 			}
 			continue
 		}
-		if vm.ReadOnly || vm.Name == ModelCacheVolume || vm.Name == helperVolumeName {
+		if vm.ReadOnly {
 			continue
 		}
-		if v := sources[vm.Name]; v != nil && (v.Secret != nil || v.ConfigMap != nil || v.DownwardAPI != nil || v.Projected != nil) {
+		if v := sources[vm.Name]; v != nil && (v.Secret != nil || v.ConfigMap != nil || v.DownwardAPI != nil || v.Projected != nil ||
+			(v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ReadOnly)) {
 			continue // read-only by kind
 		}
-		// Written here and read later, and not something an earlier init
-		// prepared for this one: an output the seed would not produce.
-		later := mountedBy(pod.Spec.InitContainers[idx+1:], vm.Name) || mountedBy(pod.Spec.Containers, vm.Name)
-		earlier := mountedBy(pod.Spec.InitContainers[:idx], vm.Name)
-		if later && !earlier {
-			return "the init writes volume " + vm.Name + ", which a later container reads"
+		if mountedBy(pod.Spec.InitContainers[idx+1:], vm.Name) || mountedBy(pod.Spec.Containers, vm.Name) {
+			watch = append(watch, vm.MountPath)
 		}
 	}
-	return ""
+	return watch, true
 }
 
 // downloadRecipe is what, besides the image, decides the tree a download
-// init writes: its command and arguments, its env (but the platform's
-// per-instance names, orchestrationEnv), what it takes env from, and the
-// volumes it mounts and where. Values from a Secret, ConfigMap or field
-// are named, not read; a Secret or ConfigMap changed under the same name
-// is the same recipe. nvsnap's own mounts are left out, so a wrapped
-// init has the key it had before.
+// init writes: its command and arguments; its env in declared order (a
+// later entry can refer to an earlier one), but the platform's
+// per-instance names (orchestrationEnv); its envFrom sources in order (the
+// last wins); its volume mounts with each volume's full source; and the
+// pod's and the init's security contexts (the owners and group a download
+// leaves). Values from a Secret, ConfigMap or field are named, not read;
+// a Secret or ConfigMap changed under the same name is the same recipe.
 func downloadRecipe(pod *corev1.Pod, c *corev1.Container) string {
 	var b strings.Builder
+	line := func(kind, s string) { fmt.Fprintf(&b, "%s %d:%s\n", kind, len(s), s) }
 	for _, s := range containerArgv(c) {
-		fmt.Fprintf(&b, "arg %d:%s\n", len(s), s)
+		line("arg", s)
 	}
-	var lines []string
 	for _, e := range c.Env {
 		if hasAnyPrefix(e.Name, orchestrationEnv) {
 			continue
@@ -256,57 +293,31 @@ func downloadRecipe(pod *corev1.Pod, c *corev1.Container) string {
 		if e.ValueFrom != nil {
 			v = "<from " + valueFromRef(e.ValueFrom) + ">"
 		}
-		lines = append(lines, "env "+e.Name+"="+v)
+		line("env", e.Name+"="+v)
 	}
 	for _, f := range c.EnvFrom {
-		switch {
-		case f.ConfigMapRef != nil:
-			lines = append(lines, "envFrom configmap "+f.ConfigMapRef.Name+" prefix "+f.Prefix)
-		case f.SecretRef != nil:
-			lines = append(lines, "envFrom secret "+f.SecretRef.Name+" prefix "+f.Prefix)
-		}
+		line("envFrom", jsonOf(f))
 	}
 	for _, vm := range c.VolumeMounts {
-		if vm.Name == ModelCacheVolume || vm.Name == helperVolumeName {
-			continue
-		}
 		src := "?"
 		for i := range pod.Spec.Volumes {
 			if pod.Spec.Volumes[i].Name == vm.Name {
-				src = volumeSourceOf(&pod.Spec.Volumes[i])
+				src = jsonOf(pod.Spec.Volumes[i].VolumeSource)
 			}
 		}
-		lines = append(lines, fmt.Sprintf("mount %s ro=%t sub=%s%s <- %s", vm.MountPath, vm.ReadOnly, vm.SubPath, vm.SubPathExpr, src))
+		line("mount", jsonOf(vm)+" <- "+src)
 	}
-	sort.Strings(lines)
-	for _, s := range lines {
-		fmt.Fprintf(&b, "%d:%s\n", len(s), s)
-	}
+	line("podSecurity", jsonOf(pod.Spec.SecurityContext))
+	line("initSecurity", jsonOf(c.SecurityContext))
 	return b.String()
 }
 
-func volumeSourceOf(v *corev1.Volume) string {
-	switch {
-	case v.EmptyDir != nil:
-		return "emptyDir"
-	case v.ConfigMap != nil:
-		return "configmap " + v.ConfigMap.Name
-	case v.Secret != nil:
-		return "secret " + v.Secret.SecretName
-	case v.PersistentVolumeClaim != nil:
-		return "pvc " + v.PersistentVolumeClaim.ClaimName
-	case v.HostPath != nil:
-		return "hostPath " + v.HostPath.Path
-	case v.Projected != nil:
-		return "projected"
-	case v.DownwardAPI != nil:
-		return "downwardAPI"
-	case v.CSI != nil:
-		return "csi " + v.CSI.Driver
-	case v.Image != nil:
-		return "image " + v.Image.Reference
+func jsonOf(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "?"
 	}
-	return "other"
+	return string(b)
 }
 
 func hasAnyPrefix(s string, prefixes []string) bool {
