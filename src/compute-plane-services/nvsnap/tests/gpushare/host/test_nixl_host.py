@@ -275,6 +275,12 @@ class NixlPauseResume(unittest.TestCase):
         self.assertIn("released on 1 worker(s)", self.ok("nixl-pause"))
         self.ok("nixl-resume")
 
+    def test_pause_counts_everything_when_nccls_list_changes(self):
+        self.start(SHIM=self.shim, FLIP="1")
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn(", 2, 1)]", p.stdout + p.stderr)
+
     def test_pause_refuses_other_rdma_beside_nccls(self):
         self.start(SHIM=self.shim, FOREIGN="1")
         p = self.tool("nixl-pause")

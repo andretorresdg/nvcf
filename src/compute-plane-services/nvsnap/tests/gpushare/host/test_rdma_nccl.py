@@ -84,7 +84,10 @@ int nvsnap_ibv_count(void) { return 1; }
 #ifndef OLD
 int nvsnap_ibv_fds(int *fds, int max)
 {
-    if (fd0 < 0) return 0;
+    static int calls;
+    /* FLIP: every other call finds no device, as if NCCL had just closed
+     * one, and its number might have gone to another user. */
+    if (fd0 < 0 || (getenv("FLIP") && calls++ % 2)) return 0;
     if (max > 0) fds[0] = fd0;
     if (max > 1) fds[1] = ev0;
     return 2;
@@ -98,6 +101,7 @@ int nvsnap_ibv_fds(int *fds, int max)
 #   foreignmap  + a mapping of another device, its file closed
 #   samemap     + a mapping of NCCL's device, its file closed
 #   foreignev   + another event file
+#   (FLIP set: NCCL's list changes during the check)
 #   noshim      no libnvsnap_ibv; a file open as in "owned"
 # then prints the pause's count (pause_open, pause_mapped).
 PROBE = r"""
@@ -243,6 +247,10 @@ class RdmaNCCL(unittest.TestCase):
     def test_a_mapping_of_another_device_counts(self):
         out = self.probe("foreignmap")
         self.assertEqual((out["pause_open"], out["pause_mapped"]), ("0", "1"), out)
+
+    def test_a_list_that_changes_during_the_check_leaves_nothing_out(self):
+        out = self.probe("owned", FLIP="1")
+        self.assertEqual((out["pause_open"], out["pause_mapped"]), ("2", "1"), out)
 
     def test_a_mapping_of_nccls_device_without_its_file_is_not_seen(self):
         # rdma-core unmaps at close, so another user leaves none; if one is

@@ -1282,16 +1282,24 @@ static int ibv_devices(void)
  * those devices. A mapping another user left of one of them after closing
  * its file (rdma-core unmaps at close) is not seen here: the dump fails on
  * it, and the capture rolls back as for any failed dump. */
-static void rdma_files(int *open, int *mapped, int nccl)
+enum { RDMA_MAX_OWN = 64 };
+
+/* NCCL's files (nvsnap_ibv_fds) in own; 0 when there are none, or more
+ * than fit (cannot tell: count them all). */
+static int nccl_rdma_fds(int *own)
 {
-    enum { MAX_OWN = 64 };
+    if (ibv_devices() <= 0 || !ibv.fds) return 0;
+    int n = ibv.fds(own, RDMA_MAX_OWN);
+    return n < 0 || n > RDMA_MAX_OWN ? 0 : n;
+}
+
+/* rdma_files with the files in own[n_own] left out. */
+static void rdma_scan(int *open, int *mapped, const int *own, int n_own)
+{
+    enum { MAX_OWN = RDMA_MAX_OWN };
     static const size_t dl = sizeof(GPUSHARE_RDMA_DIR) - 1;
-    int own[MAX_OWN], n_own = 0, n_devs = 0;
+    int n_devs = 0;
     char devs[MAX_OWN][128], p[300], l[256];
-    if (nccl && ibv_devices() > 0 && ibv.fds) {
-        n_own = ibv.fds(own, MAX_OWN);
-        if (n_own < 0 || n_own > MAX_OWN) n_own = 0;  /* cannot tell: count them all */
-    }
     *open = *mapped = 0;
     DIR *d = opendir("/proc/self/fd");
     for (struct dirent *e; d && (e = readdir(d));) {
@@ -1320,6 +1328,17 @@ static void rdma_files(int *open, int *mapped, int nccl)
         *mapped += !mine;
     }
     if (f) fclose(f);
+}
+
+static void rdma_files(int *open, int *mapped, int nccl)
+{
+    int own[RDMA_MAX_OWN], again[RDMA_MAX_OWN];
+    int n = nccl ? nccl_rdma_fds(own) : 0;
+    rdma_scan(open, mapped, own, n);
+    /* NCCL opened or closed a device meanwhile: a number in the list may
+     * have gone to another user. Count them all. */
+    if (n && (nccl_rdma_fds(again) != n || memcmp(own, again, n * sizeof(int))))
+        rdma_scan(open, mapped, own, 0);
 }
 
 /* Hold launches, drain GPU work, and check that "release" can drop every
@@ -2452,17 +2471,20 @@ static const char nixl_py[] =
     "            c._nvsnap_state = 'released'\n"
     "        return 1\n"
     "\n"
-    "    def w_rdma(_w):\n"
+    "    def w_rdma(_w, skip=True):\n"
     "        # As rdma_files: NCCL's own, through libnvsnap_ibv, are left to\n"
     "        # \"release\", which closes them.\n"
     "        import ctypes\n"
     "        d, own, devs, n, m = '" GPUSHARE_RDMA_DIR "', set(), set(), 0, 0\n"
-    "        try:\n"
-    "            a = (ctypes.c_int * 64)()\n"
-    "            k = ctypes.CDLL('libnvsnap_ibv.so', mode=os.RTLD_NOLOAD).nvsnap_ibv_fds(a, 64)\n"
-    "            own = set(a[:k]) if 0 <= k <= 64 else set()\n"
-    "        except (OSError, AttributeError):\n"
-    "            pass\n"
+    "        def nccl_fds():\n"
+    "            try:\n"
+    "                a = (ctypes.c_int * 64)()\n"
+    "                k = ctypes.CDLL('libnvsnap_ibv.so', mode=os.RTLD_NOLOAD).nvsnap_ibv_fds(a, 64)\n"
+    "                return list(a[:k]) if 0 <= k <= 64 else []\n"
+    "            except (OSError, AttributeError):\n"
+    "                return []\n"
+    "        first = nccl_fds() if skip else []\n"
+    "        own = set(first)\n"
     "        for f in os.listdir('/proc/self/fd'):\n"
     "            try:\n"
     "                t = os.readlink('/proc/self/fd/' + f)\n"
@@ -2477,6 +2499,9 @@ static const char nixl_py[] =
     "            for l in fm:\n"
     "                i = l.find(' ' + d)\n"
     "                m += i >= 0 and l[i + 1:].rstrip('\\n') not in devs\n"
+    "        # NCCL opened or closed a device meanwhile: count them all.\n"
+    "        if own and nccl_fds() != first:\n"
+    "            return w_rdma(_w, False)\n"
     "        return os.getpid(), n, m\n"
     "\n"
     "    def w_released(_w):\n"
