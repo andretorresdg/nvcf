@@ -29,6 +29,14 @@ public class RowUpdateLockDao {
 
     private final RowUpdateLockRepository repository;
 
+    public boolean markCompleted(String tableName, String recordKey, Instant completedAt) {
+        return repository.lock(tableName, recordKey, completedAt, 0);
+    }
+
+    public boolean isCompleted(String tableName, String recordKey) {
+        return repository.existsByTableNameAndRecordKey(tableName, recordKey);
+    }
+
     public boolean lock(String tableName, String recordKey, Instant updatedAt, int ttl) {
         return repository.lock(tableName, recordKey, updatedAt, ttl);
     }

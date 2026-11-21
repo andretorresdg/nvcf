@@ -105,6 +105,27 @@
       "name": "Prometheus Metrics Tracer Common",
       "url": "http://github.com/prometheus/client_java"
     },
+    "net.javacrumbs.shedlock:shedlock-core:7.9.0": {
+      "licenses": [
+        "The Apache Software License, Version 2.0"
+      ],
+      "name": "net.javacrumbs.shedlock:shedlock-core",
+      "url": "https://github.com/lukas-krecan/ShedLock"
+    },
+    "net.javacrumbs.shedlock:shedlock-provider-cassandra:7.9.0": {
+      "licenses": [
+        "The Apache Software License, Version 2.0"
+      ],
+      "name": "net.javacrumbs.shedlock:shedlock-provider-cassandra",
+      "url": "https://github.com/lukas-krecan/ShedLock"
+    },
+    "net.javacrumbs.shedlock:shedlock-spring:7.9.0": {
+      "licenses": [
+        "The Apache Software License, Version 2.0"
+      ],
+      "name": "net.javacrumbs.shedlock:shedlock-spring",
+      "url": "https://github.com/lukas-krecan/ShedLock"
+    },
     "org.apache.commons:commons-collections4:4.5.0": {
       "licenses": [
         "Apache-2.0"

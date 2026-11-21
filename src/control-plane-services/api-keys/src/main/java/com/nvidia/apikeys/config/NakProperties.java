@@ -39,7 +39,7 @@ import org.springframework.validation.annotation.Validated;
 @AllArgsConstructor
 @Configuration
 @Validated
-@ConfigurationProperties(prefix = "apikeys", ignoreUnknownFields = false)
+@ConfigurationProperties(prefix = "apikeys", ignoreUnknownFields = true)
 public class NakProperties {
 
     // service metadata
@@ -75,4 +75,14 @@ public class NakProperties {
     @NotNull
     @NestedConfigurationProperty
     private EncryptedModelConverterProperties encryptedModelConverter;
+
+    @Valid
+    @NestedConfigurationProperty
+    @Builder.Default
+    private SchedulerProperties scheduler = new SchedulerProperties();
+
+    @Data
+    public static class SchedulerProperties {
+        private boolean enabled = true;
+    }
 }

@@ -32,6 +32,8 @@ import org.springframework.stereotype.Repository;
 @Repository
 public interface RowUpdateLockRepository extends MapIdCassandraRepository<RowUpdateLockModel> {
 
+    boolean existsByTableNameAndRecordKey(String tableName, String recordKey);
+
     String TTL = "ttl";
 
     @Query("INSERT INTO " + TABLE_NAME
