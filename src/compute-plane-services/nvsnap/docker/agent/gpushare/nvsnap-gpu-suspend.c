@@ -33,6 +33,31 @@ SPDX-License-Identifier: Apache-2.0
  *                 stop + CRIU restore, or full-save) it freezes every thread
  *                 except the restore thread itself, SIGCONTs, restores.
  *   open          After resume --hold-gate: let the pids' GPU launches through.
+ *   mx-pause      Before suspend: ModelExpress in each pid stops serving its
+ *                 weights to peers and drops its NIXL/RDMA state, which CRIU
+ *                 cannot dump. Each reply counts the RDMA device files the
+ *                 pid still has open or mapped; mx-pause fails while any
+ *                 are left (RDMA outside ModelExpress, too). Needs
+ *                 ModelExpress >= 0.7: with an earlier one, mx-pause fails
+ *                 (the load context is gone, nothing to pause); upgrade it.
+ *                 When it fails, every pid is mx-resumed.
+ *   mx-resume     After open (or resume without --hold-gate): ModelExpress
+ *                 registers the weights again and republishes them. After a
+ *                 restore into another pod, pass --host with that pod's IP:
+ *                 the restored process still has the captured pod's address
+ *                 and would publish it, unreachable from other pods.
+ *   nixl-pause    Before suspend (after mx-pause, if both): vLLM's NIXL KV
+ *                 connector (disaggregated prefill/decode) in each pid stops:
+ *                 the engine takes no new requests, waits for KV transfers in
+ *                 flight, and drops its NIXL agent and RDMA state. Fails, as
+ *                 mx-pause does, while any RDMA device file is left (NCCL
+ *                 over RDMA, say), or when the process's UCX is not 1.22
+ *                 (restored into another pod, it would keep the old pod's
+ *                 routes); then every pid is resumed. The reply names the
+ *                 UCX ("..., UCX 1.22.0").
+ *   nixl-resume   After open: the connectors come back under a new engine id
+ *                 and the engine takes requests again. --host as for
+ *                 mx-resume: the address decode engines reach it at.
  *   gpus [FILE]   Print (or write to FILE) the UUIDs of the GPUs visible here.
  *
  * --hold-gate (resume after stop + CRIU restore): the pids run, but their
@@ -286,6 +311,7 @@ static int visible_gpus(CUuuid *out, int max)
  * library does not load or lacks an entry point.
  */
 static const char *libcuda_path = "libcuda.so.1";  /* --libcuda */
+static const char *mx_host;  /* --host (mx-resume, nixl-resume) */
 
 #define PROBE_BYTES (1 << 20)
 
@@ -666,9 +692,20 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + n;
     int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (s < 0) return -1;
+    /* "release"/"load" move the saved GPU memory: allow for slow disks.
+     * "open" waits at most 2 s for the state lock: a pid silent for longer
+     * is stuck or dying, and the restore should fail now. The send timeout
+     * also bounds connect(), which waits while pid's accept queue is full. */
+    int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
+    struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(s, (struct sockaddr *)&a, len) != 0) {
+        int e = errno;
         close(s);
-        return 1;
+        if (e != EAGAIN) return 1;  /* no control socket */
+        printf("pid=%d %s: err control socket not accepting (%s)\n", pid, cmd, strerror(e));
+        return -1;
     }
     /* An abstract name can be bound by anyone in the network namespace:
      * talk only to pid itself (so this tool must run in its pid namespace). */
@@ -680,12 +717,6 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
                pid, cmd, pid, pid, cl == sizeof(cr) ? cr.pid : -1);
         return -1;
     }
-    /* "release"/"load" move the saved GPU memory: allow for slow disks.
-     * "open" waits at most 2 s for the state lock: a pid silent for longer
-     * is stuck or dying, and the restore should fail now. */
-    int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
-    struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     char rep[GPUSHARE_REPLY_MAX] = "err no reply (timeout)";
     if (send(s, cmd, strlen(cmd) + 1, MSG_NOSIGNAL) < 0) snprintf(rep, sizeof(rep), "err send: %s", strerror(errno));
     else {
@@ -1773,10 +1804,15 @@ static void usage(const char *prog)
         "         stop         (after suspend: leave pids SIGSTOPped for CRIU dump)\n"
         "         resume       (restore + unlock all, then thaw)\n"
         "         open         (after resume --hold-gate: let the pids' GPU launches through)\n"
+        "         mx-pause     (before suspend: ModelExpress drops its NIXL/RDMA state)\n"
+        "         mx-resume    (after open: ModelExpress registers and republishes again)\n"
+        "         nixl-pause   (before suspend: vLLM's NIXL KV connector drops its RDMA state)\n"
+        "         nixl-resume  (after open: the connector comes back under a new engine id)\n"
         "         gpus [FILE]  (print or write the visible GPU UUIDs, for --gpu-map)\n"
         "         probe        (is the one visible GPU usable? prints ok or the failing\n"
         "                       step and CUDA error; exit 0, 2 on a failure, 1 if it cannot ask)\n"
         "--libcuda PATH: (probe) the driver library to load (default libcuda.so.1)\n"
+        "--host H: (mx-resume, nixl-resume) the address peers reach this pod at (its IP)\n"
         "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever; not with --fabric-map)\n"
         "--gpu-map FILE: restore GPUs listed in FILE onto the GPUs visible here\n"
         "--store S --ckpt-dir C: (suspend) libnvsnap_gpushare processes save GPU memory\n"
@@ -1821,6 +1857,8 @@ int main(int argc, char **argv)
             fabric_dir = argv[argi + 1];
         else if (strcmp(argv[argi], "--libcuda") == 0)
             libcuda_path = argv[argi + 1];
+        else if (strcmp(argv[argi], "--host") == 0)
+            mx_host = argv[argi + 1];
         else
             break;
         argi += 2;
@@ -1884,6 +1922,29 @@ int main(int argc, char **argv)
     }
     if (strcmp(action, "open") == 0) {
         failures = open_all(pids, n) < 0;
+        free(pids);
+        return failures;
+    }
+    if (!strcmp(action, "mx-pause") || !strcmp(action, "mx-resume") ||
+        !strcmp(action, "nixl-pause") || !strcmp(action, "nixl-resume")) {
+        /* "mx-pause" -> "mx pause", "nixl-resume" -> "nixl resume [HOST]" */
+        const char *dash = strchr(action, '-');
+        int kind = (int)(dash - action), pause = dash[1] == 'p';
+        char cmd[300];
+        if (mx_host && pause) {
+            fprintf(stderr, "--host goes with %.*s-resume\n", kind, action);
+            free(pids);
+            return 1;
+        }
+        snprintf(cmd, sizeof(cmd), "%.*s %s%s%s", kind, action, pause ? "pause" : "resume",
+                 mx_host ? " " : "", mx_host ? mx_host : "");
+        failures = ctl_all_par(pids, n, cmd) < 0;
+        /* A pid that paused would serve nothing until resumed. */
+        if (failures && pause) {
+            fprintf(stderr, "%s failed: resuming every pid\n", action);
+            snprintf(cmd, sizeof(cmd), "%.*s resume", kind, action);
+            ctl_all_par(pids, n, cmd);
+        }
         free(pids);
         return failures;
     }
