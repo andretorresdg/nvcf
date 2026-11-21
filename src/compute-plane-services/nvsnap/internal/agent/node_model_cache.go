@@ -787,12 +787,22 @@ func (a *Agent) startNodeModelCache(ctx context.Context, router *mux.Router) {
 			Error("model cache: needs a cache root, --auth-mode=required and model volumes off; the cache is off")
 		return
 	}
-	if a.config.NodeName == "" || a.kubeClient == nil {
-		log.Error("model cache: no node name or kube client; the cache is off")
+	if a.config.NodeName == "" {
+		log.Error("model cache: no node name; the cache is off")
 		return
 	}
+	// The agent's client is built by a later start-up step
+	// (startRootfsCapture); the cache does not depend on that order.
+	kube := a.kubeClient
+	if kube == nil {
+		var err error
+		if kube, err = buildKubeClient(); err != nil {
+			log.WithError(err).Error("model cache: no kube client; the cache is off")
+			return
+		}
+	}
 	// Main container 0, as the webhook's Mutator resolves it.
-	c := newNodeModelCache(cfg, a.kubeClient, a.config.NodeName, a.modelCacheNamespace(), agentTenants{a}, 0, a.peerAgentURL, log)
+	c := newNodeModelCache(cfg, kube, a.config.NodeName, a.modelCacheNamespace(), agentTenants{a}, 0, a.peerAgentURL, log)
 	router.HandleFunc("/v1/model-cache/{key}", c.manifestHandler).Methods("GET")
 	router.HandleFunc("/v1/model-cache/{key}/{gen}/file", c.fileHandler).Methods("GET")
 	go c.run(ctx)
