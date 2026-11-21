@@ -114,6 +114,17 @@ func (n *mcNode) downloaded(t *testing.T, pod *corev1.Pod, files map[string]stri
 		must(os.MkdirAll(filepath.Join(dir, filepath.Dir(p)), 0o755))
 		must(os.WriteFile(filepath.Join(dir, p), []byte(b), 0o644))
 	}
+	// The init reports the tree it left, as the helper does.
+	if len(pod.Status.InitContainerStatuses) > 0 && pod.Status.InitContainerStatuses[0].State.Terminated != nil {
+		ents, err := modelcache.Scan(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pod.Status.InitContainerStatuses[0].State.Terminated.Message = modelcache.InitDownloaded + " " + modelcache.TreeField + modelcache.Fingerprint(ents)
+		if _, err := n.kube.CoreV1().Pods(pod.Namespace).UpdateStatus(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func mcEventually(t *testing.T, what string, cond func() bool) {
@@ -406,5 +417,54 @@ func TestModelCacheDoesNotHarvestATreeTheEngineWrote(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if a.has(keyOf(pod)) {
 		t.Fatal("a tree written after the download finished was cached")
+	}
+}
+
+func TestModelCacheHarvestsOnlyTheTreeTheDownloadReported(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	a := newMCNode(t, kube, "a", map[string]string{})
+	// No reported tree (an init that never reported one): nothing kept.
+	silent := initDone(cachePod(t, "p1", "a", "u1"), 0)
+	addPod(t, kube, silent)
+	dir := filepath.Join(a.c.podsRoot, "u1", "volumes", "kubernetes.io~empty-dir", "ngc-models", "model")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "w.bin"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.c.tick(context.Background())
+	time.Sleep(300 * time.Millisecond)
+	if a.has(keyOf(silent)) {
+		t.Fatal("a tree no download reported was cached")
+	}
+
+	// Reported, then the engine removed a file before the harvest read it.
+	b := newMCNode(t, kube, "b", map[string]string{})
+	pod := initDone(cachePod(t, "p2", "b", "u2"), 0)
+	addPod(t, kube, pod)
+	b.downloaded(t, pod, map[string]string{"model/w.bin": "weights", "model/w2.bin": "more"})
+	if err := os.Remove(filepath.Join(b.c.podsRoot, "u2", "volumes", "kubernetes.io~empty-dir", "ngc-models", "model/w2.bin")); err != nil {
+		t.Fatal(err)
+	}
+	b.c.tick(context.Background())
+	time.Sleep(300 * time.Millisecond)
+	if b.has(keyOf(pod)) {
+		t.Fatal("a tree missing a downloaded file was cached")
+	}
+}
+
+func TestModelCacheDeletesASourceListOnceEmpty(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	a := newMCNode(t, kube, "a", map[string]string{})
+	key := "0123456789abcdef0123456789abcdef"
+	if err := a.c.register(context.Background(), key, "gen-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.c.deregister(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kube.CoreV1().ConfigMaps(mcNS).Get(context.Background(), sourcesName(key), metav1.GetOptions{}); err == nil {
+		t.Fatal("an empty source list was kept")
 	}
 }

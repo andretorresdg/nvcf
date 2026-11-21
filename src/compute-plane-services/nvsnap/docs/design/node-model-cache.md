@@ -57,8 +57,11 @@ cluster would need an elected writer and a wait on it; it is not built (section 
 - the tenant of the pod's namespace;
 - the model identity and its layout in the volume (`modelid` `ShareKey`);
 - the download init's image;
-- its command, its arguments and the env vars that steer a download (`NGC_*`, `HF_*`, `HUGGING*`, `MODEL*`,
-  `NIM_*`).
+- its command and arguments;
+- its env, except the platform's per-instance metadata (`GROVE_*`, `NVCF_*`, `KUBERNETES_*`, `POD_*`, `NODE_*`,
+  `HOSTNAME`, `OTEL_*`), which would split every redeploy's key;
+- its `envFrom` sources and its volume mounts with their sources, by name. A Secret or ConfigMap whose content
+  changes under the same name is the same recipe.
 
 Admission and the agent both compute the key from the pod spec and the namespace (`ResolveModelCacheDownload`). The
 agent never takes it from the label admission sets: a pod that labels itself with another key is ignored.
@@ -77,6 +80,14 @@ so no directory anyone has mounted is replaced.
 
 **Admission** (`nodeModelCachePatches`) wraps the download init in `nvsnap-helper model-cache`. It mounts
 `<root>/<key>` read-only into that init only, and labels and annotates the pod with the key, the volume and the init.
+It wraps an init only when all of these hold:
+
+- The pod is a cold pod: the restore and election branches of admission did not take it.
+- The pod already uses the node's nvsnap bundle, because the gpushare library is placed. The helper comes from the
+  same bundle, so a pod that did not depend on the bundle does not start to.
+- The init mounts its download volume whole, with no `subPath`.
+- The init writes no other volume that a later container reads, unless an earlier init also mounts that volume, as
+  an input prepared for it. A seed fills the download volume only.
 
 **The helper**, in the init:
 1. If the volume already has content, a restarted init, it runs the download, which knows how to continue.
@@ -85,20 +96,32 @@ so no directory anyone has mounted is replaced.
 3. It waits only while the agent's fetch heartbeat (`<key>/.incoming`) is fresh, and never past `wait` seconds.
 4. Otherwise it runs the download unchanged, and passes its exit code through.
 
-It reports `seeded` or `downloaded` as the init's termination message.
+It reports `seeded` or `downloaded` as the init's termination message. After a download it adds the tree's
+fingerprint: a hash of every entry's path, type, size, mode, owner, mtime and link target.
+
+A seed gives every entry its recorded owner, mode (special bits included) and mtime. If the helper runs as root, it
+sets any owner. If not, every entry must belong to the helper's own user, as when the download ran as that user;
+otherwise it refuses before writing and the pod downloads. The cache's own copies are readable by any user.
 
 **The agent** (`nodeModelCache`) looks at the pods on its node every 10 s:
+- **Sources.** Every 5 minutes the agent makes the ConfigMaps match its disk, which repairs a registration that
+  failed. A ConfigMap left with no source is deleted.
 - **Fill.** For a pod whose init has not finished and a key the node does not have, it fetches the key from a peer
   listed in the ConfigMap `nvsnap-model-cache-<key>`, over the agent HTTP API, while refreshing the heartbeat. Every
   file is checked against the peer's manifest. The copy is published and the node listed as a source only after all
   files pass.
 - **Harvest.** For a pod whose init exited 0 and a key the node does not have, it copies the pod's `emptyDir` from
-  the host into a new generation, hashing as it copies. If any source file changed during its copy, the attempt is
-  discarded.
+  the host into a new generation, hashing as it copies. It publishes the copy only if its fingerprint is the one the
+  init reported, so a file the engine removed, added or rewrote after starting is never cached. A download that
+  reported no fingerprint is not kept.
+  - The walk never follows a symlink anywhere in a path. Each entry is opened through its parent's descriptor and
+    checked to be the entry examined, so a workload that swaps a directory for a symlink mid-walk cannot lead the
+    agent out of the volume. A FIFO or device is refused without blocking.
 - **One attempt per key at a time.** A node runs one attempt per key, and each attempt has its own directory.
   Attempts left by an earlier agent are removed at start, before any new attempt begins; never by age.
-- **Disk.** Before an attempt, the agent reserves its size against `maxPercent` of the filesystem, counting complete
-  generations and other reservations, and keeps 10% of the filesystem free. If room is short it evicts the least
+- **Disk.** Before an attempt, the agent reserves its allocation against `maxPercent` of the filesystem: each file
+  rounded to 4 KiB, plus 4 KiB per entry. It counts complete generations by allocated blocks, plus other
+  reservations, keeps 10% of the filesystem free, and refuses trees of more than 500,000 entries. If room is short it evicts the least
   recently used keys first. A key used by a pending or running pod on the node, or busy with a fill, harvest or
   transfer, is never evicted. The node is removed from a key's sources before its files go.
 

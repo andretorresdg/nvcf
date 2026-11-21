@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -57,6 +56,10 @@ const (
 	modelCacheTick          = 10 * time.Second
 	modelCacheHeartbeat     = 5 * time.Second
 	modelCacheRetry         = 10 * time.Minute
+	modelCacheReconcile     = 5 * time.Minute
+	// modelCacheMaxEntries bounds a tree's entries: past it, a tree of
+	// many tiny files costs more in inodes than its bytes say.
+	modelCacheMaxEntries = 500000
 	// modelCacheFloorPercent of the filesystem stays free whatever the
 	// budget allows.
 	modelCacheFloorPercent = 10
@@ -138,8 +141,15 @@ func (c *nodeModelCache) run(ctx context.Context) {
 	c.reconcileSources(ctx)
 	t := time.NewTicker(modelCacheTick)
 	defer t.Stop()
+	last := time.Now()
 	for {
 		c.tick(ctx)
+		// A registration that failed (API down, too many conflicts) is
+		// made good here, and a node never stays listed for a key it lost.
+		if time.Since(last) >= modelCacheReconcile {
+			c.reconcileSources(ctx)
+			last = time.Now()
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -264,7 +274,7 @@ func (c *nodeModelCache) handlePod(ctx context.Context, pod *corev1.Pod, d webho
 		}
 		go func() {
 			defer c.end(d.Key)
-			c.harvest(ctx, pod, d, st.State.Terminated.FinishedAt.Time)
+			c.harvest(ctx, pod, d, st.State.Terminated.FinishedAt.Time, modelcache.DownloadedTree(st.State.Terminated.Message))
 		}()
 	}
 }
@@ -385,6 +395,19 @@ func (c *nodeModelCache) updateSources(ctx context.Context, key string, mutate f
 		if !mutate(cm.Data) {
 			return nil
 		}
+		if len(cm.Data) == 0 {
+			// The last source went: the ConfigMap goes too, unless a node
+			// listed itself since (the precondition fails, and we retry).
+			rv := cm.ResourceVersion
+			err = cms.Delete(ctx, cm.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{ResourceVersion: &rv}})
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
 		if _, err = cms.Update(ctx, cm, metav1.UpdateOptions{}); apierrors.IsConflict(err) {
 			continue
 		}
@@ -470,7 +493,10 @@ func (c *nodeModelCache) fillFrom(ctx context.Context, key, node string) (string
 	if !strings.HasPrefix(pm.Gen, modelcache.GenPrefix) || !validPathSegmentOK(pm.Gen) {
 		return "", 0, fmt.Errorf("peer named generation %q", pm.Gen)
 	}
-	release, err := c.reserve(ctx, pm.Manifest.Bytes)
+	if err := pm.Manifest.Check(modelcache.Limits{MaxEntries: modelCacheMaxEntries}); err != nil {
+		return "", 0, err
+	}
+	release, err := c.reserve(ctx, modelcache.AllocEstimate(pm.Manifest.Entries))
 	if err != nil {
 		return "", 0, err
 	}
@@ -491,7 +517,7 @@ func (c *nodeModelCache) fillFrom(ctx context.Context, key, node string) (string
 		}
 		return resp.Body, nil
 	}
-	gen, err := c.store.Fetch(key, pm.Manifest, open, modelcache.Limits{MaxBytes: pm.Manifest.Bytes})
+	gen, err := c.store.Fetch(key, pm.Manifest, open, modelcache.Limits{MaxBytes: pm.Manifest.Bytes, MaxEntries: modelCacheMaxEntries})
 	return gen, pm.Manifest.Bytes, err
 }
 
@@ -514,28 +540,40 @@ func (c *nodeModelCache) getJSON(ctx context.Context, u string, v any) error {
 }
 
 // harvest copies a pod's finished download volume into the cache.
-func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook.ModelCacheDownload, finishedAt time.Time) {
+func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook.ModelCacheDownload, finishedAt time.Time, fingerprint string) {
 	log := c.log.WithFields(logrus.Fields{"key": d.Key, "pod": pod.Namespace + "/" + pod.Name})
 	if _, _, ok := c.store.Latest(d.Key); ok {
 		return
 	}
-	if finishedAt.IsZero() {
-		return // without the init's end, the engine's writes cannot be told apart
+	if finishedAt.IsZero() || fingerprint == "" {
+		// Without the download's own record of its tree, what the engine
+		// changed since cannot be told apart.
+		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+		return
 	}
 	src, err := c.emptyDirPath(pod, d.Landing.VolumeName)
 	if err != nil {
 		log.WithError(err).Warn("model cache: no volume to harvest")
 		return
 	}
-	size, err := treeBytes(src)
+	ents, err := modelcache.Scan(src)
 	if err != nil {
-		log.WithError(err).Warn("model cache: sizing the volume failed")
+		log.WithError(err).Warn("model cache: reading the volume failed")
 		return
 	}
-	if size == 0 {
+	if len(ents) == 0 {
 		return
 	}
-	release, err := c.reserve(ctx, size)
+	if len(ents) > modelCacheMaxEntries {
+		log.WithField("entries", len(ents)).Info("model cache: not harvesting a tree of that many entries")
+		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+		return
+	}
+	var size int64
+	for _, e := range ents {
+		size += e.Size
+	}
+	release, err := c.reserve(ctx, modelcache.AllocEstimate(ents))
 	if err != nil {
 		log.WithError(err).WithField("bytes", size).Info("model cache: not harvesting")
 		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
@@ -545,7 +583,8 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 	start := time.Now()
 	// Anything written after the init finished (one-second resolution,
 	// so a second of slack) is the engine's, not the download's.
-	gen, err := c.store.Harvest(d.Key, src, modelcache.Limits{MaxBytes: size, NotAfter: finishedAt.Add(time.Second)})
+	gen, err := c.store.Harvest(d.Key, src, modelcache.Limits{MaxBytes: size, MaxEntries: modelCacheMaxEntries,
+		NotAfter: finishedAt.Add(time.Second), Fingerprint: fingerprint})
 	if err != nil {
 		log.WithError(err).Warn("model cache: harvest failed; the next cold pod downloads")
 		metrics.ModelCacheOps.WithLabelValues("harvest", "error").Inc()
@@ -569,24 +608,6 @@ func (c *nodeModelCache) emptyDirPath(pod *corev1.Pod, vol string) (string, erro
 		}
 	}
 	return "", fmt.Errorf("volume %q is not an emptyDir of the pod", vol)
-}
-
-func treeBytes(root string) (int64, error) {
-	var n int64
-	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.Type().IsRegular() {
-			fi, err := d.Info()
-			if err != nil {
-				return err
-			}
-			n += fi.Size()
-		}
-		return nil
-	})
-	return n, err
 }
 
 var errNoRoom = errors.New("model cache: no room within the budget")

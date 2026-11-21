@@ -46,7 +46,7 @@ func TestNodeModelCacheWrapsTheDownloadInit(t *testing.T) {
 	m := nodeCacheMutator(t)
 	pod := ngcFunctionPod()
 	orig := containerArgv(initByName(pod, "download-ngc-model"))
-	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod))
+	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
 
 	key := out.Labels[ModelCacheKeyLabel]
 	if !modelcache.ValidKey(key) {
@@ -94,7 +94,7 @@ func TestNodeModelCacheKeyIsPerTenantAndPerRecipe(t *testing.T) {
 	key := func(mut func(*corev1.Pod)) string {
 		pod := ngcFunctionPod()
 		mut(pod)
-		return applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod)).Labels[ModelCacheKeyLabel]
+		return applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true)).Labels[ModelCacheKeyLabel]
 	}
 	base := key(func(*corev1.Pod) {})
 	same := key(func(p *corev1.Pod) {
@@ -111,6 +111,19 @@ func TestNodeModelCacheKeyIsPerTenantAndPerRecipe(t *testing.T) {
 		"model": func(p *corev1.Pod) {
 			for _, c := range []*corev1.Container{initByName(p, "download-ngc-model")} {
 				c.Env[0].Value = "org/team/other:1"
+			}
+		},
+		"any other env": func(p *corev1.Pod) {
+			initByName(p, "download-ngc-model").Env = append(initByName(p, "download-ngc-model").Env, corev1.EnvVar{Name: "STORE_ENDPOINT", Value: "https://other"})
+		},
+		"envFrom": func(p *corev1.Pod) {
+			initByName(p, "download-ngc-model").EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "dl"}}}}
+		},
+		"a mount": func(p *corev1.Pod) {
+			for i := range p.Spec.Volumes {
+				if p.Spec.Volumes[i].Name == "scripts" {
+					p.Spec.Volumes[i].ConfigMap.Name = "other-scripts"
+				}
 			}
 		},
 		"ngc env": func(p *corev1.Pod) {
@@ -146,6 +159,20 @@ func TestNodeModelCacheLeavesOtherPodsAlone(t *testing.T) {
 			}
 			return p
 		}(),
+		"subPath download mount": func() *corev1.Pod {
+			p := ngcFunctionPod()
+			c := initByName(p, "download-ngc-model")
+			c.VolumeMounts[0].SubPath = "data"
+			return p
+		}(),
+		"init writes another volume main reads": func() *corev1.Pod {
+			p := ngcFunctionPod()
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "rendered", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+			c := initByName(p, "download-ngc-model")
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "rendered", MountPath: "/config/rendered"})
+			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "rendered", MountPath: "/config/rendered"})
+			return p
+		}(),
 		"already wrapped": func() *corev1.Pod {
 			p := ngcFunctionPod()
 			c := initByName(p, "download-ngc-model")
@@ -153,19 +180,22 @@ func TestNodeModelCacheLeavesOtherPodsAlone(t *testing.T) {
 			return p
 		}(),
 	} {
-		if ops := m.nodeModelCachePatches(context.Background(), pod); ops != nil {
+		if ops := m.nodeModelCachePatches(context.Background(), pod, true); ops != nil {
 			t.Errorf("%s: patched %v", name, ops)
 		}
 	}
 
 	off := nodeCacheMutator(t)
 	off.NodeModelCache = nil
-	if ops := off.nodeModelCachePatches(context.Background(), ngcFunctionPod()); ops != nil {
+	if ops := off.nodeModelCachePatches(context.Background(), ngcFunctionPod(), true); ops != nil {
 		t.Error("feature off: patched")
+	}
+	if ops := nodeCacheMutator(t).nodeModelCachePatches(context.Background(), ngcFunctionPod(), false); ops != nil {
+		t.Error("a pod not on the node bundle: patched")
 	}
 	both := nodeCacheMutator(t)
 	both.ModelVolume = &modelvolume.Provisioner{}
-	if ops := both.nodeModelCachePatches(context.Background(), ngcFunctionPod()); ops != nil {
+	if ops := both.nodeModelCachePatches(context.Background(), ngcFunctionPod(), true); ops != nil {
 		t.Error("model volumes on: the cache patched too")
 	}
 }
@@ -174,8 +204,20 @@ func TestNodeModelCacheLeavesOtherPodsAlone(t *testing.T) {
 // NGC pod.
 func TestMutateAppliesTheNodeModelCache(t *testing.T) {
 	m := nodeCacheMutator(t)
+	m.HostBundleRoot = "/bundle"
+	// Without the gpushare library the pod does not use the node bundle,
+	// and is left alone.
+	plain := ngcFunctionPod()
+	ops, err := m.Mutate(context.Background(), plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := initByName(applyPatches(t, plain, ops), "download-ngc-model"); len(c.Command) > 0 && c.Command[0] == HelperBin {
+		t.Fatal("Mutate wrapped the init of a pod that does not use the node bundle")
+	}
 	pod := ngcFunctionPod()
-	ops, err := m.Mutate(context.Background(), pod)
+	pod.Annotations = map[string]string{GPUShareAnnotation: "true"}
+	ops, err = m.Mutate(context.Background(), pod)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +241,7 @@ func TestModelCacheKeyIsTheSameBeforeAndAfterWrapping(t *testing.T) {
 	if !ok || before.Wrapped {
 		t.Fatalf("unwrapped: %+v ok=%v", before, ok)
 	}
-	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod))
+	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
 	out.Labels[ModelCacheKeyLabel] = "ffffffffffffffffffffffffffffffff" // a pod's own claim
 	after, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, out, 0)
 	if !ok || !after.Wrapped || after.Key != before.Key {
@@ -207,5 +249,21 @@ func TestModelCacheKeyIsTheSameBeforeAndAfterWrapping(t *testing.T) {
 	}
 	if !reflect.DeepEqual(after.Download, containerArgv(initByName(pod, "download-ngc-model"))) {
 		t.Fatalf("download = %q", after.Download)
+	}
+}
+
+// A writable volume an earlier init filled is an input of the download,
+// not an output: the pod stays eligible (NVCA's merged certificates).
+func TestNodeModelCacheAcceptsAnInputVolumeFromAnEarlierInit(t *testing.T) {
+	m := nodeCacheMutator(t)
+	p := ngcFunctionPod()
+	p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "certs", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+	certs := corev1.VolumeMount{Name: "certs", MountPath: "/etc/ssl/certs"}
+	p.Spec.InitContainers = append([]corev1.Container{{Name: "merge-certs", Image: "x", Command: []string{"merge"}, VolumeMounts: []corev1.VolumeMount{certs}}}, p.Spec.InitContainers...)
+	c := initByName(p, "download-ngc-model")
+	c.VolumeMounts = append(c.VolumeMounts, certs)
+	p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, certs)
+	if ops := m.nodeModelCachePatches(context.Background(), p, true); ops == nil {
+		t.Fatal("a pod whose download reads an earlier init's volume was left alone")
 	}
 }

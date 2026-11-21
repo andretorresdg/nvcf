@@ -46,7 +46,13 @@ func modelCacheCmd(args []string) (int, error) {
 	fmt.Println("nvsnap: model cache: downloading")
 	code, err := run(argv)
 	if code == 0 {
-		report(modelcache.InitDownloaded)
+		// What the download left, for the agent: it keeps a copy only if
+		// the volume still has exactly this tree when it reads it.
+		msg := modelcache.InitDownloaded
+		if ents, serr := modelcache.Scan(*to); serr == nil {
+			msg += " " + modelcache.TreeField + modelcache.Fingerprint(ents)
+		}
+		report(msg)
 	}
 	return code, err
 }

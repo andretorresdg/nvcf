@@ -38,6 +38,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -58,6 +60,8 @@ const (
 	// termination message: how its volume was filled.
 	InitSeeded     = "nvsnap-model-cache: seeded"
 	InitDownloaded = "nvsnap-model-cache: downloaded"
+	// TreeField precedes the downloaded tree's Fingerprint in the message.
+	TreeField = "tree="
 	// ManifestVersion is the manifest format.
 	ManifestVersion = 1
 )
@@ -80,10 +84,29 @@ var (
 	ErrTooLarge = errors.New("model cache: tree is over its size limit")
 	// ErrChanged: a source file changed while it was copied.
 	ErrChanged = errors.New("model cache: source changed while it was copied")
+	// ErrOwner: the seed cannot give an entry its recorded owner (the
+	// helper does not run as root, and the download ran as another user).
+	ErrOwner = errors.New("model cache: cannot give the tree its recorded owners")
 	// ErrTargetNotEmpty: the volume to seed already has content (an init
 	// that restarted after a partial download); the download handles it.
 	ErrTargetNotEmpty = errors.New("model cache: target is not empty")
 )
+
+// DownloadedTree returns the fingerprint a download init reported in its
+// termination message, or "" when it reported none.
+func DownloadedTree(msg string) string {
+	if !strings.HasPrefix(msg, InitDownloaded) {
+		return ""
+	}
+	for _, f := range strings.Fields(msg[len(InitDownloaded):]) {
+		if v, ok := strings.CutPrefix(f, TreeField); ok && len(v) == 64 {
+			if _, err := hex.DecodeString(v); err == nil {
+				return v
+			}
+		}
+	}
+	return ""
+}
 
 // Entry is one path in a model tree, relative to the tree root.
 type Entry struct {
@@ -93,6 +116,12 @@ type Entry struct {
 	Size   int64  `json:"size,omitempty"`
 	SHA256 string `json:"sha256,omitempty"`
 	Target string `json:"target,omitempty"`
+	// UID and GID own the entry; Mode holds its permission and special
+	// bits (07777); Mtime is its modification time in nanoseconds. A seed
+	// gives every entry these, as the download left them.
+	UID   int   `json:"uid"`
+	GID   int   `json:"gid"`
+	Mtime int64 `json:"mtime"`
 }
 
 // Manifest is a generation's list of entries, parents before children.
@@ -111,6 +140,9 @@ type Limits struct {
 	// changed later was written by something else (the engine, once it
 	// started), so the tree is not the download's and is not cached.
 	NotAfter time.Time
+	// Fingerprint, for a harvest, is the tree's Fingerprint as the
+	// download left it; the copy is published only if it matches.
+	Fingerprint string
 }
 
 // ErrWrittenAfter: the tree changed after the download finished.
@@ -250,6 +282,9 @@ func (m Manifest) Check(lim Limits) error {
 		if !validRel(e.Path) {
 			return fmt.Errorf("%w: path %q", ErrUnsupported, e.Path)
 		}
+		if e.Mode > 0o7777 {
+			return fmt.Errorf("%w: %q has mode %o", ErrUnsupported, e.Path, e.Mode)
+		}
 		if _, dup := seen[e.Path]; dup {
 			return fmt.Errorf("%w: path %q twice", ErrUnsupported, e.Path)
 		}
@@ -362,119 +397,123 @@ func (s *Store) Harvest(key, src string, lim Limits) (string, error) {
 	return gen, nil
 }
 
-// copyIn walks src without following symlinks and copies it to dst,
-// building the manifest.
+// copyIn copies the tree at src to dst, building the manifest. It walks
+// without following any symlink (walkNoFollow), opens every file through
+// its parent's descriptor and checks it is the regular file it examined,
+// and refuses a file that changed during its copy, or anything changed
+// after lim.NotAfter.
 func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	m := Manifest{Version: ManifestVersion}
-	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if p == src {
-			// A file the engine added or removed at the top changes the
-			// root's mtime.
-			if fi, err := d.Info(); err == nil && !lim.NotAfter.IsZero() && fi.ModTime().After(lim.NotAfter) {
-				return fmt.Errorf("%w: the volume root at %s", ErrWrittenAfter, fi.ModTime().UTC().Format(time.RFC3339))
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(src, p)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
+	var root unix.Stat_t
+	if err := unix.Lstat(src, &root); err != nil {
+		return m, err
+	}
+	if !lim.NotAfter.IsZero() && time.Unix(0, root.Mtim.Nano()).After(lim.NotAfter) {
+		return m, fmt.Errorf("%w: the volume root", ErrWrittenAfter)
+	}
+	err := walkNoFollow(src, func(n node) error {
 		if lim.MaxEntries > 0 && len(m.Entries) >= lim.MaxEntries {
 			return fmt.Errorf("%w: over %d entries", ErrTooLarge, lim.MaxEntries)
 		}
-		fi, err := d.Info()
+		if !lim.NotAfter.IsZero() && time.Unix(0, n.st.Mtim.Nano()).After(lim.NotAfter) {
+			return fmt.Errorf("%w: %s", ErrWrittenAfter, n.rel)
+		}
+		var target string
+		if n.st.Mode&unix.S_IFMT == unix.S_IFLNK {
+			t, err := readLink(n)
+			if err != nil {
+				return err
+			}
+			if !validLink(n.rel, t) {
+				return fmt.Errorf("%w: symlink %s -> %s", ErrUnsupported, n.rel, t)
+			}
+			target = t
+		}
+		e, err := entryOf(n, target)
 		if err != nil {
 			return err
 		}
-		if !lim.NotAfter.IsZero() && fi.ModTime().After(lim.NotAfter) {
-			return fmt.Errorf("%w: %s at %s", ErrWrittenAfter, rel, fi.ModTime().UTC().Format(time.RFC3339))
-		}
-		out := filepath.Join(dst, filepath.FromSlash(rel))
-		e := Entry{Path: rel, Mode: uint32(fi.Mode().Perm())}
-		switch {
-		case fi.IsDir():
-			e.Type = TypeDir
+		out := filepath.Join(dst, filepath.FromSlash(n.rel))
+		switch e.Type {
+		case TypeDir:
 			if err := os.Mkdir(out, 0o755); err != nil {
 				return err
 			}
-		case fi.Mode().IsRegular():
-			e.Type = TypeFile
+		case TypeSymlink:
+			if err := os.Symlink(target, out); err != nil {
+				return err
+			}
+		case TypeFile:
 			budget := int64(-1)
 			if lim.MaxBytes > 0 {
 				budget = lim.MaxBytes - m.Bytes
 			}
-			sum, n, err := copyFile(p, out, fi, budget)
+			sum, err := copyFile(n, out, budget)
 			if err != nil {
-				return fmt.Errorf("%s: %w", rel, err)
+				return fmt.Errorf("%s: %w", n.rel, err)
 			}
-			e.Size, e.SHA256 = n, sum
-			m.Bytes += n
-		case fi.Mode()&fs.ModeSymlink != 0:
-			t, err := os.Readlink(p)
-			if err != nil {
-				return err
-			}
-			if !validLink(rel, t) {
-				return fmt.Errorf("%w: symlink %s -> %s", ErrUnsupported, rel, t)
-			}
-			e.Type, e.Target, e.Mode = TypeSymlink, t, 0
-			if err := os.Symlink(t, out); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("%w: %s is %v", ErrUnsupported, rel, fi.Mode().Type())
+			e.SHA256 = sum
+			m.Bytes += e.Size
 		}
 		m.Entries = append(m.Entries, e)
 		return nil
 	})
-	return m, err
+	if err != nil {
+		return m, err
+	}
+	if lim.Fingerprint != "" && Fingerprint(m.Entries) != lim.Fingerprint {
+		return m, fmt.Errorf("%w: the tree is not the one the download finished with", ErrChanged)
+	}
+	return m, nil
 }
 
-// copyFile copies one regular file, hashing it, refusing to go past budget
-// bytes (negative: no limit), and checking the source did not change.
-func copyFile(src, dst string, before fs.FileInfo, budget int64) (string, int64, error) {
-	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+// copyFile copies the regular file n, hashing it, refusing to go past
+// budget bytes (negative: no limit), and checking it did not change.
+func copyFile(n node, dst string, budget int64) (string, error) {
+	fd, err := openSame(n.dirfd, n.name, &n.st, 0)
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
+	in := os.NewFile(uintptr(fd), n.rel)
 	defer in.Close()
+	// The descriptor was opened non-blocking so a FIFO swapped in could
+	// not hang the open; a regular file reads the same either way.
+	_ = unix.SetNonblock(fd, false)
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
 	h := sha256.New()
 	var r io.Reader = in
 	if budget >= 0 {
 		r = io.LimitReader(in, budget+1)
 	}
-	n, err := io.Copy(io.MultiWriter(out, h), r)
+	k, err := io.Copy(io.MultiWriter(out, h), r)
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		return "", n, err
+		return "", err
 	}
-	if budget >= 0 && n > budget {
-		return "", n, ErrTooLarge
+	if budget >= 0 && k > budget {
+		return "", ErrTooLarge
 	}
-	after, err := in.Stat()
-	if err != nil {
-		return "", n, err
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil {
+		return "", err
 	}
-	if n != before.Size() || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
-		return "", n, ErrChanged
+	if k != n.st.Size || after.Size != n.st.Size || after.Mtim != n.st.Mtim {
+		return "", ErrChanged
 	}
-	return hex.EncodeToString(h.Sum(nil)), n, nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // Fetch builds a new generation of key from a peer's manifest, reading
 // each file through open and checking it against the manifest. The
 // manifest is checked first: a path or link leaving the tree, or a tree
-// over the limits, is refused before anything is written.
+// over the limits, is refused before anything is written. The cache's
+// own copy is readable by any user (a seeding init may not run as root);
+// a seed gives the tree its recorded owners and modes.
 func (s *Store) Fetch(key string, m Manifest, open func(rel string) (ReadCloser, error), lim Limits) (string, error) {
 	if err := m.Check(lim); err != nil {
 		return "", err
@@ -499,8 +538,11 @@ func (s *Store) Fetch(key string, m Manifest, open func(rel string) (ReadCloser,
 }
 
 // Seed copies generation gen, whose manifest is m, into the empty
-// directory dst, checking every file against the manifest as it copies
-// and giving every entry its recorded mode. On error dst may hold part of
+// directory dst, checking every file against the manifest as it copies.
+// Every entry then gets its recorded owner, mode and mtime, children
+// before their directory. Running as root it sets any owner; otherwise
+// every entry must be the helper's own user, as when the download ran as
+// that user, or it refuses before writing. On error dst may hold part of
 // the tree; the caller empties it before falling back to the download.
 func Seed(gen string, m Manifest, dst string) error {
 	if err := m.Check(Limits{}); err != nil {
@@ -513,6 +555,14 @@ func Seed(gen string, m Manifest, dst string) error {
 	if len(ents) > 0 {
 		return ErrTargetNotEmpty
 	}
+	root := os.Geteuid() == 0
+	if !root {
+		for _, e := range m.Entries {
+			if e.UID != os.Geteuid() {
+				return fmt.Errorf("%w: %s is owned by %d, the helper runs as %d", ErrOwner, e.Path, e.UID, os.Geteuid())
+			}
+		}
+	}
 	tree := filepath.Join(gen, TreeDir)
 	for _, e := range m.Entries {
 		src := filepath.Join(tree, filepath.FromSlash(e.Path))
@@ -522,20 +572,40 @@ func Seed(gen string, m Manifest, dst string) error {
 			return fmt.Errorf("%s: %w", e.Path, err)
 		}
 	}
-	// Directory modes last: a read-only directory set first would refuse
-	// its own children.
 	for i := len(m.Entries) - 1; i >= 0; i-- {
-		if e := m.Entries[i]; e.Type == TypeDir {
-			if err := os.Chmod(filepath.Join(dst, filepath.FromSlash(e.Path)), fs.FileMode(e.Mode).Perm()); err != nil {
+		e := m.Entries[i]
+		p := filepath.Join(dst, filepath.FromSlash(e.Path))
+		var st unix.Stat_t
+		if err := unix.Lstat(p, &st); err != nil {
+			return err
+		}
+		// The owner first: chown clears the set-id bits chmod then sets.
+		if int(st.Uid) != e.UID || int(st.Gid) != e.GID {
+			uid := e.UID
+			if !root {
+				uid = -1
+			}
+			if err := unix.Lchown(p, uid, e.GID); err != nil {
+				return fmt.Errorf("%w: %s: %v", ErrOwner, e.Path, err)
+			}
+		}
+		if e.Type != TypeSymlink {
+			if err := unix.Chmod(p, e.Mode); err != nil {
 				return err
 			}
+		}
+		ts := []unix.Timespec{unix.NsecToTimespec(e.Mtime), unix.NsecToTimespec(e.Mtime)}
+		if err := unix.UtimesNanoAt(unix.AT_FDCWD, p, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 // materialize creates entry e under root, reading a file's bytes from
-// open and checking them against e.
+// open and checking them against e. Files are created readable by all
+// and directories open, as the cache keeps them; Seed then applies the
+// recorded owner and mode.
 func materialize(root string, e Entry, open func() (ReadCloser, error)) error {
 	out := filepath.Join(root, filepath.FromSlash(e.Path))
 	switch e.Type {
@@ -549,7 +619,7 @@ func materialize(root string, e Entry, open func() (ReadCloser, error)) error {
 			return err
 		}
 		defer in.Close()
-		f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			return err
 		}
@@ -566,7 +636,7 @@ func materialize(root string, e Entry, open func() (ReadCloser, error)) error {
 		if n != e.Size || !sumIs(h, e.SHA256) {
 			return ErrCorrupt
 		}
-		return os.Chmod(out, fs.FileMode(e.Mode).Perm())
+		return nil
 	}
 	return ErrUnsupported
 }
@@ -625,11 +695,12 @@ func (s *Store) Keys() []string {
 	return out
 }
 
-// Usage is the bytes of files in complete generations. Attempts in
-// flight are left out: their owners account for them by reservation.
+// Usage is the disk the cache's complete generations take: allocated
+// blocks, directories included. Attempts in flight are left out: their
+// owners account for them by reservation.
 func (s *Store) Usage() (int64, error) {
 	var total int64
-	err := filepath.WalkDir(s.Root, func(_ string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(s.Root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -639,9 +710,12 @@ func (s *Store) Usage() (int64, error) {
 		if d.IsDir() && strings.HasPrefix(d.Name(), AttemptPrefix) {
 			return filepath.SkipDir
 		}
-		if d.Type().IsRegular() {
-			if fi, err := d.Info(); err == nil {
-				total += fi.Size()
+		if p == s.Root {
+			return nil
+		}
+		if fi, err := d.Info(); err == nil {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				total += st.Blocks * 512
 			}
 		}
 		return nil

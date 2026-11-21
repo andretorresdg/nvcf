@@ -301,3 +301,111 @@ func TestHarvestRefusesATreeWrittenAfterTheDownload(t *testing.T) {
 		t.Fatal("a tree written after the download was cached")
 	}
 }
+
+func TestHarvestPublishesOnlyTheTreeTheDownloadFinishedWith(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	src := modelTree(t)
+	ents, err := Scan(src)
+	must(t, err)
+	fp := Fingerprint(ents)
+	if _, err := s.Harvest("k1", src, Limits{Fingerprint: fp}); err != nil {
+		t.Fatalf("unchanged tree: %v", err)
+	}
+	// The engine removed a file before the harvest read the volume: every
+	// remaining file checks out, but the tree is not the download's.
+	must(t, os.Remove(filepath.Join(src, "m/config.json")))
+	if _, err := s.Harvest("k2", src, Limits{Fingerprint: fp}); !errors.Is(err, ErrChanged) {
+		t.Fatalf("err = %v, want ErrChanged", err)
+	}
+	if _, _, ok := s.Latest("k2"); ok {
+		t.Fatal("a tree missing a downloaded file was cached")
+	}
+}
+
+// A workload swaps a directory for a symlink to the host while the agent
+// walks its volume: the walk must not follow it.
+func TestHarvestDoesNotFollowADirectorySwappedForASymlink(t *testing.T) {
+	src := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(src, "a"), 0o755))
+	must(t, os.WriteFile(filepath.Join(src, "a/x"), []byte("x"), 0o644))
+	outside := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(outside, "secret"), []byte("host"), 0o600))
+	var copied []string
+	err := walkNoFollow(src, func(n node) error {
+		copied = append(copied, n.rel)
+		if n.rel == "a" { // examined; now swapped before it is entered
+			must(t, os.Rename(filepath.Join(src, "a"), filepath.Join(src, "a.old")))
+			must(t, os.Symlink(outside, filepath.Join(src, "a")))
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatalf("the walk entered a swapped directory: %v", copied)
+	}
+	for _, c := range copied {
+		if strings.Contains(c, "secret") {
+			t.Fatalf("the walk reached outside the tree: %v", copied)
+		}
+	}
+}
+
+func TestHarvestRefusesAFIFOWithoutBlocking(t *testing.T) {
+	src := modelTree(t)
+	must(t, unix.Mkfifo(filepath.Join(src, "m/pipe"), 0o644))
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&Store{Root: t.TempDir()}).Harvest("k1", src, Limits{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("err = %v, want ErrUnsupported", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("harvest blocked on a FIFO")
+	}
+}
+
+func TestSeedRestoresModesAndMtimes(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	src := modelTree(t)
+	when := time.Date(2026, 1, 2, 3, 4, 5, 6000, time.UTC)
+	must(t, os.Chmod(filepath.Join(src, "m/config.json"), 0o600))
+	must(t, os.Chtimes(filepath.Join(src, "m/config.json"), when, when))
+	harvest(t, s, "k1", src)
+	gen, m, _ := s.Latest("k1")
+	// The cache's own copy stays readable whatever the download's mode.
+	if fi, err := os.Stat(filepath.Join(gen, TreeDir, "m/config.json")); err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("cached copy mode = %v, %v; want 0644", fi.Mode().Perm(), err)
+	}
+	dst := t.TempDir()
+	must(t, Seed(gen, m, dst))
+	fi, err := os.Stat(filepath.Join(dst, "m/config.json"))
+	if err != nil || fi.Mode().Perm() != 0o600 || !fi.ModTime().Equal(when) {
+		t.Fatalf("seeded config.json mode %v mtime %v, %v; want 0600 at %v", fi.Mode().Perm(), fi.ModTime(), err, when)
+	}
+	// The seeded tree has the download's fingerprint.
+	a, _ := Scan(src)
+	b, _ := Scan(dst)
+	if Fingerprint(a) != Fingerprint(b) {
+		t.Fatal("the seeded tree differs from the download in path, size, mode, owner or mtime")
+	}
+}
+
+func TestSeedRefusesAnotherUsersTreeWhenNotRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("runs as root: any owner can be given")
+	}
+	s := &Store{Root: t.TempDir()}
+	harvest(t, s, "k1", modelTree(t))
+	gen, m, _ := s.Latest("k1")
+	m.Entries[0].UID = os.Geteuid() + 1
+	dst := t.TempDir()
+	if err := Seed(gen, m, dst); !errors.Is(err, ErrOwner) {
+		t.Fatalf("err = %v, want ErrOwner", err)
+	}
+	if ents, _ := os.ReadDir(dst); len(ents) != 0 {
+		t.Fatal("the refused seed wrote files")
+	}
+}

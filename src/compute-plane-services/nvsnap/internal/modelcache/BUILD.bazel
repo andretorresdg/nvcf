@@ -2,9 +2,13 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "modelcache",
-    srcs = ["modelcache.go"],
+    srcs = [
+        "modelcache.go",
+        "walk.go",
+    ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache",
     visibility = ["//src/compute-plane-services/nvsnap:__subpackages__"],
+    deps = ["@org_golang_x_sys//unix"],
 )
 
 go_test(

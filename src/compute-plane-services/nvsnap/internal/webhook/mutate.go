@@ -643,8 +643,13 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	// gpushare placement is independent of every other decision below and
 	// rides along with whichever patches they return.
+	// Whether the pod already runs from the node's nvsnap bundle (the
+	// gpushare library): only then may the model cache add the helper,
+	// which comes from the same bundle.
+	bundled := false
 	if !isFallback || (fallback.Reason != FallbackGPUShareFailed && fallback.Reason != FallbackDriver) {
 		gp := m.gpusharePatches(ctx, pod)
+		bundled = len(gp) > 0
 		injectPatches = append(injectPatches, gp...)
 		injectPatches = append(injectPatches, m.captureHoldPatches(ctx, pod, len(gp) > 0)...)
 	}
@@ -672,15 +677,17 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		} else if vp != nil {
 			return mergePatchPlan(append(injectPatches, vp...)), nil
 		}
-		// A cold pod's model download seeds from the node's copy
-		// (node_model_cache.go); it changes only the download init.
-		injectPatches = append(injectPatches, m.nodeModelCachePatches(ctx, pod)...)
 		if ep, err := m.electionPatches(ctx, pod); err != nil {
 			m.logger().WithError(err).WithField("pod", election.PodIdentity(pod)).
 				Warn("election failed; admitting pod unchanged")
 		} else if ep != nil {
 			return mergePatchPlan(append(injectPatches, ep...)), nil
 		}
+		// A cold pod's model download seeds from the node's copy
+		// (node_model_cache.go); it changes only the download init. Here,
+		// after the restore and election branches returned: a pod those
+		// admit keeps its spec.
+		injectPatches = append(injectPatches, m.nodeModelCachePatches(ctx, pod, bundled)...)
 		// No restore-from — this is a CAPTURE/cold pod. In cachedir mode,
 		// inject the cache/model env vars + the /opt/nvsnap emptyDir so the
 		// engine funnels its caches there and the agent captures that dir.

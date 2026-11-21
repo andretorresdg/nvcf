@@ -138,7 +138,8 @@ func TestModelCacheWaitsForALiveFetchThenSeeds(t *testing.T) {
 	cache := cachedModel(t)
 	// Hide the generation behind a live heartbeat, then publish it.
 	gen, _, _ := modelcache.LatestIn(cache)
-	hidden := gen + ".hidden"
+	// Under a name LatestIn does not look at, so only the wait finds it.
+	hidden := filepath.Join(cache, "hidden")
 	if err := os.Rename(gen, hidden); err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +158,23 @@ func TestModelCacheWaitsForALiveFetchThenSeeds(t *testing.T) {
 	}
 	if got := read(t, filepath.Join(to, "weights.bin")); got != "cached" {
 		t.Fatalf("weights.bin = %q, want the fetched copy", got)
+	}
+	if _, err := os.Stat(hidden); !os.IsNotExist(err) {
+		t.Fatal("the seed did not wait for the generation to be published")
+	}
+}
+
+func TestModelCacheReportsTheDownloadedTree(t *testing.T) {
+	to := t.TempDir()
+	if code, err := modelCacheCmd(append([]string{"--cache", t.TempDir(), "--to", to, "--"}, download(to)...)); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	ents, err := modelcache.Scan(to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := modelcache.DownloadedTree(read(t, terminationLog)); got != modelcache.Fingerprint(ents) {
+		t.Fatalf("reported tree %q, want the volume's %q", got, modelcache.Fingerprint(ents))
 	}
 }
 

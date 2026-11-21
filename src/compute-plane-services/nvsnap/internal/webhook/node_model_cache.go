@@ -62,16 +62,22 @@ type NodeModelCache struct {
 	Tenants TenantScoper
 }
 
-// recipeEnvPrefixes are the env vars that can change what a download
-// writes. Others (instance names, namespaces) differ per deployment and
-// would only split the key.
-var recipeEnvPrefixes = []string{"NGC_", "HF_", "HUGGING", "MODEL", "NIM_"}
+// orchestrationEnv are env var prefixes the platform sets per instance or
+// deployment (names, namespaces, ids). They do not steer what a download
+// writes and would split every redeploy's key; every other env var is part
+// of the recipe.
+var orchestrationEnv = []string{"GROVE_", "NVCF_", "KUBERNETES_", "POD_", "NODE_", "HOSTNAME", "OTEL_"}
 
 // nodeModelCachePatches wraps the pod's model download init, or returns
 // nil when the pod has none the cache can serve.
-func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod) []PatchOp {
+//
+// bundled says the pod already mounts the node's nvsnap bundle (the
+// gpushare library is placed): the helper comes from that bundle, and a
+// pod that did not depend on it before must not start to, or it could
+// wait for a directory its node never has.
+func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bundled bool) []PatchOp {
 	c := m.NodeModelCache
-	if c == nil || c.Root == "" || m.ModelVolume != nil || gpuRequest(pod) == 0 {
+	if c == nil || c.Root == "" || m.ModelVolume != nil || !bundled || gpuRequest(pod) == 0 {
 		return nil
 	}
 	d, ok := ResolveModelCacheDownload(ctx, c.Tenants, pod, m.MainContainer)
@@ -154,6 +160,9 @@ func ResolveModelCacheDownload(ctx context.Context, tenants TenantScoper, pod *c
 		return d, false
 	}
 	init := pod.Spec.InitContainers[idx]
+	if why := notSeedable(pod, idx, land.VolumeName); why != "" {
+		return d, false
+	}
 	argv := containerArgv(&init)
 	if len(argv) >= 2 && argv[0] == modelCachePrefix[0] && argv[1] == modelCachePrefix[1] {
 		dash := -1
@@ -177,35 +186,127 @@ func ResolveModelCacheDownload(ctx context.Context, tenants TenantScoper, pod *c
 		scope = tenants.Scope(ctx, pod.Namespace)
 	}
 	init.Command, init.Args = argv, nil
-	d.Key = modelcache.Key(scope, res.ShareKey(), init.Image, downloadRecipe(&init))
+	d.Key = modelcache.Key(scope, res.ShareKey(), init.Image, downloadRecipe(pod, &init))
 	d.ShareKey, d.Landing, d.InitIndex, d.Download = res.ShareKey(), land, idx, argv
 	return d, true
 }
 
+// notSeedable says why the download init at idx cannot be replaced by a
+// seed of its volume vol, or "" when it can. A seed fills vol and nothing
+// else, so the init must write nothing else a later container reads, and
+// must see vol whole (a subPath mount sees part of what a harvest keeps).
+func notSeedable(pod *corev1.Pod, idx int, vol string) string {
+	init := &pod.Spec.InitContainers[idx]
+	sources := map[string]*corev1.Volume{}
+	for i := range pod.Spec.Volumes {
+		sources[pod.Spec.Volumes[i].Name] = &pod.Spec.Volumes[i]
+	}
+	mountedBy := func(cs []corev1.Container, name string) bool {
+		for i := range cs {
+			for _, vm := range cs[i].VolumeMounts {
+				if vm.Name == name {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, vm := range init.VolumeMounts {
+		if vm.Name == vol {
+			if vm.SubPath != "" || vm.SubPathExpr != "" {
+				return "the init mounts its download volume with a subPath"
+			}
+			continue
+		}
+		if vm.ReadOnly || vm.Name == ModelCacheVolume || vm.Name == helperVolumeName {
+			continue
+		}
+		if v := sources[vm.Name]; v != nil && (v.Secret != nil || v.ConfigMap != nil || v.DownwardAPI != nil || v.Projected != nil) {
+			continue // read-only by kind
+		}
+		// Written here and read later, and not something an earlier init
+		// prepared for this one: an output the seed would not produce.
+		later := mountedBy(pod.Spec.InitContainers[idx+1:], vm.Name) || mountedBy(pod.Spec.Containers, vm.Name)
+		earlier := mountedBy(pod.Spec.InitContainers[:idx], vm.Name)
+		if later && !earlier {
+			return "the init writes volume " + vm.Name + ", which a later container reads"
+		}
+	}
+	return ""
+}
+
 // downloadRecipe is what, besides the image, decides the tree a download
-// init writes: its command, arguments and the env vars that steer a
-// download. Values from a Secret or field are named, not read.
-func downloadRecipe(c *corev1.Container) string {
+// init writes: its command and arguments, its env (but the platform's
+// per-instance names, orchestrationEnv), what it takes env from, and the
+// volumes it mounts and where. Values from a Secret, ConfigMap or field
+// are named, not read; a Secret or ConfigMap changed under the same name
+// is the same recipe. nvsnap's own mounts are left out, so a wrapped
+// init has the key it had before.
+func downloadRecipe(pod *corev1.Pod, c *corev1.Container) string {
 	var b strings.Builder
 	for _, s := range containerArgv(c) {
 		fmt.Fprintf(&b, "arg %d:%s\n", len(s), s)
 	}
-	var env []string
+	var lines []string
 	for _, e := range c.Env {
-		if !hasAnyPrefix(e.Name, recipeEnvPrefixes) {
+		if hasAnyPrefix(e.Name, orchestrationEnv) {
 			continue
 		}
 		v := e.Value
 		if e.ValueFrom != nil {
 			v = "<from " + valueFromRef(e.ValueFrom) + ">"
 		}
-		env = append(env, e.Name+"="+v)
+		lines = append(lines, "env "+e.Name+"="+v)
 	}
-	sort.Strings(env)
-	for _, s := range env {
-		fmt.Fprintf(&b, "env %d:%s\n", len(s), s)
+	for _, f := range c.EnvFrom {
+		switch {
+		case f.ConfigMapRef != nil:
+			lines = append(lines, "envFrom configmap "+f.ConfigMapRef.Name+" prefix "+f.Prefix)
+		case f.SecretRef != nil:
+			lines = append(lines, "envFrom secret "+f.SecretRef.Name+" prefix "+f.Prefix)
+		}
+	}
+	for _, vm := range c.VolumeMounts {
+		if vm.Name == ModelCacheVolume || vm.Name == helperVolumeName {
+			continue
+		}
+		src := "?"
+		for i := range pod.Spec.Volumes {
+			if pod.Spec.Volumes[i].Name == vm.Name {
+				src = volumeSourceOf(&pod.Spec.Volumes[i])
+			}
+		}
+		lines = append(lines, fmt.Sprintf("mount %s ro=%t sub=%s%s <- %s", vm.MountPath, vm.ReadOnly, vm.SubPath, vm.SubPathExpr, src))
+	}
+	sort.Strings(lines)
+	for _, s := range lines {
+		fmt.Fprintf(&b, "%d:%s\n", len(s), s)
 	}
 	return b.String()
+}
+
+func volumeSourceOf(v *corev1.Volume) string {
+	switch {
+	case v.EmptyDir != nil:
+		return "emptyDir"
+	case v.ConfigMap != nil:
+		return "configmap " + v.ConfigMap.Name
+	case v.Secret != nil:
+		return "secret " + v.Secret.SecretName
+	case v.PersistentVolumeClaim != nil:
+		return "pvc " + v.PersistentVolumeClaim.ClaimName
+	case v.HostPath != nil:
+		return "hostPath " + v.HostPath.Path
+	case v.Projected != nil:
+		return "projected"
+	case v.DownwardAPI != nil:
+		return "downwardAPI"
+	case v.CSI != nil:
+		return "csi " + v.CSI.Driver
+	case v.Image != nil:
+		return "image " + v.Image.Reference
+	}
+	return "other"
 }
 
 func hasAnyPrefix(s string, prefixes []string) bool {
