@@ -35,6 +35,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_mx_host import CUDA_INC, build  # noqa: E402
+from test_rdma_nccl import SHIM  # noqa: E402
 
 # argv: LOG MODE. MODE "none": no vLLM; "busy": a KV send is in flight for
 # 1 s after the first pause request; "fail": the connector shutdown raises;
@@ -188,6 +189,10 @@ if MODE != "none":
 
 if os.environ.get("UCX_LIB"):
     ctypes.CDLL(os.environ["UCX_LIB"])
+if os.environ.get("SHIM"):  # NCCL's verbs over RDMA, loaded as NCCL loads them
+    ctypes.CDLL(os.environ["SHIM"], mode=os.RTLD_LOCAL)
+if os.environ.get("FOREIGN"):  # a device file NIXL's shutdown left open
+    keep = os.open(os.path.join(os.environ["IBDIR"], "uverbs0"), os.O_RDWR)
 h = ctypes.c_ulonglong()
 fd = os.open(os.devnull, os.O_RDONLY)
 imp = ctypes.CDLL("libcuda.so.1").cuMemImportFromShareableHandle
@@ -210,8 +215,18 @@ class NixlPauseResume(unittest.TestCase):
         if not shutil.which("gcc") or not os.path.exists(os.path.join(CUDA_INC, "cuda.h")):
             raise unittest.SkipTest("needs gcc and cuda.h (CUDA_INC)")
         cls.tmp = tempfile.mkdtemp()
-        build(cls.tmp)
-        cls.env = dict(os.environ, LD_LIBRARY_PATH=cls.tmp)
+        # Files here stand for /dev/infiniband's (see test_rdma_nccl.py).
+        cls.ib = os.path.join(cls.tmp, "ib")
+        os.mkdir(cls.ib)
+        with open(os.path.join(cls.ib, "uverbs0"), "wb") as f:
+            f.write(b"\0" * 4096)
+        build(cls.tmp, "-DGPUSHARE_RDMA_DIR=\"%s/\"" % cls.ib)
+        cls.env = dict(os.environ, LD_LIBRARY_PATH=cls.tmp, IBDIR=cls.ib)
+        with open(os.path.join(cls.tmp, "shim.c"), "w") as f:
+            f.write(SHIM)
+        cls.shim = os.path.join(cls.tmp, "libnvsnap_ibv.so")
+        subprocess.run(["gcc", "-O2", "-Wall", "-Werror", "-shared", "-fPIC", "-Wl,-soname,libnvsnap_ibv.so",
+                        "-o", cls.shim, os.path.join(cls.tmp, "shim.c")], check=True)
         # Named as NIXL bundles it.
         cls.ucp = os.path.join(cls.tmp, "libucp-1234abcd.so.0")
         with open(cls.ucp + ".c", "w") as f:
@@ -252,6 +267,20 @@ class NixlPauseResume(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn(" ok ", p.stdout, p.stdout)
         return p.stdout
+
+    def test_pause_leaves_nccls_rdma_to_release(self):
+        # A TP worker whose NCCL runs over RDMA through libnvsnap_ibv: its
+        # device file is still open after the pause, and "release" closes it.
+        self.start(SHIM=self.shim)
+        self.assertIn("released on 1 worker(s)", self.ok("nixl-pause"))
+        self.ok("nixl-resume")
+
+    def test_pause_refuses_other_rdma_beside_nccls(self):
+        self.start(SHIM=self.shim, FOREIGN="1")
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn("RDMA device files still open after the release", p.stdout + p.stderr)
+        self.assertIn(", 1, 0)]", p.stdout + p.stderr)
 
     def test_pause_resume_new_engine_id_and_host(self):
         self.start()

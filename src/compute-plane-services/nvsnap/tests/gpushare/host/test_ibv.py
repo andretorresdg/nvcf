@@ -36,9 +36,11 @@ IBV_INC = os.environ.get("IBV_INC", "/usr/include")
 CUDA_INC = os.environ.get("CUDA_INC", "/usr/local/cuda/include")
 
 FAKE = r"""
+#include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Two devices that number their keys and queue pairs alike, as NICs do. */
 static int epoch, counter[2], open_ctxs;
@@ -150,12 +152,13 @@ const char *ibv_get_device_name(struct ibv_device *d) { return d->name; }
 struct ibv_context *ibv_open_device(struct ibv_device *d)
 {
     struct ibv_context *c = calloc(1, sizeof(*c));
-    c->device = d; c->async_fd = -1; c->cmd_fd = -1;
+    /* A device file of its own, as rdma-core's (/dev/null here). */
+    c->device = d; c->async_fd = -1; c->cmd_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     c->ops.poll_cq = poll_cq; c->ops.post_send = post_send; c->ops.post_recv = post_recv;
     open_ctxs++;
     return c;
 }
-int ibv_close_device(struct ibv_context *c) { free(c); open_ctxs--; return 0; }
+int ibv_close_device(struct ibv_context *c) { close(c->cmd_fd); free(c); open_ctxs--; return 0; }
 int ibv_get_async_event(struct ibv_context *c, struct ibv_async_event *e) { (void)c; (void)e; return -1; }
 void ibv_ack_async_event(struct ibv_async_event *e) { (void)e; }
 int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) { (void)c; memset(a, 0, sizeof(*a)); return 0; }
@@ -258,6 +261,8 @@ int main(int argc, char **argv)
     int (*map)(FILE *) = dlsym(h, "nvsnap_ibv_map");
     int (*connect)(const char *, char *, size_t) = dlsym(h, "nvsnap_ibv_connect");
     void (*open_)(void) = dlsym(h, "nvsnap_ibv_open");
+    int (*fds)(int *, int) = dlsym(h, "nvsnap_ibv_fds");
+    if (!fds) { printf("no nvsnap_ibv_fds\n"); return 2; }
     struct ibv_device **(*getl)(int *) = dlvsym(h, "ibv_get_device_list", "IBVERBS_1.1");
     S(ibv_open_device); S(ibv_alloc_pd); S(ibv_create_cq); S(ibv_create_qp);
     S(ibv_modify_qp); S(ibv_query_gid);
@@ -320,7 +325,16 @@ int main(int argc, char **argv)
         char rep[256];
         /* Round 1 as gpushare does it: fence at "quiesce", then "release". */
         if (round == 1 && fence(rep, sizeof(rep))) { printf("fence: %s\n", rep); return 1; }
+        /* NCCL's device files, which the pause checks leave to the suspend. */
+        int fv[4], one, nf = fds(fv, 4), cut = fds(&one, 1), dn = 0;
+        for (int i = 0; i < nf && i < 4; i++) {
+            char p[64], t[64] = "";
+            snprintf(p, sizeof(p), "/proc/self/fd/%d", fv[i]);
+            ssize_t k = readlink(p, t, sizeof(t) - 1);
+            dn += k > 0 && !strncmp(t, "/dev/null", 9);
+        }
         if (suspend(rep, sizeof(rep))) { printf("suspend: %s\n", rep); return 1; }
+        printf("round=%d fds=%d fds_cut=%d fds_devnull=%d fds_after_suspend=%d\n", round, nf, cut, dn, fds(fv, 4));
         printf("round=%d suspended=%s open_after_suspend=%d\n", round, rep, open_ctxs());
         move();
         if (restore(rep, sizeof(rep))) { printf("restore: %s\n", rep); return 1; }
@@ -390,8 +404,12 @@ class Ibv(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         rounds = [dict(kv.split("=", 1) for kv in l.split() if "=" in kv) for l in p.stdout.splitlines()]
         for r in (0, 1):  # two checkpoints in a row
-            sus = [x for x in rounds if x.get("round") == str(r)][0]
+            sus = [x for x in rounds if x.get("round") == str(r) and "open_after_suspend" in x][0]
             self.assertEqual(sus["open_after_suspend"], "0", p.stdout)
+            # Each open device's file, all of them even past max; none once closed.
+            fd = [x for x in rounds if x.get("round") == str(r) and "fds" in x][0]
+            self.assertEqual((fd["fds"], fd["fds_cut"], fd["fds_devnull"], fd["fds_after_suspend"]),
+                             ("2", "2", "2", "0"), p.stdout)
         self.assertIn("same_numbers=1", p.stdout)  # two NICs, the same keys and queue pair numbers
         done = [x for x in rounds if "held" in x]
         self.assertEqual(len(done), 4, p.stdout + p.stderr)  # 2 rounds x 2 devices

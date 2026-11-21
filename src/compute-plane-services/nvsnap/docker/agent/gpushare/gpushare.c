@@ -1240,7 +1240,7 @@ static void do_poll(char *reply, size_t n, int step)
  * nvsnap_ibv.c). */
 static struct {
     int (*fence)(char *, size_t), (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
-    int (*connect)(const char *, char *, size_t), (*count)(void);
+    int (*connect)(const char *, char *, size_t), (*count)(void), (*fds)(int *, int);
     void (*open)(void);
 } ibv;
 
@@ -1248,6 +1248,8 @@ static struct {
 static int ibv_devices(void)
 {
     if (!ibv.count) {
+        static pthread_once_t once = PTHREAD_ONCE_INIT;
+        pthread_once(&once, init_real_dlsym);  /* a pause can come first */
         void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_NOLOAD);
         if (!h) return 0;
         *(void **)&ibv.fence = real_dlsym(h, "nvsnap_ibv_fence");
@@ -1257,10 +1259,77 @@ static int ibv_devices(void)
         *(void **)&ibv.connect = real_dlsym(h, "nvsnap_ibv_connect");
         *(void **)&ibv.open = real_dlsym(h, "nvsnap_ibv_open");
         if (!ibv.fence || !ibv.suspend || !ibv.restore || !ibv.map || !ibv.connect || !ibv.open) return 0;
+        /* Optional: without it, the pause checks count NCCL's files too. */
+        *(void **)&ibv.fds = real_dlsym(h, "nvsnap_ibv_fds");
         *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
         if (!ibv.count) return 0;
     }
     return ibv.count();
+}
+
+#ifndef GPUSHARE_RDMA_DIR
+#define GPUSHARE_RDMA_DIR "/dev/infiniband/"  /* the host tests name their own */
+#endif
+
+/* RDMA device files this process has open, and mappings of them: the
+ * dump fails on any. nccl: leave out NCCL's own, which libnvsnap_ibv holds
+ * and "release" closes (nvsnap_ibv_fds): its open files, and mappings of
+ * the devices they are, which cannot be told from another user's. Another
+ * user's open file still counts, even on one of those devices; a mapping
+ * of one whose file was closed is found by "release" (ibv_release). */
+static void rdma_files(int *open, int *mapped, int nccl)
+{
+    enum { MAX_OWN = 64 };
+    static const size_t dl = sizeof(GPUSHARE_RDMA_DIR) - 1;
+    int own[MAX_OWN], n_own = 0, n_devs = 0;
+    char devs[MAX_OWN][128], p[300], l[256];
+    if (nccl && ibv_devices() > 0 && ibv.fds) {
+        n_own = ibv.fds(own, MAX_OWN);
+        if (n_own < 0 || n_own > MAX_OWN) n_own = 0;  /* cannot tell: count them all */
+    }
+    *open = *mapped = 0;
+    DIR *d = opendir("/proc/self/fd");
+    for (struct dirent *e; d && (e = readdir(d));) {
+        snprintf(p, sizeof(p), "/proc/self/fd/%s", e->d_name);
+        ssize_t k = readlink(p, l, sizeof(l) - 1);
+        if (k <= 0) continue;
+        l[k] = 0;
+        if (strncmp(l, GPUSHARE_RDMA_DIR, dl)) continue;
+        int fd = atoi(e->d_name), mine = 0;
+        for (int i = 0; !mine && i < n_own; i++) mine = own[i] == fd;
+        if (!mine) { (*open)++; continue; }
+        int seen = (size_t)k >= sizeof(devs[0]);  /* too long to keep: its mappings count */
+        for (int i = 0; !seen && i < n_devs; i++) seen = !strcmp(devs[i], l);
+        if (!seen && n_devs < MAX_OWN) memcpy(devs[n_devs++], l, k + 1);
+    }
+    if (d) closedir(d);
+    FILE *f = fopen("/proc/self/maps", "re");
+    while (f && fgets(p, sizeof(p), f)) {
+        char *s = strstr(p, " " GPUSHARE_RDMA_DIR);
+        if (!s) continue;
+        s[strcspn(s, "\n")] = 0;
+        int mine = 0;
+        for (int i = 0; !mine && i < n_devs; i++) mine = !strcmp(devs[i], s + 1);
+        *mapped += !mine;
+    }
+    if (f) fclose(f);
+}
+
+/* "release", NCCL's part: destroy its verbs objects (nvsnap_ibv_suspend),
+ * then check that no RDMA is left at all. The pause checks ("mx",
+ * "nixl") left NCCL's to this point; what they could not tell from NCCL's
+ * fails here, before any GPU memory goes, rather than in the dump. Either
+ * way the tool rolls back: "load" creates NCCL's objects again. */
+static int ibv_release(char *reply, size_t n)
+{
+    if (ibv_devices() <= 0) return 0;
+    if (ibv.suspend(reply, n) < 0) return -1;
+    int fds, maps;
+    rdma_files(&fds, &maps, 0);
+    if (!fds && !maps) return 0;
+    snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped, once NCCL's were released: "
+             "CRIU cannot dump them", fds, maps);
+    return -1;
 }
 
 /* Hold launches, drain GPU work, and check that "release" can drop every
@@ -1383,7 +1452,7 @@ static void do_release(char *reply, size_t n, const char *args)
         return;
     }
     /* Before any memory goes: NCCL's registrations of it come first. */
-    if (ibv_devices() > 0 && ibv.suspend(reply, n) < 0) {
+    if (ibv_release(reply, n) < 0) {
         pthread_mutex_unlock(&mu);
         return;
     }
@@ -2224,8 +2293,10 @@ static void lease_expired(void)
  * (before quiesce) and "mx resume" (after open) do, in this process's own
  * Python. Not while launches are held: a Python thread waiting in the gate
  * holds the GIL. Needs ModelExpress >= 0.7: earlier releases keep no load
- * context once loaded, so there is nothing to pause. The reply counts the RDMA device files still open or
- * mapped: CRIU fails on any.
+ * context once loaded, so there is nothing to pause. The reply counts the
+ * RDMA device files still open or mapped, and the pause fails on any:
+ * CRIU cannot dump them. NCCL's, through libnvsnap_ibv, are left out:
+ * "release", right after, closes them (rdma_files).
  *
  * "mx resume HOST": ModelExpress publishes MX_WORKER_HOST, else the
  * address its sockets route from, as the address peers pull from. After a
@@ -2268,23 +2339,6 @@ static const char mx_py[] =
     "    except BaseException as e:\n"
     "        rep = 'err %s: %s' % (type(e).__name__, e)\n"
     "    os.write(fd, rep.encode()[:160])\n";
-
-/* RDMA device files this process has open, and mappings of them. */
-static void rdma_files(int *open, int *mapped)
-{
-    char p[300], l[256];
-    *open = *mapped = 0;
-    DIR *d = opendir("/proc/self/fd");
-    for (struct dirent *e; d && (e = readdir(d));) {
-        snprintf(p, sizeof(p), "/proc/self/fd/%s", e->d_name);
-        ssize_t k = readlink(p, l, sizeof(l) - 1);
-        if (k > 0) l[k] = 0, *open += !strncmp(l, "/dev/infiniband/", 16);
-    }
-    if (d) closedir(d);
-    FILE *f = fopen("/proc/self/maps", "r");
-    while (f && fgets(p, sizeof(p), f)) *mapped += strstr(p, " /dev/infiniband/") != NULL;
-    if (f) fclose(f);
-}
 
 static unsigned ucx_ver[3];
 static int ucx_loaded(void);
@@ -2332,9 +2386,9 @@ static void do_py(char *reply, size_t n, const char *src, size_t srclen, const c
         if (k > 0) out[k] = 0;
         else if (r) snprintf(out, sizeof(out), "err Python raised (see stderr)");
     }
-    rdma_files(&fds, &maps);
-    /* RDMA left after a pause (NCCL, say) fails the dump: fail the pause
-     * instead. */
+    rdma_files(&fds, &maps, 1);
+    /* RDMA left after a pause (UCX outside ModelExpress, say) fails the
+     * dump: fail the pause instead. NCCL's is left to "release". */
     if (*op == 'p' && (fds || maps) && !strncmp(out, "ok ", 3))
         snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped (%s): CRIU cannot dump them",
                  fds, maps, out + 3);
@@ -2353,7 +2407,8 @@ static void do_py(char *reply, size_t n, const char *src, size_t srclen, const c
  * connector on every TP worker (which frees the NIXL agent and its memory
  * registrations); in a TP worker process it waits until the engine has
  * done so. If that fails, or a worker still has RDMA device files open
- * afterwards (NCCL, say), the engine resumes. "nixl resume [HOST]"
+ * afterwards (other than NCCL's through libnvsnap_ibv, which "release"
+ * closes), the engine resumes. "nixl resume [HOST]"
  * creates the connectors again on the same KV memory under a new engine
  * id, so peers handshake with it afresh instead of using the queue pairs
  * and keys they cached, restarts the listener (on HOST, the pod's new IP,
@@ -2408,14 +2463,31 @@ static const char nixl_py[] =
     "        return 1\n"
     "\n"
     "    def w_rdma(_w):\n"
-    "        n = 0\n"
+    "        # As rdma_files: NCCL's own, through libnvsnap_ibv, are left to\n"
+    "        # \"release\", which checks again once they are closed.\n"
+    "        import ctypes\n"
+    "        d, own, devs, n, m = '" GPUSHARE_RDMA_DIR "', set(), set(), 0, 0\n"
+    "        try:\n"
+    "            a = (ctypes.c_int * 64)()\n"
+    "            k = ctypes.CDLL('libnvsnap_ibv.so', mode=os.RTLD_NOLOAD).nvsnap_ibv_fds(a, 64)\n"
+    "            own = set(a[:k]) if 0 <= k <= 64 else set()\n"
+    "        except (OSError, AttributeError):\n"
+    "            pass\n"
     "        for f in os.listdir('/proc/self/fd'):\n"
     "            try:\n"
-    "                n += os.readlink('/proc/self/fd/' + f).startswith('/dev/infiniband/')\n"
+    "                t = os.readlink('/proc/self/fd/' + f)\n"
     "            except OSError:\n"
-    "                pass\n"
-    "        with open('/proc/self/maps') as m:\n"
-    "            return os.getpid(), n, sum(' /dev/infiniband/' in l for l in m)\n"
+    "                continue\n"
+    "            if t.startswith(d):\n"
+    "                if int(f) in own:\n"
+    "                    devs.add(t)\n"
+    "                else:\n"
+    "                    n += 1\n"
+    "        with open('/proc/self/maps') as fm:\n"
+    "            for l in fm:\n"
+    "                i = l.find(' ' + d)\n"
+    "                m += i >= 0 and l[i + 1:].rstrip('\\n') not in devs\n"
+    "        return os.getpid(), n, m\n"
     "\n"
     "    def w_released(_w):\n"
     "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
@@ -2562,8 +2634,8 @@ static const char nixl_py[] =
     "            stop_listener(e.scheduler.get_kv_connector().connector_scheduler)\n"
     "            e._nvsnap_nixl['released'] = True\n"
     "            n = sum(e.model_executor.collective_rpc(w_release))\n"
-    "            # RDMA left in any worker (NCCL, say) would fail the dump: fail\n"
-    "            # here, so the engine resumes itself.\n"
+    "            # RDMA left in any worker (but NCCL's, see w_rdma) would fail\n"
+    "            # the dump: fail here, so the engine resumes itself.\n"
     "            left = [r for r in e.model_executor.collective_rpc(w_rdma) if r[1] or r[2]]\n"
     "            if left:\n"
     "                raise RuntimeError('RDMA device files still open after the release (pid, open, '\n"

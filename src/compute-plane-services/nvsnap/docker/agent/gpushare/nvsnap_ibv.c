@@ -1293,6 +1293,24 @@ EXPORT void nvsnap_ibv_open(void)
     reopen();
 }
 
+/* The files NCCL's open devices hold (each real context's command and
+ * event file), at most max of them in fds; returns how many there are.
+ * gpushare's "mx" and "nixl" pauses leave these to nvsnap_ibv_suspend,
+ * which closes them, instead of failing on them. */
+EXPORT int nvsnap_ibv_fds(int *fds, int max)
+{
+    int k = 0;
+    pthread_mutex_lock(&omu);
+    for (int i = 0; i < n_ctxs; i++) {
+        struct ibv_context *r = ctxs[i]->real;
+        if (!r) continue;
+        if (r->cmd_fd >= 0) { if (k < max) fds[k] = r->cmd_fd; k++; }
+        if (r->async_fd >= 0) { if (k < max) fds[k] = r->async_fd; k++; }
+    }
+    pthread_mutex_unlock(&omu);
+    return k;
+}
+
 /* How many RDMA devices NCCL has open (it opens them even when it
  * connects no queue pair: one node, NVLink only). */
 EXPORT int nvsnap_ibv_count(void)

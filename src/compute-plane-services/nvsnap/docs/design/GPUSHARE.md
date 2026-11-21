@@ -373,7 +373,15 @@ handle, a completion channel, or a queue pair other than reliable-connected.
 A process whose NCCL creates one refuses the suspend, and its workload runs
 on. Devices are matched by name (`mlx5_3`), so the restore node needs the
 same NIC names. Other users of verbs in the process (UCX, NIXL) are not
-covered: their devices still fail the dump, which rolls the workload back.
+covered: their devices still fail the dump, which rolls the workload back,
+unless they release them first. ModelExpress (`mx-pause`) and vLLM's NIXL
+KV connector (`nixl-pause`) do, before `quiesce`, while NCCL still holds its
+devices: their checks that no RDMA is left skip NCCL's files, which the
+library names (`nvsnap_ibv_fds`), and mappings of those devices, and
+`release`, once NCCL's are closed, checks the whole process and fails, before
+any GPU memory goes, if anything is still held. A mapping of one of NCCL's
+devices that another user left without its file is caught there, not at the
+pause.
 
 ## Requirements and limits
 
@@ -466,11 +474,11 @@ covered: their devices still fail the dump, which rolls the workload back.
   `rdma_cm`) or an MPTCP socket at capture cannot be captured; CRIU cannot
   dump them (checkpoint-restore/criu#267), and RDMA state (memory
   registrations in a NIC context, queue pairs connected to peers) would not
-  survive a restore anyway. gpushare does not touch RDMA. The capture
+  survive a restore anyway. The capture
   preflight blocks such a capture and the instance runs on and starts cold
   (ARCHITECTURE.md, "Who is captured"; MPTCP support: #2926). This covers,
-  for example, ModelExpress peer-to-peer over RDMA (NIXL/UCX) and NCCL over
-  InfiniBand or RoCE. A workload that has released its RDMA devices by
+  for example, NIXL KV over RDMA without `nixl-pause` and NCCL over
+  InfiniBand or RoCE without `libnvsnap_ibv.so`. A workload that has released its RDMA devices by
   capture time is not blocked.
 - ModelExpress: a worker that loads its weights through ModelExpress
   (`MODEL_EXPRESS_URL` in a process's environment, or `--load-format mx` or `modelexpress`)
@@ -480,8 +488,9 @@ covered: their devices still fail the dump, which rolls the workload back.
   each member's agent runs `mx-pause` on the GPU processes right before the
   suspend, after the instance is held and the capture claimed, so a
   skipped or retried capture never pauses a serving worker. `mx-pause`
-  fails while any RDMA device is still held (NCCL or NIXL KV over RDMA
-  outside ModelExpress): the capture fails there, before anything is
+  fails while any RDMA device is still held (NIXL KV, or NCCL over RDMA
+  without `libnvsnap_ibv.so`; see "NCCL over InfiniBand or RoCE" for NCCL
+  with it): the capture fails there, before anything is
   stopped, with the tool's reason, and the agent runs `mx-resume`. Every
   way the source runs on after a pause (a failed capture, a leave-running
   dump) runs `mx-resume` after the source's resume. The capture records
@@ -521,8 +530,8 @@ covered: their devices still fail the dump, which rolls the workload back.
   pause is refused. At TP > 1 in a pod with RDMA NICs, NCCL opens
   the RDMA devices even when every rank is on one node, and keeps them open
   until the process exits (destroying all its communicators does not close
-  them), so `nixl-pause` refuses such a pod until gpushare handles RDMA
-  devices itself. A process holding both ModelExpress and NIXL KV
+  them), so `nixl-pause` refuses such a pod unless NCCL loads its verbs from
+  `libnvsnap_ibv.so` (see "NCCL over InfiniBand or RoCE"). A process holding both ModelExpress and NIXL KV
   RDMA state is not handled yet: whichever pause runs first fails its RDMA
   check, since the other still holds RDMA devices.
 

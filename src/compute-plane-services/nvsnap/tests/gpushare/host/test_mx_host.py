@@ -100,9 +100,10 @@ while True:
 """
 
 
-def build(tmp):
+def build(tmp, *defines):
     def cc(*args):
-        subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", SRC, "-I", CUDA_INC, *args], check=True)
+        subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", SRC, "-I", CUDA_INC, *defines, *args],
+                       check=True)
     with open(os.path.join(tmp, "stub.c"), "w") as f:
         f.write(STUB)
     cc("-shared", "-fPIC", "-o", os.path.join(tmp, "libcuda.so.1"), os.path.join(tmp, "stub.c"))
