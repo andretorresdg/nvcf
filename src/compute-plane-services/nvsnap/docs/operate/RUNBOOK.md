@@ -215,8 +215,9 @@ three times.
   the failed run's log" and the pod's name.
 - Captures that failed for the workload's own doing (`reason`
   `workload_exited`: it ended during the capture; `no_gpu_process`: it had
-  nothing on the GPU) do not fire this alert; they are on the dashboard's
-  "Capture outcomes".
+  nothing on the GPU; `modelexpress_version`: it runs a ModelExpress older
+  than 0.7, so it serves uncaptured until its owner updates ModelExpress)
+  do not fire this alert; they are on the dashboard's "Capture outcomes".
 
 ## NvsnapInventoryStale
 

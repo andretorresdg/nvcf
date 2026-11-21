@@ -314,6 +314,11 @@ const (
 	// NoGPUProcessText: a multi-node instance's pod had no process on the
 	// GPU under the gpushare library to capture.
 	NoGPUProcessText = "no process of this pod runs on the gpu"
+	// ModelExpressVersionText: the workload loads its weights through a
+	// ModelExpress older than 0.7, which cannot release its state for a
+	// capture (the GPU tool's mx-pause refuses it). Not captured until
+	// the workload updates ModelExpress.
+	ModelExpressVersionText = "needs modelexpress >= 0.7"
 )
 
 // Reason classes a failure's text into a bounded label value.
@@ -328,6 +333,8 @@ func Reason(text string) string {
 		return "workload_exited"
 	case strings.Contains(t, NoGPUProcessText):
 		return "no_gpu_process"
+	case strings.Contains(t, ModelExpressVersionText):
+		return "modelexpress_version"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):
