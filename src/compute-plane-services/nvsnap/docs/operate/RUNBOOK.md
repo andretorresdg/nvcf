@@ -12,6 +12,7 @@ records are in `nvsnap-system`.
 **Contents**
 
 - [Following one capture or restore](#following-one-capture-or-restore)
+- [Group restores that skip setup (`webhook.skipUnusedInits`)](#group-restores-that-skip-setup-webhookskipunusedinits)
 - [NvsnapAgentMetricsMissing](#nvsnapagentmetricsmissing)
 - [NvsnapAgentDown](#nvsnapagentdown)
 - [NvsnapWebhookErrors](#nvsnapwebhookerrors)
