@@ -16,7 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// The shape crit gives a Kimi worker's dump (ct4, 2026-11-20): the model
+// The shape crit gives a multi-node vLLM worker's dump: the model
 // emptyDir is mounted, but no file the processes hold is on it.
 const dumpMounts = `{"entries":[
  {"mnt_id":11136,"mountpoint":"/","root":"/"},

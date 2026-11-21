@@ -15,7 +15,7 @@ import (
 
 // kimiWorker is a Dynamo vLLM worker as a PodClique runs it: its engine
 // container "main" mounts the model emptyDir download-ngc-model fills, and
-// a native sidecar and a wait run beside it (ct4, 2026-11-20).
+// a native sidecar and a wait run beside it.
 func kimiWorker(i string) *corev1.Pod {
 	yes := true
 	always := corev1.ContainerRestartPolicyAlways
@@ -36,7 +36,7 @@ func kimiWorker(i string) *corev1.Pod {
 	return p
 }
 
-// The ct4 gate failure: with no model volume, every group placeholder
+// The failure this fixes: with no model volume, every group placeholder
 // downloaded the whole model again although no restored process used it.
 // With the group's capture recording the model volume unused, the
 // placeholder skips the download and keeps everything else it ran.
