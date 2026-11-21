@@ -340,6 +340,10 @@ type Mutator struct {
 	// group members that name no model (LWS workers); may be nil.
 	// ModelWaitDeadline bounds a reader's wait before it downloads itself.
 	ModelVolume *modelvolume.Provisioner
+	// NodeModelCache, when set, seeds a cold pod's model download from
+	// the node's local copy (docs/design/node-model-cache.md). Never
+	// together with ModelVolume.
+	NodeModelCache *NodeModelCache
 	// CacheVolume shares compile caches between Helm pods on block storage
 	// (KindCache provisioner); nil disables.
 	CacheVolume       *modelvolume.Provisioner
@@ -668,6 +672,9 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		} else if vp != nil {
 			return mergePatchPlan(append(injectPatches, vp...)), nil
 		}
+		// A cold pod's model download seeds from the node's copy
+		// (node_model_cache.go); it changes only the download init.
+		injectPatches = append(injectPatches, m.nodeModelCachePatches(ctx, pod)...)
 		if ep, err := m.electionPatches(ctx, pod); err != nil {
 			m.logger().WithError(err).WithField("pod", election.PodIdentity(pod)).
 				Warn("election failed; admitting pod unchanged")

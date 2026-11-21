@@ -1,0 +1,718 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package modelcache keeps downloaded model trees on a node's local disk,
+// so a later cold pod on that node, or on a node that fetches the tree
+// from it, seeds its own download volume instead of downloading again
+// (docs/design/node-model-cache.md).
+//
+// Layout under the cache root, one directory per key:
+//
+//	<root>/<key>/gen-<id>/tree/      the model files
+//	<root>/<key>/gen-<id>/MANIFEST   every entry: path, type, mode, size, sha256
+//	<root>/<key>/gen-<id>/.complete  written last; without it the generation does not exist
+//	<root>/<key>/.attempt-<id>/      a harvest or fetch in progress
+//
+// A generation is immutable once complete. A new copy is always a new
+// generation, built in an attempt directory nobody reads and renamed into
+// place only after every file is written, checked and synced, so no reader
+// ever sees a directory replaced under it. Every use of a generation
+// checks each file against its manifest while copying, so a file corrupted
+// on disk after publication is caught by the pod about to use it.
+package modelcache
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+)
+
+const (
+	// TreeDir holds a generation's files.
+	TreeDir = "tree"
+	// ManifestFile lists a generation's entries.
+	ManifestFile = "MANIFEST"
+	// CompleteFile marks a generation as published.
+	CompleteFile = ".complete"
+	// GenPrefix starts a generation directory's name.
+	GenPrefix = "gen-"
+	// AttemptPrefix starts an in-progress harvest or fetch directory.
+	AttemptPrefix = ".attempt-"
+	// IncomingFile is the heartbeat the agent refreshes while it fetches a
+	// key from a peer; a seeding pod waits only while it is fresh.
+	IncomingFile = ".incoming"
+	// InitSeeded and InitDownloaded are a wrapped download init's
+	// termination message: how its volume was filled.
+	InitSeeded     = "nvsnap-model-cache: seeded"
+	InitDownloaded = "nvsnap-model-cache: downloaded"
+	// ManifestVersion is the manifest format.
+	ManifestVersion = 1
+)
+
+// Entry types.
+const (
+	TypeDir     = "dir"
+	TypeFile    = "file"
+	TypeSymlink = "symlink"
+)
+
+var (
+	// ErrCorrupt: a file does not match its manifest entry.
+	ErrCorrupt = errors.New("model cache: file does not match its manifest")
+	// ErrUnsupported: the tree holds an entry the cache cannot reproduce
+	// exactly (a device, a socket, a symlink leaving the tree, a path
+	// leaving the tree). Such a tree is not cached.
+	ErrUnsupported = errors.New("model cache: tree holds an entry the cache does not reproduce")
+	// ErrTooLarge: the tree is over the limit it was given.
+	ErrTooLarge = errors.New("model cache: tree is over its size limit")
+	// ErrChanged: a source file changed while it was copied.
+	ErrChanged = errors.New("model cache: source changed while it was copied")
+	// ErrTargetNotEmpty: the volume to seed already has content (an init
+	// that restarted after a partial download); the download handles it.
+	ErrTargetNotEmpty = errors.New("model cache: target is not empty")
+)
+
+// Entry is one path in a model tree, relative to the tree root.
+type Entry struct {
+	Path   string `json:"path"`
+	Type   string `json:"type"`
+	Mode   uint32 `json:"mode"`
+	Size   int64  `json:"size,omitempty"`
+	SHA256 string `json:"sha256,omitempty"`
+	Target string `json:"target,omitempty"`
+}
+
+// Manifest is a generation's list of entries, parents before children.
+type Manifest struct {
+	Version int     `json:"version"`
+	Entries []Entry `json:"entries"`
+	// Bytes is the sum of the file sizes.
+	Bytes int64 `json:"bytes"`
+}
+
+// Limits bounds what a harvest or fetch writes. Zero means no limit.
+type Limits struct {
+	MaxBytes   int64
+	MaxEntries int
+	// NotAfter, for a harvest, is when the download finished: an entry
+	// changed later was written by something else (the engine, once it
+	// started), so the tree is not the download's and is not cached.
+	NotAfter time.Time
+}
+
+// ErrWrittenAfter: the tree changed after the download finished.
+var ErrWrittenAfter = errors.New("model cache: tree changed after the download finished")
+
+// ReadCloser is a source file, local or from a peer.
+type ReadCloser = io.ReadCloser
+
+// Key is the cache key of a download: the tenant it was downloaded for,
+// what it downloads and how it lays it out (modelid ShareKey), and the
+// downloader itself (its image and its command and settings). A change to
+// any of them is another key, so a pod never seeds a tree another recipe
+// wrote. The key is hex, safe as a path element and a label value.
+func Key(scope, shareKey, image, recipe string) string {
+	h := sha256.New()
+	for _, s := range []string{scope, shareKey, image, recipe} {
+		fmt.Fprintf(h, "%d:%s\n", len(s), s)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
+}
+
+// ValidKey reports whether k is a key Key could have made.
+func ValidKey(k string) bool {
+	if len(k) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(k)
+	return err == nil
+}
+
+// ValidRel reports whether p is a clean path inside a tree.
+func ValidRel(p string) bool { return validRel(p) }
+
+// validRel reports whether p is a clean path inside a tree.
+func validRel(p string) bool {
+	return p != "" && p != "." && !path.IsAbs(p) && path.Clean(p) == p &&
+		p != ".." && !strings.HasPrefix(p, "../")
+}
+
+// validLink reports whether a symlink at rel pointing to target stays
+// inside the tree.
+func validLink(rel, target string) bool {
+	if target == "" || path.IsAbs(target) || path.Clean(target) != target {
+		return false
+	}
+	return validRel(path.Join(path.Dir(rel), target))
+}
+
+// Store is a node's cache root.
+type Store struct {
+	Root string
+}
+
+// KeyDir is where key's generations live.
+func (s *Store) KeyDir(key string) string { return filepath.Join(s.Root, key) }
+
+func newID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%020d-%s", time.Now().UnixNano(), hex.EncodeToString(b[:]))
+}
+
+// Latest returns key's newest complete generation and its manifest.
+func (s *Store) Latest(key string) (string, Manifest, bool) {
+	gens := s.Generations(key)
+	for i := len(gens) - 1; i >= 0; i-- {
+		if m, err := ReadManifest(gens[i]); err == nil {
+			return gens[i], m, true
+		}
+	}
+	return "", Manifest{}, false
+}
+
+// Generations lists key's complete generations, oldest first.
+func (s *Store) Generations(key string) []string {
+	return Generations(s.KeyDir(key))
+}
+
+// Generations lists the complete generations in a key directory, oldest
+// first. The helper calls it on the key directory mounted into the pod.
+func Generations(keyDir string) []string {
+	ents, err := os.ReadDir(keyDir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), GenPrefix) {
+			continue
+		}
+		dir := filepath.Join(keyDir, e.Name())
+		if _, err := os.Stat(filepath.Join(dir, CompleteFile)); err == nil {
+			out = append(out, dir)
+		}
+	}
+	sort.Strings(out) // ids start with a zero-padded timestamp
+	return out
+}
+
+// LatestIn is Latest for a key directory given by path.
+func LatestIn(keyDir string) (string, Manifest, bool) {
+	gens := Generations(keyDir)
+	for i := len(gens) - 1; i >= 0; i-- {
+		if m, err := ReadManifest(gens[i]); err == nil {
+			return gens[i], m, true
+		}
+	}
+	return "", Manifest{}, false
+}
+
+// ReadManifest reads and checks a generation's manifest.
+func ReadManifest(gen string) (Manifest, error) {
+	var m Manifest
+	b, err := os.ReadFile(filepath.Join(gen, ManifestFile))
+	if err != nil {
+		return m, err
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return m, fmt.Errorf("manifest %s: %w", gen, err)
+	}
+	return m, m.Check(Limits{})
+}
+
+// Check validates a manifest, typically one received from a peer: a known
+// version, confined paths, known types, well-formed checksums, parents
+// before children, and the limits.
+func (m Manifest) Check(lim Limits) error {
+	if m.Version != ManifestVersion {
+		return fmt.Errorf("%w: manifest version %d", ErrUnsupported, m.Version)
+	}
+	if lim.MaxEntries > 0 && len(m.Entries) > lim.MaxEntries {
+		return fmt.Errorf("%w: %d entries", ErrTooLarge, len(m.Entries))
+	}
+	seen := map[string]string{}
+	var total int64
+	for _, e := range m.Entries {
+		if !validRel(e.Path) {
+			return fmt.Errorf("%w: path %q", ErrUnsupported, e.Path)
+		}
+		if _, dup := seen[e.Path]; dup {
+			return fmt.Errorf("%w: path %q twice", ErrUnsupported, e.Path)
+		}
+		if d := path.Dir(e.Path); d != "." && seen[d] != TypeDir {
+			return fmt.Errorf("%w: %q comes before its directory", ErrUnsupported, e.Path)
+		}
+		switch e.Type {
+		case TypeDir:
+		case TypeFile:
+			if e.Size < 0 || len(e.SHA256) != 64 {
+				return fmt.Errorf("%w: file %q has no size or checksum", ErrUnsupported, e.Path)
+			}
+			if _, err := hex.DecodeString(e.SHA256); err != nil {
+				return fmt.Errorf("%w: file %q checksum", ErrUnsupported, e.Path)
+			}
+			total += e.Size
+		case TypeSymlink:
+			if !validLink(e.Path, e.Target) {
+				return fmt.Errorf("%w: symlink %q -> %q", ErrUnsupported, e.Path, e.Target)
+			}
+		default:
+			return fmt.Errorf("%w: %q has type %q", ErrUnsupported, e.Path, e.Type)
+		}
+		seen[e.Path] = e.Type
+	}
+	if total != m.Bytes {
+		return fmt.Errorf("%w: manifest bytes %d, files sum to %d", ErrUnsupported, m.Bytes, total)
+	}
+	if lim.MaxBytes > 0 && total > lim.MaxBytes {
+		return fmt.Errorf("%w: %d bytes", ErrTooLarge, total)
+	}
+	return nil
+}
+
+// attempt is a directory a harvest or fetch builds a generation in.
+type attempt struct {
+	keyDir, dir string
+}
+
+func (s *Store) newAttempt(key string) (*attempt, error) {
+	if !ValidKey(key) && !testKey(key) {
+		return nil, fmt.Errorf("model cache: bad key %q", key)
+	}
+	keyDir := s.KeyDir(key)
+	if err := os.MkdirAll(keyDir, 0o755); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(keyDir, AttemptPrefix+newID())
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(filepath.Join(dir, TreeDir), 0o755); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	return &attempt{keyDir: keyDir, dir: dir}, nil
+}
+
+// testKey lets tests use short readable keys; production keys come from Key.
+var testKey = func(string) bool { return false }
+
+func (a *attempt) abort() { _ = os.RemoveAll(a.dir) }
+
+// publish writes the manifest and the completion marker, syncs the tree,
+// and renames the attempt to a generation.
+func (a *attempt) publish(m Manifest) (string, error) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	if err := writeSynced(filepath.Join(a.dir, ManifestFile), b); err != nil {
+		return "", err
+	}
+	if err := syncTree(filepath.Join(a.dir, TreeDir)); err != nil {
+		return "", err
+	}
+	// The directory is opened to readers only now: an attempt is 0700 so
+	// a pod's mount of the key directory never reads one.
+	if err := os.Chmod(a.dir, 0o755); err != nil {
+		return "", err
+	}
+	if err := writeSynced(filepath.Join(a.dir, CompleteFile), nil); err != nil {
+		return "", err
+	}
+	gen := filepath.Join(a.keyDir, GenPrefix+newID())
+	if err := os.Rename(a.dir, gen); err != nil {
+		return "", err
+	}
+	return gen, syncDir(a.keyDir)
+}
+
+// Harvest copies the tree at src (a pod's download volume, read from the
+// host) into a new generation of key. It hashes as it copies, and checks
+// each file did not change during its copy. Any error leaves nothing.
+func (s *Store) Harvest(key, src string, lim Limits) (string, error) {
+	a, err := s.newAttempt(key)
+	if err != nil {
+		return "", err
+	}
+	m, err := copyIn(src, filepath.Join(a.dir, TreeDir), lim)
+	if err != nil {
+		a.abort()
+		return "", err
+	}
+	gen, err := a.publish(m)
+	if err != nil {
+		a.abort()
+		return "", err
+	}
+	return gen, nil
+}
+
+// copyIn walks src without following symlinks and copies it to dst,
+// building the manifest.
+func copyIn(src, dst string, lim Limits) (Manifest, error) {
+	m := Manifest{Version: ManifestVersion}
+	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if p == src {
+			// A file the engine added or removed at the top changes the
+			// root's mtime.
+			if fi, err := d.Info(); err == nil && !lim.NotAfter.IsZero() && fi.ModTime().After(lim.NotAfter) {
+				return fmt.Errorf("%w: the volume root at %s", ErrWrittenAfter, fi.ModTime().UTC().Format(time.RFC3339))
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if lim.MaxEntries > 0 && len(m.Entries) >= lim.MaxEntries {
+			return fmt.Errorf("%w: over %d entries", ErrTooLarge, lim.MaxEntries)
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !lim.NotAfter.IsZero() && fi.ModTime().After(lim.NotAfter) {
+			return fmt.Errorf("%w: %s at %s", ErrWrittenAfter, rel, fi.ModTime().UTC().Format(time.RFC3339))
+		}
+		out := filepath.Join(dst, filepath.FromSlash(rel))
+		e := Entry{Path: rel, Mode: uint32(fi.Mode().Perm())}
+		switch {
+		case fi.IsDir():
+			e.Type = TypeDir
+			if err := os.Mkdir(out, 0o755); err != nil {
+				return err
+			}
+		case fi.Mode().IsRegular():
+			e.Type = TypeFile
+			budget := int64(-1)
+			if lim.MaxBytes > 0 {
+				budget = lim.MaxBytes - m.Bytes
+			}
+			sum, n, err := copyFile(p, out, fi, budget)
+			if err != nil {
+				return fmt.Errorf("%s: %w", rel, err)
+			}
+			e.Size, e.SHA256 = n, sum
+			m.Bytes += n
+		case fi.Mode()&fs.ModeSymlink != 0:
+			t, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			if !validLink(rel, t) {
+				return fmt.Errorf("%w: symlink %s -> %s", ErrUnsupported, rel, t)
+			}
+			e.Type, e.Target, e.Mode = TypeSymlink, t, 0
+			if err := os.Symlink(t, out); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("%w: %s is %v", ErrUnsupported, rel, fi.Mode().Type())
+		}
+		m.Entries = append(m.Entries, e)
+		return nil
+	})
+	return m, err
+}
+
+// copyFile copies one regular file, hashing it, refusing to go past budget
+// bytes (negative: no limit), and checking the source did not change.
+func copyFile(src, dst string, before fs.FileInfo, budget int64) (string, int64, error) {
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", 0, err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", 0, err
+	}
+	h := sha256.New()
+	var r io.Reader = in
+	if budget >= 0 {
+		r = io.LimitReader(in, budget+1)
+	}
+	n, err := io.Copy(io.MultiWriter(out, h), r)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", n, err
+	}
+	if budget >= 0 && n > budget {
+		return "", n, ErrTooLarge
+	}
+	after, err := in.Stat()
+	if err != nil {
+		return "", n, err
+	}
+	if n != before.Size() || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return "", n, ErrChanged
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// Fetch builds a new generation of key from a peer's manifest, reading
+// each file through open and checking it against the manifest. The
+// manifest is checked first: a path or link leaving the tree, or a tree
+// over the limits, is refused before anything is written.
+func (s *Store) Fetch(key string, m Manifest, open func(rel string) (ReadCloser, error), lim Limits) (string, error) {
+	if err := m.Check(lim); err != nil {
+		return "", err
+	}
+	a, err := s.newAttempt(key)
+	if err != nil {
+		return "", err
+	}
+	tree := filepath.Join(a.dir, TreeDir)
+	for _, e := range m.Entries {
+		if err := materialize(tree, e, func() (ReadCloser, error) { return open(e.Path) }); err != nil {
+			a.abort()
+			return "", fmt.Errorf("%s: %w", e.Path, err)
+		}
+	}
+	gen, err := a.publish(m)
+	if err != nil {
+		a.abort()
+		return "", err
+	}
+	return gen, nil
+}
+
+// Seed copies generation gen, whose manifest is m, into the empty
+// directory dst, checking every file against the manifest as it copies
+// and giving every entry its recorded mode. On error dst may hold part of
+// the tree; the caller empties it before falling back to the download.
+func Seed(gen string, m Manifest, dst string) error {
+	if err := m.Check(Limits{}); err != nil {
+		return err
+	}
+	ents, err := os.ReadDir(dst)
+	if err != nil {
+		return err
+	}
+	if len(ents) > 0 {
+		return ErrTargetNotEmpty
+	}
+	tree := filepath.Join(gen, TreeDir)
+	for _, e := range m.Entries {
+		src := filepath.Join(tree, filepath.FromSlash(e.Path))
+		if err := materialize(dst, e, func() (ReadCloser, error) {
+			return os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		}); err != nil {
+			return fmt.Errorf("%s: %w", e.Path, err)
+		}
+	}
+	// Directory modes last: a read-only directory set first would refuse
+	// its own children.
+	for i := len(m.Entries) - 1; i >= 0; i-- {
+		if e := m.Entries[i]; e.Type == TypeDir {
+			if err := os.Chmod(filepath.Join(dst, filepath.FromSlash(e.Path)), fs.FileMode(e.Mode).Perm()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// materialize creates entry e under root, reading a file's bytes from
+// open and checking them against e.
+func materialize(root string, e Entry, open func() (ReadCloser, error)) error {
+	out := filepath.Join(root, filepath.FromSlash(e.Path))
+	switch e.Type {
+	case TypeDir:
+		return os.Mkdir(out, 0o755)
+	case TypeSymlink:
+		return os.Symlink(e.Target, out)
+	case TypeFile:
+		in, err := open()
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		h := sha256.New()
+		// One byte past the size shows a source longer than its entry
+		// without writing more than that.
+		n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(in, e.Size+1))
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+		if n != e.Size || !sumIs(h, e.SHA256) {
+			return ErrCorrupt
+		}
+		return os.Chmod(out, fs.FileMode(e.Mode).Perm())
+	}
+	return ErrUnsupported
+}
+
+func sumIs(h hash.Hash, want string) bool {
+	return hex.EncodeToString(h.Sum(nil)) == want
+}
+
+// EvictKey removes every generation of key. The caller holds the key's
+// lock and has checked nothing uses it.
+func (s *Store) EvictKey(key string) error {
+	if !ValidKey(key) && !testKey(key) {
+		return fmt.Errorf("model cache: bad key %q", key)
+	}
+	return os.RemoveAll(s.KeyDir(key))
+}
+
+// CleanAttempts removes every attempt directory. Called when the agent
+// starts, before it begins any attempt: no attempt then has a live owner.
+func (s *Store) CleanAttempts() error {
+	keys, err := os.ReadDir(s.Root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, k := range keys {
+		if !k.IsDir() {
+			continue
+		}
+		ents, _ := os.ReadDir(filepath.Join(s.Root, k.Name()))
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), AttemptPrefix) {
+				if err := os.RemoveAll(filepath.Join(s.Root, k.Name(), e.Name())); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Keys lists the keys with at least one directory under the root.
+func (s *Store) Keys() []string {
+	ents, err := os.ReadDir(s.Root)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// Usage is the bytes of files in complete generations. Attempts in
+// flight are left out: their owners account for them by reservation.
+func (s *Store) Usage() (int64, error) {
+	var total int64
+	err := filepath.WalkDir(s.Root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() && strings.HasPrefix(d.Name(), AttemptPrefix) {
+			return filepath.SkipDir
+		}
+		if d.Type().IsRegular() {
+			if fi, err := d.Info(); err == nil {
+				total += fi.Size()
+			}
+		}
+		return nil
+	})
+	return total, err
+}
+
+// LastUsed is when key was last seeded or published: the newest mtime of
+// its key directory's use marker or generations.
+func (s *Store) LastUsed(key string) time.Time {
+	var t time.Time
+	for _, p := range append(s.Generations(key), filepath.Join(s.KeyDir(key), usedFile)) {
+		if fi, err := os.Stat(p); err == nil && fi.ModTime().After(t) {
+			t = fi.ModTime()
+		}
+	}
+	return t
+}
+
+// usedFile is touched by the agent whenever a pod seeds the key.
+const usedFile = ".used"
+
+// Touch records a use of key, for eviction order.
+func (s *Store) Touch(key string) {
+	p := filepath.Join(s.KeyDir(key), usedFile)
+	now := time.Now()
+	if err := os.Chtimes(p, now, now); err != nil {
+		_ = os.WriteFile(p, nil, 0o644)
+	}
+}
+
+func writeSynced(p string, b []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// syncTree flushes every file and directory under root to disk, so a
+// generation marked complete survives a power loss as written.
+func syncTree(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return f.Sync()
+	})
+}

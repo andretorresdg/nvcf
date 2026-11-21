@@ -183,6 +183,11 @@ type Config struct {
 	// ModelVolume enables the write-once model volume for Helm functions.
 	ModelVolume ModelVolumeConfig
 
+	// NodeModelCache keeps downloaded models on this node's disk and
+	// seeds later cold pods from it (node_model_cache.go). Off by default;
+	// never together with ModelVolume.
+	NodeModelCache NodeModelCacheConfig
+
 	// Rails is the rails tier of EnsureLocal: checkpoint copies between
 	// nodes over their RDMA NICs with bedrock-peer (rails_fetch.go). Off
 	// unless Rails.Image is set.
@@ -737,6 +742,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	router.HandleFunc("/v1/restore/prep", a.startRestorePrepHandler).Methods("POST")
 	router.HandleFunc("/v1/restore/prep/{pod-uid}", a.statusRestorePrepHandler).Methods("GET")
 	router.HandleFunc("/v1/restore/prep/{pod-uid}", a.cleanupRestorePrepHandler).Methods("DELETE")
+
+	// Node-local model cache: its peer routes and its controller.
+	a.startNodeModelCache(ctx, router)
 
 	a.server = &http.Server{
 		Addr:              a.config.ListenAddr,

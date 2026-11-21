@@ -22,6 +22,7 @@ records are in `nvsnap-system`.
 - [NvsnapCaptureFailed](#nvsnapcapturefailed)
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
+- [Node model cache](#node-model-cache)
 <!-- /toc -->
 
 ## Following one capture or restore
@@ -240,3 +241,21 @@ for 6 minutes; until then only its own namespace restores from it.
 - Its namespace's pods: deleted and restored again and again within 6
   minutes (a test that cycles its instance) never verify it. Otherwise
   [follow its last restore](#following-one-capture-or-restore).
+
+## Node model cache
+
+Not an alert. The cache ([node-model-cache.md](../design/node-model-cache.md)) seeds cold pods' model downloads from
+a copy on the node.
+
+- **Is it working?** `sum by (result) (increase(nvsnap_model_cache_inits_total[1h]))`: `seeded` against
+  `downloaded`. A wrapped init logs `nvsnap: model cache: seeded <bytes> ...` or `... downloading`. The agent logs
+  `model cache: harvested`, `fetched from peer` and `evicted` with the key.
+- **Which nodes have a model?** `kubectl -n nvsnap-system get cm -l app.kubernetes.io/component=model-cache -o yaml`:
+  one ConfigMap per key, one entry per node.
+- **A pod seeded a bad model.** Every copy is checked against its manifest. A tree that was wrong when it was
+  downloaded was kept as downloaded. To remove a key from a node, delete `<root>/<key>` on the node and remove the
+  node's entry from `nvsnap-model-cache-<key>`. Admission keeps wrapping inits; they download until a new copy is
+  kept.
+- **Turn it off.** Set `agent.nodeModelCache.enabled=false` and upgrade. New pods are admitted unwrapped. The files
+  under `root` stay until removed by hand.
+

@@ -262,12 +262,40 @@ var (
 )
 
 // lifecycleCollectors are registered with the agent's.
+// Node-local model cache (docs/design/node-model-cache.md).
+var (
+	// ModelCacheInits counts wrapped download inits that finished, by
+	// what filled the volume: seeded from the cache, downloaded, or the
+	// download failed.
+	ModelCacheInits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_inits_total",
+		Help:      "Model download inits the node cache wraps, by how the volume was filled: seeded, downloaded, failed.",
+	}, []string{"result"})
+
+	// ModelCacheOps counts the agent's cache operations: harvest (keep a
+	// finished download), fetch (copy a key from a peer), evict.
+	ModelCacheOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_operations_total",
+		Help:      "Node model cache operations by kind (harvest, fetch, evict) and result (ok, error, skipped).",
+	}, []string{"op", "result"})
+
+	// ModelCacheBytes counts the bytes harvests and fetches wrote.
+	ModelCacheBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_bytes_total",
+		Help:      "Bytes the node model cache wrote, by operation (harvest, fetch).",
+	}, []string{"op"})
+)
+
 var lifecycleCollectors = []prometheus.Collector{
 	CaptureOutcomes, CapturePhaseSeconds, CaptureBytes,
 	RestoreOutcomes, RestorePhaseSeconds, RestoreFetches, RestoreFetchSeconds,
 	PodReadySeconds, PodStartSeconds, TeardownOutcomes, TeardownSeconds,
 	CaptureRecords, CaptureRecordOldestSeconds, CaptureRecordsUnrestored, InventoryLeader, InventoryScanTimestamp,
 	Admissions, WebhookRequests, WebhookSeconds, GPUProbes, BuildInfo,
+	ModelCacheInits, ModelCacheOps, ModelCacheBytes,
 }
 
 // Ranks buckets an instance size: the label stays bounded for instances of
