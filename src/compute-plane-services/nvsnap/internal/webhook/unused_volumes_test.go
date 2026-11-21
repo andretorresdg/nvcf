@@ -212,3 +212,24 @@ func TestCRIUGroupRestore_SkipsUnusedSetupOnlyWithTheFlag(t *testing.T) {
 		}
 	}
 }
+
+// A file the engine reads through a subPath of the volume: a placeholder
+// that skipped its setup would get a directory kubelet made in its place.
+// The download runs, and the group decides nothing to skip.
+func TestGroupPlaceholderKeepsSetupForSubPathMounts(t *testing.T) {
+	for _, set := range []func(*corev1.VolumeMount){
+		func(vm *corev1.VolumeMount) { vm.SubPath = "config.json" },
+		func(vm *corev1.VolumeMount) { vm.SubPathExpr = "$(POD_NAME)" },
+	} {
+		pod := kimiWorker("0")
+		vm := corev1.VolumeMount{Name: "ngc-models", MountPath: "/etc/model.json"}
+		set(&vm)
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, vm)
+		if !placeholderInitsUnused(t, pod, true, map[string]bool{"ngc-models": true})["download-ngc-model"] {
+			t.Errorf("%+v: the download must run", vm)
+		}
+		if got, why := GroupUnusedVolumes(members(pod, kimiWorker("1"))); got != nil || why == "" {
+			t.Errorf("%+v: got %v, want none with a reason", vm, got)
+		}
+	}
+}

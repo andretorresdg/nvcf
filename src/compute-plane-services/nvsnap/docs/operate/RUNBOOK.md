@@ -106,7 +106,8 @@ skips the init containers that fill only it.
 - **Did a placeholder skip?** Its annotation `nvsnap.io/skipped-inits`
   names the inits it skipped.
 - **A workload must keep its setup.** Annotate its pods
-  `nvsnap.io/keep-inits: "true"`. Its next placeholders run every init.
+  `nvsnap.io/keep-inits: "true"`. Its next placeholders skip no init for
+  unused volumes: they run the same inits as with the flag off.
 - **Turn it off.** Set `webhook.skipUnusedInits: false` and roll the agents.
   Records that already list volumes are then ignored. Placeholders admitted
   before the change keep their patches until they are replaced.

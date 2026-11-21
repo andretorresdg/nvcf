@@ -184,7 +184,8 @@ func unusedVolumeSkips(pod *corev1.Pod, container string, unused map[string]bool
 	return skips, ""
 }
 
-// containerEmptyDirs lists the emptyDir volumes container of pod mounts.
+// containerEmptyDirs lists the emptyDir volumes container of pod mounts,
+// leaving out any it mounts through a subPath (a file its setup put there).
 func containerEmptyDirs(pod *corev1.Pod, container string) []string {
 	empty := map[string]bool{}
 	for i := range pod.Spec.Volumes {
@@ -193,13 +194,19 @@ func containerEmptyDirs(pod *corev1.Pod, container string) []string {
 		}
 	}
 	var out []string
+	sub := map[string]bool{}
 	for i := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[i]
 		if c.Name != container {
 			continue
 		}
 		for _, vm := range c.VolumeMounts {
-			if empty[vm.Name] {
+			if vm.SubPath != "" || vm.SubPathExpr != "" {
+				sub[vm.Name] = true
+			}
+		}
+		for _, vm := range c.VolumeMounts {
+			if empty[vm.Name] && !sub[vm.Name] {
 				out = append(out, vm.Name)
 			}
 		}

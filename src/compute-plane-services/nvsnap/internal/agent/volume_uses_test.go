@@ -60,9 +60,9 @@ func TestUsedMounts(t *testing.T) {
 		"unknown mount": `{"type":"REG","reg":{"name":"/x","mnt_id":99}}`,
 		// 2^32 + 11153 would wrap to the model's mount id as a uint32.
 		"mount id past 32 bits": `{"type":"REG","reg":{"name":"/x","mnt_id":4294978449}}`,
-		"no mount id":   `{"type":"REG","reg":{"name":"/x"}}`,
-		"inotify watch": `{"type":"INOTIFY","ify":{}}`,
-		"unknown kind":  `{"type":"SOMETHING_NEW"}`,
+		"no mount id":           `{"type":"REG","reg":{"name":"/x"}}`,
+		"inotify watch":         `{"type":"INOTIFY","ify":{}}`,
+		"unknown kind":          `{"type":"SOMETHING_NEW"}`,
 		// A plugin's file (EXT) may be on any mount.
 		"plugin file": `{"type":"EXT","ext":{}}`,
 		// A socket bound by a relative name, or one whose long name crit

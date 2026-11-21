@@ -520,7 +520,9 @@ func initsToKeep(pod *corev1.Pod, container string, unused map[string]bool) map[
 			continue
 		}
 		for _, vm := range c.VolumeMounts {
-			if v, ok := volumes[vm.Name]; ok && v.EmptyDir != nil && unused[vm.Name] {
+			// A subPath mount reads a file the setup put there; without it
+			// kubelet would make a directory in its place.
+			if v, ok := volumes[vm.Name]; ok && v.EmptyDir != nil && unused[vm.Name] && vm.SubPath == "" && vm.SubPathExpr == "" {
 				continue
 			}
 			read[vm.Name] = true
