@@ -8,22 +8,22 @@ and run NCCL over RDMA through libnvsnap_ibv. After the pause, NCCL's
 device files are still open: the library closes them at "release", right
 after. The pause's check, that no RDMA is left for the dump to fail on,
 must not count them, or such a worker can never be captured; anything
-else's must still count. "release" then checks the whole process once
-NCCL's are closed.
+else's must still count.
 
 No NIC and no root: the library is built with GPUSHARE_RDMA_DIR naming a
-temporary directory, whose files stand for /dev/infiniband's, and a fake
-libnvsnap_ibv opens and maps one of them as NCCL's. The test checks that
+temporary directory, whose files stand for /dev/infiniband's, and with
+GPUSHARE_RDMA_EVENT naming a timerfd for a verbs event file. A fake
+libnvsnap_ibv opens and maps one device file, and opens an event file, as
+NCCL's context would. The test checks that
 
-  * NCCL's open file and mapping are left out of the pause's count;
-  * another file open on the same device, or a mapping of another device,
-    still counts;
+  * NCCL's open files and mapping are left out of the pause's count;
+  * another file open on the same device, another event file, or a
+    mapping of another device, still counts;
+  * a mapping of NCCL's device whose file another user closed cannot be
+    told from NCCL's (the dump fails on it instead);
   * a library without nvsnap_ibv_fds leaves nothing out;
-  * "release" closes NCCL's, then fails while anything is still left
-    (a mapping of NCCL's device that the pause left out), and passes
-    otherwise;
-  * end to end, mx-pause and nixl-pause pass in a worker whose only RDMA
-    is NCCL's, and refuse one with another file open.
+  * end to end, mx-pause passes in a worker whose only RDMA is NCCL's, and
+    refuses one with another file open (test_nixl_host.py: nixl-pause).
 
 Run: python3 -I tests/gpushare/host/test_rdma_nccl.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -40,17 +40,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_mx_host import CUDA_INC, SRC, STUB  # noqa: E402
 
-# A fake libnvsnap_ibv: at load it opens IBDIR/uverbs0 and maps it, as
-# NCCL's context would; "suspend" closes both and "restore" opens them
-# again. -DOLD leaves out nvsnap_ibv_fds (a library from before it).
+# A fake libnvsnap_ibv: at load it opens IBDIR/uverbs0 and maps it, and
+# opens an event file (a timerfd), as NCCL's context would; "suspend"
+# closes them and "restore" opens them again. -DOLD leaves out
+# nvsnap_ibv_fds (a library from before it).
 SHIM = r"""
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
-static int fd0 = -1;
+static int fd0 = -1, ev0 = -1;
 static void *map0;
 
 static void up(void)
@@ -59,21 +61,22 @@ static void up(void)
     snprintf(p, sizeof(p), "%s/uverbs0", getenv("IBDIR"));
     fd0 = open(p, O_RDWR | O_CLOEXEC);
     map0 = fd0 < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd0, 0);
+    ev0 = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
 }
 __attribute__((constructor)) static void init(void) { up(); }
 
 int nvsnap_ibv_fence(char *r, size_t n) { snprintf(r, n, "ok"); return 0; }
 int nvsnap_ibv_suspend(char *r, size_t n)
 {
-    if (getenv("SUSPEND_FAILS")) { snprintf(r, n, "err suspend refused"); return -1; }
     if (map0 != MAP_FAILED) munmap(map0, 4096);
     if (fd0 >= 0) close(fd0);
-    fd0 = -1;
+    if (ev0 >= 0) close(ev0);
+    fd0 = ev0 = -1;
     map0 = MAP_FAILED;
     snprintf(r, n, "ok released 1 device(s)");
     return 0;
 }
-int nvsnap_ibv_restore(char *r, size_t n) { up(); snprintf(r, n, "ok"); return 0; }
+int nvsnap_ibv_restore(char *r, size_t n) { if (fd0 < 0) up(); snprintf(r, n, "ok"); return 0; }
 int nvsnap_ibv_map(FILE *fp) { (void)fp; return 0; }
 int nvsnap_ibv_connect(const char *p, char *r, size_t n) { (void)p; snprintf(r, n, "ok"); return 0; }
 void nvsnap_ibv_open(void) {}
@@ -83,7 +86,8 @@ int nvsnap_ibv_fds(int *fds, int max)
 {
     if (fd0 < 0) return 0;
     if (max > 0) fds[0] = fd0;
-    return 1;
+    if (max > 1) fds[1] = ev0;
+    return 2;
 }
 #endif
 """
@@ -93,11 +97,12 @@ int nvsnap_ibv_fds(int *fds, int max)
 #   foreignfd   + another file open on NCCL's device (UCX, say)
 #   foreignmap  + a mapping of another device, its file closed
 #   samemap     + a mapping of NCCL's device, its file closed
+#   foreignev   + another event file
 #   noshim      no libnvsnap_ibv; a file open as in "owned"
-# then prints the pause's count (pause_open, pause_mapped), and the result
-# of release's NCCL step (release=ok|err ...).
+# then prints the pause's count (pause_open, pause_mapped).
 PROBE = r"""
 #include "gpushare.c"
+#include <sys/timerfd.h>
 
 static void open_map(const char *dev, int keep)
 {
@@ -124,13 +129,10 @@ int main(int argc, char **argv)
     }
     if (!strcmp(c, "foreignmap")) open_map("uverbs1", 0);
     if (!strcmp(c, "samemap")) open_map("uverbs0", 0);
+    if (!strcmp(c, "foreignev") && timerfd_create(CLOCK_MONOTONIC, 0) < 0) return 5;
     int o, m;
     rdma_files(&o, &m, 1);
     printf("pause_open=%d pause_mapped=%d\n", o, m);
-    char rep[256] = "";
-    int r = ibv_release(rep, sizeof(rep));
-    for (char *s = rep; *s; s++) if (*s == ' ') *s = '_';
-    printf("release=%s:%s\n", r ? "err" : "ok", rep);
     return 0;
 }
 """
@@ -180,6 +182,11 @@ while True:
 """
 
 
+def rdma_defines(ib):
+    """Build flags: IB's files stand for RDMA devices, a timerfd for a verbs event file."""
+    return ["-DGPUSHARE_RDMA_DIR=\"%s/\"" % ib, "-DGPUSHARE_RDMA_EVENT=\"anon_inode:[timerfd]\""]
+
+
 class RdmaNCCL(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -195,7 +202,7 @@ class RdmaNCCL(unittest.TestCase):
 
         def cc(*args):
             subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", SRC, "-I", CUDA_INC,
-                            "-DGPUSHARE_RDMA_DIR=\"%s/\"" % cls.ib, *args], check=True)
+                            *rdma_defines(cls.ib), *args], check=True)
         for name, text in (("stub.c", STUB), ("shim.c", SHIM), ("probe.c", PROBE)):
             with open(os.path.join(t, name), "w") as f:
                 f.write(text)
@@ -224,39 +231,32 @@ class RdmaNCCL(unittest.TestCase):
     def test_nccls_own_are_left_to_release(self):
         out = self.probe("owned")
         self.assertEqual((out["pause_open"], out["pause_mapped"]), ("0", "0"), out)
-        self.assertTrue(out["release"].startswith("ok:"), out)
 
     def test_another_file_on_nccls_device_counts(self):
         out = self.probe("foreignfd")
         self.assertEqual((out["pause_open"], out["pause_mapped"]), ("1", "0"), out)
-        self.assertTrue(out["release"].startswith("err:"), out)
-        self.assertIn("still_open", out["release"], out)
+
+    def test_another_event_file_counts(self):
+        out = self.probe("foreignev")
+        self.assertEqual((out["pause_open"], out["pause_mapped"]), ("1", "0"), out)
 
     def test_a_mapping_of_another_device_counts(self):
         out = self.probe("foreignmap")
         self.assertEqual((out["pause_open"], out["pause_mapped"]), ("0", "1"), out)
-        self.assertTrue(out["release"].startswith("err:"), out)
 
-    def test_release_finds_what_the_pause_left_out(self):
-        # A mapping of NCCL's device whose file another user closed: the
-        # pause cannot tell it from NCCL's; once NCCL's are gone, it is left.
+    def test_a_mapping_of_nccls_device_without_its_file_is_not_seen(self):
+        # rdma-core unmaps at close, so another user leaves none; if one is
+        # left, the dump fails on it and the capture rolls back.
         out = self.probe("samemap")
         self.assertEqual((out["pause_open"], out["pause_mapped"]), ("0", "0"), out)
-        self.assertTrue(out["release"].startswith("err:"), out)
-        self.assertIn("1_mapped", out["release"], out)
 
     def test_library_without_fds_leaves_nothing_out(self):
         out = self.probe("owned", shim="old/libnvsnap_ibv.so")
-        self.assertEqual((out["pause_open"], out["pause_mapped"]), ("1", "1"), out)
+        self.assertEqual((out["pause_open"], out["pause_mapped"]), ("2", "1"), out)
 
     def test_without_the_library_everything_counts(self):
         out = self.probe("noshim")
-        self.assertEqual(out["pause_open"], "1", out)
-        self.assertEqual(out["release"], "ok:", out)
-
-    def test_failed_suspend_is_reported(self):
-        out = self.probe("owned", SUSPEND_FAILS="1")
-        self.assertEqual(out["release"], "err:err_suspend_refused", out)
+        self.assertEqual((out["pause_open"], out["pause_mapped"]), ("1", "0"), out)
 
     def worker(self, foreign):
         log = os.path.join(self.tmp, "log.%s" % self._testMethodName)

@@ -35,7 +35,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_mx_host import CUDA_INC, build  # noqa: E402
-from test_rdma_nccl import SHIM  # noqa: E402
+from test_rdma_nccl import SHIM, rdma_defines  # noqa: E402
 
 # argv: LOG MODE. MODE "none": no vLLM; "busy": a KV send is in flight for
 # 1 s after the first pause request; "fail": the connector shutdown raises;
@@ -220,7 +220,7 @@ class NixlPauseResume(unittest.TestCase):
         os.mkdir(cls.ib)
         with open(os.path.join(cls.ib, "uverbs0"), "wb") as f:
             f.write(b"\0" * 4096)
-        build(cls.tmp, "-DGPUSHARE_RDMA_DIR=\"%s/\"" % cls.ib)
+        build(cls.tmp, *rdma_defines(cls.ib))
         cls.env = dict(os.environ, LD_LIBRARY_PATH=cls.tmp, IBDIR=cls.ib)
         with open(os.path.join(cls.tmp, "shim.c"), "w") as f:
             f.write(SHIM)

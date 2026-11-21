@@ -376,12 +376,16 @@ same NIC names. Other users of verbs in the process (UCX, NIXL) are not
 covered: their devices still fail the dump, which rolls the workload back,
 unless they release them first. ModelExpress (`mx-pause`) and vLLM's NIXL
 KV connector (`nixl-pause`) do, before `quiesce`, while NCCL still holds its
-devices: their checks that no RDMA is left skip NCCL's files, which the
-library names (`nvsnap_ibv_fds`), and mappings of those devices, and
-`release`, once NCCL's are closed, checks the whole process and fails, before
-any GPU memory goes, if anything is still held. A mapping of one of NCCL's
-devices that another user left without its file is caught there, not at the
-pause.
+devices. Their checks that no RDMA is left (device files, verbs event files
+and device mappings) skip NCCL's files, which the library names
+(`nvsnap_ibv_fds`), and mappings of those devices: another user's open file
+still fails the pause, even on one of NCCL's devices. A mapping of one of
+NCCL's devices that another user left after closing its file cannot be told
+from NCCL's; rdma-core unmaps at close, so none is expected, and the dump
+would fail on it and roll the workload back. The check stays at the pause,
+before any rank releases: a refusal at `release`, with other ranks already
+released, would leave shared GPU memory and other nodes to a harder
+rollback.
 
 ## Requirements and limits
 
@@ -522,7 +526,8 @@ pause.
   as for `mx-resume`. Requests that reached a paused decode engine are
   prefilled there if the pause outlasted a third of prefill's hold on their
   KV (`kv_lease_duration`, 30 s by default), since prefill may have reused
-  those blocks. `nixl-pause` fails while any RDMA device file is left: the
+  those blocks. `nixl-pause` fails while any RDMA device file is left (other
+than NCCL's through `libnvsnap_ibv.so`): the
   engine checks every worker after the release and resumes itself, and the
   tool resumes every pid on any failure. At TP > 1 the engine-core process allocates no GPU
   memory, so the pod needs `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` (see "How it

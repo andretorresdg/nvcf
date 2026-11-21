@@ -1270,13 +1270,18 @@ static int ibv_devices(void)
 #ifndef GPUSHARE_RDMA_DIR
 #define GPUSHARE_RDMA_DIR "/dev/infiniband/"  /* the host tests name their own */
 #endif
+#ifndef GPUSHARE_RDMA_EVENT
+#define GPUSHARE_RDMA_EVENT "anon_inode:[infinibandevent]"  /* a verbs event file */
+#endif
 
-/* RDMA device files this process has open, and mappings of them: the
- * dump fails on any. nccl: leave out NCCL's own, which libnvsnap_ibv holds
- * and "release" closes (nvsnap_ibv_fds): its open files, and mappings of
- * the devices they are, which cannot be told from another user's. Another
- * user's open file still counts, even on one of those devices; a mapping
- * of one whose file was closed is found by "release" (ibv_release). */
+/* RDMA device files this process has open (and verbs event files), and
+ * mappings of devices: the dump fails on any. nccl: leave out NCCL's own,
+ * which libnvsnap_ibv holds and "release" closes (nvsnap_ibv_fds): its open
+ * files, and mappings of the devices they are, which cannot be told from
+ * another user's. Another user's open file still counts, even on one of
+ * those devices. A mapping another user left of one of them after closing
+ * its file (rdma-core unmaps at close) is not seen here: the dump fails on
+ * it, and the capture rolls back as for any failed dump. */
 static void rdma_files(int *open, int *mapped, int nccl)
 {
     enum { MAX_OWN = 64 };
@@ -1294,10 +1299,12 @@ static void rdma_files(int *open, int *mapped, int nccl)
         ssize_t k = readlink(p, l, sizeof(l) - 1);
         if (k <= 0) continue;
         l[k] = 0;
-        if (strncmp(l, GPUSHARE_RDMA_DIR, dl)) continue;
+        int dev = !strncmp(l, GPUSHARE_RDMA_DIR, dl);
+        if (!dev && strcmp(l, GPUSHARE_RDMA_EVENT)) continue;
         int fd = atoi(e->d_name), mine = 0;
         for (int i = 0; !mine && i < n_own; i++) mine = own[i] == fd;
         if (!mine) { (*open)++; continue; }
+        if (!dev) continue;
         int seen = (size_t)k >= sizeof(devs[0]);  /* too long to keep: its mappings count */
         for (int i = 0; !seen && i < n_devs; i++) seen = !strcmp(devs[i], l);
         if (!seen && n_devs < MAX_OWN) memcpy(devs[n_devs++], l, k + 1);
@@ -1313,23 +1320,6 @@ static void rdma_files(int *open, int *mapped, int nccl)
         *mapped += !mine;
     }
     if (f) fclose(f);
-}
-
-/* "release", NCCL's part: destroy its verbs objects (nvsnap_ibv_suspend),
- * then check that no RDMA is left at all. The pause checks ("mx",
- * "nixl") left NCCL's to this point; what they could not tell from NCCL's
- * fails here, before any GPU memory goes, rather than in the dump. Either
- * way the tool rolls back: "load" creates NCCL's objects again. */
-static int ibv_release(char *reply, size_t n)
-{
-    if (ibv_devices() <= 0) return 0;
-    if (ibv.suspend(reply, n) < 0) return -1;
-    int fds, maps;
-    rdma_files(&fds, &maps, 0);
-    if (!fds && !maps) return 0;
-    snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped, once NCCL's were released: "
-             "CRIU cannot dump them", fds, maps);
-    return -1;
 }
 
 /* Hold launches, drain GPU work, and check that "release" can drop every
@@ -1452,7 +1442,7 @@ static void do_release(char *reply, size_t n, const char *args)
         return;
     }
     /* Before any memory goes: NCCL's registrations of it come first. */
-    if (ibv_release(reply, n) < 0) {
+    if (ibv_devices() > 0 && ibv.suspend(reply, n) < 0) {
         pthread_mutex_unlock(&mu);
         return;
     }
@@ -2464,7 +2454,7 @@ static const char nixl_py[] =
     "\n"
     "    def w_rdma(_w):\n"
     "        # As rdma_files: NCCL's own, through libnvsnap_ibv, are left to\n"
-    "        # \"release\", which checks again once they are closed.\n"
+    "        # \"release\", which closes them.\n"
     "        import ctypes\n"
     "        d, own, devs, n, m = '" GPUSHARE_RDMA_DIR "', set(), set(), 0, 0\n"
     "        try:\n"
@@ -2478,11 +2468,11 @@ static const char nixl_py[] =
     "                t = os.readlink('/proc/self/fd/' + f)\n"
     "            except OSError:\n"
     "                continue\n"
-    "            if t.startswith(d):\n"
-    "                if int(f) in own:\n"
-    "                    devs.add(t)\n"
-    "                else:\n"
+    "            if t.startswith(d) or t == '" GPUSHARE_RDMA_EVENT "':\n"
+    "                if int(f) not in own:\n"
     "                    n += 1\n"
+    "                elif t.startswith(d):\n"
+    "                    devs.add(t)\n"
     "        with open('/proc/self/maps') as fm:\n"
     "            for l in fm:\n"
     "                i = l.find(' ' + d)\n"
