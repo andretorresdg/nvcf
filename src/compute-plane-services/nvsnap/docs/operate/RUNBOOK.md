@@ -22,6 +22,7 @@ records are in `nvsnap-system`.
 - [NvsnapCaptureFailed](#nvsnapcapturefailed)
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
+- [Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)](#workloads-whose-nccl-uses-rdma-webhookgpushareibv)
 <!-- /toc -->
 
 ## Following one capture or restore
@@ -240,3 +241,29 @@ for 6 minutes; until then only its own namespace restores from it.
 - Its namespace's pods: deleted and restored again and again within 6
   minutes (a test that cycles its instance) never verify it. Otherwise
   [follow its last restore](#following-one-capture-or-restore).
+
+## Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)
+
+NCCL over InfiniBand or RoCE holds the node's RDMA devices, which a
+checkpoint cannot save. Without help, the capture preflight refuses such a
+pod (its finding: "holds RDMA devices … a checkpoint cannot save RDMA
+state"), and the configuration starts cold every time.
+
+- On: set `webhook.gpushareIBV: true`. Pods admitted after the rollout get
+  `NCCL_IBVERBS_LIB=/nvsnap/libnvsnap_ibv.so` in their GPU containers; pods
+  already running keep NCCL's own library until they are recreated. The
+  workload keeps its transport: NCCL still runs over RDMA, and the library
+  releases and re-creates NCCL's RDMA state around the capture
+  (docs/design/GPUSHARE.md, "NCCL over InfiniBand or RoCE").
+- Check a pod: `kubectl exec <pod> -c <container> -- printenv NCCL_IBVERBS_LIB`,
+  and in its log `NCCL_IBVERBS_LIB set by environment to /nvsnap/libnvsnap_ibv.so`
+  (with `NCCL_DEBUG=INFO`). The preflight then reports the RDMA devices as a
+  warning, not a block.
+- One workload out: annotate its pods `nvsnap.io/gpushare-ibv: "false"`, or
+  set `NCCL_IBVERBS_LIB` in the pod; NCCL keeps its own library and the
+  capture is refused as before.
+- Not covered: RDMA held by anything other than NCCL in the pod (UCX, NIXL,
+  ModelExpress transfers). Those keep failing the dump, which rolls the
+  workload back to running.
+- Off: set it back to `false`; pods recreated after that use NCCL's own
+  library.

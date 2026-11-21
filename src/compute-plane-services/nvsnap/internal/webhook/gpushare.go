@@ -42,7 +42,8 @@ const (
 	// verbs, so that a pod whose NCCL uses RDMA (IB or RoCE) can be
 	// captured: the library destroys NCCL's RDMA state before the checkpoint
 	// and creates it again after the restore (docs/design/GPUSHARE.md).
-	// Off by default.
+	// "false" opts a pod out of Mutator.GPUShareIBVByDefault; unset
+	// follows it (off unless the chart sets webhook.gpushareIBV).
 	GPUShareIBVAnnotation = "nvsnap.io/gpushare-ibv"
 	// GPUShareIBVLibPath is that library, in the node bundle.
 	GPUShareIBVLibPath = nvsnapToolsMountPath + "/libnvsnap_ibv.so"
@@ -104,6 +105,19 @@ func (m *Mutator) gpushareMode(ctx context.Context, pod *corev1.Pod) (wanted, fa
 	return true, false
 }
 
+// gpushareIBV reports whether a pod under the library gets NCCL pointed at
+// the bundled verbs library: its nvsnap.io/gpushare-ibv annotation, or
+// GPUShareIBVByDefault when it has none.
+func (m *Mutator) gpushareIBV(pod *corev1.Pod) bool {
+	switch pod.Annotations[GPUShareIBVAnnotation] {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return m.GPUShareIBVByDefault
+}
+
 // runsToCompletion reports a pod that is not restarted when it exits: a
 // Job's or a task's, not a server's (every serving controller runs its
 // pods with restartPolicy Always, the default).
@@ -142,6 +156,7 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 	if !wanted {
 		return nil
 	}
+	ibv := m.gpushareIBV(pod)
 	gpuContainers := make([]int, 0, len(pod.Spec.Containers))
 	preloads := map[int]corev1.EnvVar{}
 	for i := range pod.Spec.Containers {
@@ -241,7 +256,7 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 		}
 		// NCCL's own choice of verbs library wins: then its RDMA state stays
 		// as before, and a capture of the pod is refused.
-		if pod.Annotations[GPUShareIBVAnnotation] == "true" && !hasEnv(c, ncclIBVerbsLibEnv) {
+		if ibv && !hasEnv(c, ncclIBVerbsLibEnv) {
 			vars = append(vars, corev1.EnvVar{Name: ncclIBVerbsLibEnv, Value: GPUShareIBVLibPath})
 		}
 		patches = append(patches, setContainerEnv(i, c, vars)...)

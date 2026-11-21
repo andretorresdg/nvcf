@@ -333,9 +333,11 @@ Limits of the move:
 NCCL opens the node's RDMA devices when it starts, even when every rank is on
 one node, and keeps them, with its queue pairs and memory registrations, until
 the process exits. CRIU cannot dump them, so the capture preflight refuses
-such a pod. Annotated `nvsnap.io/gpushare-ibv: "true"`, the pod's GPU
-containers get `NCCL_IBVERBS_LIB` pointed at `libnvsnap_ibv.so` from the node
-bundle (a value the pod sets itself wins). NCCL then loads its verbs from that
+such a pod. Annotated `nvsnap.io/gpushare-ibv: "true"`, or on a cluster whose
+chart sets `webhook.gpushareIBV: true` (every pod under the library unless
+annotated `"false"`), the pod's GPU containers get `NCCL_IBVERBS_LIB` pointed
+at `libnvsnap_ibv.so` from the node bundle (a value the pod sets itself wins).
+The workload keeps its transport: NCCL still runs over RDMA. NCCL then loads its verbs from that
 library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
 
 - NCCL gets shadow objects. The queue pair numbers, memory keys, LIDs and GIDs
