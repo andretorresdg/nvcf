@@ -83,7 +83,7 @@ where the files column says.
 | `nvsnap.io/hash` | `HashAnnotation` (internal/election/election.go)<br>`HashLabel` (internal/election/election.go)<br>`stampedHashAnnotation` (internal/rootfsonly/watcher.go) | Carries the full cache hash the webhook composed at admission. |
 | `nvsnap.io/hash-short` | `labelHashShort` (internal/checkpointstore/promoter_shared.go) |  |
 | `nvsnap.io/inject` | `InjectLabel` (internal/webhook/mutate.go) | On a pod (or, via the registration's namespaceSelector, on its namespace) set to InjectDisabled opts the pod out of every nvsnap mutation. |
-| `nvsnap.io/keep-inits` | `KeepInitsAnnotation` (internal/webhook/unused_volumes.go) | KeepInitsAnnotation, set to any value on a workload's pods, keeps every init a group placeholder would skip for unused volumes: for a workload that reads its setup's output again after it starts. |
+| `nvsnap.io/keep-inits` | `KeepInitsAnnotation` (internal/webhook/unused_volumes.go) | Keeps every init a group placeholder would skip for unused volumes, when set to any value on a workload's pods: for a workload that reads its setup's output again after it starts. |
 | `nvsnap.io/kind` | `CMLabelKind` (internal/checkpointstore/cmregistry.go)<br>`LeaseKindLabel` (internal/election/election.go) | Marks ConfigMaps managed by nvsnap so list/cleanup queries can filter them. |
 | `nvsnap.io/last-used` | `LastUsedAnnotation` (internal/modelvolume/modelvolume.go) | On a primary PV is the RFC 3339 time a pod last admitted against it (or it completed). |
 | `nvsnap.io/leader-id` | `LeaderIDAnnotation` (internal/election/election.go) |  |

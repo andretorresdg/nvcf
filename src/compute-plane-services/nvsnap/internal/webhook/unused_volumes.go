@@ -45,9 +45,9 @@ const (
 	// containers it skips because they fill only volumes no restored
 	// process uses.
 	SkippedInitsAnnotation = "nvsnap.io/skipped-inits"
-	// KeepInitsAnnotation keeps, set to any value on a workload's pods,
-	// every init a group placeholder would skip for unused volumes: for a
-	// workload that reads its setup's output again after it starts.
+	// KeepInitsAnnotation keeps every init a group placeholder would skip
+	// for unused volumes, when set to any value on a workload's pods: for
+	// a workload that reads its setup's output again after it starts.
 	KeepInitsAnnotation = "nvsnap.io/keep-inits"
 
 	// unusedVolumesMeta carries a group record's UnusedVolumes to the
