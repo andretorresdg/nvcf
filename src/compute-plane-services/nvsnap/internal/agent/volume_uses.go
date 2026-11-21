@@ -43,7 +43,9 @@ const critTimeout = 2 * time.Minute
 var critShow = func(img string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), critTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, "crit", "show", img).Output()
+	// The image is a file of the agent's own dump directory.
+	return exec.CommandContext(ctx, "crit", "show", img).Output() //nolint:gosec // fixed binary; img is a path the agent wrote
+
 }
 
 // dumpUsedMounts returns the mountpoints, in the dumped container's view,
@@ -71,14 +73,14 @@ func dumpUsedMounts(dir string) ([]string, error) {
 func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 	var mt struct {
 		Entries []struct {
-			MntID      uint32 `json:"mnt_id"`
+			MntID      int64  `json:"mnt_id"`
 			Mountpoint string `json:"mountpoint"`
 		} `json:"entries"`
 	}
 	if err := json.Unmarshal(mountsJSON, &mt); err != nil {
 		return nil, fmt.Errorf("mount table: %w", err)
 	}
-	byID := map[uint32]string{}
+	byID := map[int64]string{}
 	for _, e := range mt.Entries {
 		byID[e.MntID] = path.Clean(e.Mountpoint)
 	}
@@ -105,7 +107,7 @@ func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 			if e.Reg.MntID == nil || *e.Reg.MntID < 0 {
 				return nil, fmt.Errorf("file %q has no mount id", e.Reg.Name)
 			}
-			mp, ok := byID[uint32(*e.Reg.MntID)]
+			mp, ok := byID[*e.Reg.MntID]
 			if !ok {
 				return nil, fmt.Errorf("file %q is on mount %d, not in the dump's mount table", e.Reg.Name, *e.Reg.MntID)
 			}
@@ -120,7 +122,7 @@ func usedMounts(filesJSON, mountsJSON []byte) ([]string, error) {
 			if e.Usk.MntID == nil || *e.Usk.MntID < 0 {
 				return nil, fmt.Errorf("unix socket %q has no mount id", e.Usk.Name)
 			}
-			mp, ok := byID[uint32(*e.Usk.MntID)]
+			mp, ok := byID[*e.Usk.MntID]
 			if !ok {
 				return nil, fmt.Errorf("unix socket %q is on mount %d, not in the dump's mount table", e.Usk.Name, *e.Usk.MntID)
 			}

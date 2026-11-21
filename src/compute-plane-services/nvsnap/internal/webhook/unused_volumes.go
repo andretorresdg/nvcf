@@ -45,7 +45,7 @@ const (
 	// containers it skips because they fill only volumes no restored
 	// process uses.
 	SkippedInitsAnnotation = "nvsnap.io/skipped-inits"
-	// KeepInitsAnnotation, set to any value on a workload's pods, keeps
+	// KeepInitsAnnotation keeps, set to any value on a workload's pods,
 	// every init a group placeholder would skip for unused volumes: for a
 	// workload that reads its setup's output again after it starts.
 	KeepInitsAnnotation = "nvsnap.io/keep-inits"
@@ -111,7 +111,7 @@ type MemberVolumeUse struct {
 // and why, when the group skips nothing: a member's use is not known, a
 // member may not drop setup, or some member would still run an init that
 // fills one of them.
-func GroupUnusedVolumes(members []MemberVolumeUse) ([]string, string) {
+func GroupUnusedVolumes(members []MemberVolumeUse) (unused []string, why string) {
 	used := map[string]bool{}
 	for _, m := range members {
 		if m.Used == nil {
@@ -187,13 +187,14 @@ func unusedVolumeSkips(pod *corev1.Pod, container string, unused map[string]bool
 // containerEmptyDirs lists the emptyDir volumes container of pod mounts.
 func containerEmptyDirs(pod *corev1.Pod, container string) []string {
 	empty := map[string]bool{}
-	for _, v := range pod.Spec.Volumes {
-		if v.EmptyDir != nil {
-			empty[v.Name] = true
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].EmptyDir != nil {
+			empty[pod.Spec.Volumes[i].Name] = true
 		}
 	}
 	var out []string
-	for _, c := range pod.Spec.Containers {
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
 		if c.Name != container {
 			continue
 		}
@@ -212,7 +213,8 @@ func containerEmptyDirs(pod *corev1.Pod, container string) []string {
 // /dev/shm, a mount the runtime adds) names none.
 func VolumesAt(pod *corev1.Pod, container string, mountpoints []string) []string {
 	at := map[string]string{}
-	for _, c := range pod.Spec.Containers {
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
 		if c.Name != container {
 			continue
 		}

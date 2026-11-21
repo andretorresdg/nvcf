@@ -27,13 +27,13 @@ const dumpMounts = `{"entries":[
 ]}`
 
 func dumpFiles(extra ...string) []byte {
-	entries := []string{
+	entries := make([]string, 0, 7+len(extra))
+	entries = append(entries,
 		`{"type":"REG","reg":{"name":"/usr/lib/libc.so.6","mnt_id":11136}}`,
 		`{"type":"REG","reg":{"name":"/dev/shm/psm_1","mnt_id":11154}}`,
 		`{"type":"INETSK","isk":{}}`, `{"type":"MEMFD","memfd":{}}`, `{"type":"PIPE","pipe":{}}`,
 		`{"type":"UNIXSK","usk":{"name":"=00abstract"}}`,
-		`{"type":"UNIXSK","usk":{"name":""}}`,
-	}
+		`{"type":"UNIXSK","usk":{"name":""}}`)
 	return []byte(`{"entries":[` + strings.Join(append(entries, extra...), ",") + `]}`)
 }
 
@@ -58,6 +58,8 @@ func TestUsedMounts(t *testing.T) {
 	// What cannot be accounted for makes the use unknown.
 	for name, extra := range map[string]string{
 		"unknown mount": `{"type":"REG","reg":{"name":"/x","mnt_id":99}}`,
+		// 2^32 + 11153 would wrap to the model's mount id as a uint32.
+		"mount id past 32 bits": `{"type":"REG","reg":{"name":"/x","mnt_id":4294978449}}`,
 		"no mount id":   `{"type":"REG","reg":{"name":"/x"}}`,
 		"inotify watch": `{"type":"INOTIFY","ify":{}}`,
 		"unknown kind":  `{"type":"SOMETHING_NEW"}`,
@@ -125,7 +127,8 @@ func volumeUsePod(name string) *corev1.Pod {
 // when every member's dump was read.
 func TestRecordUnusedVolumes(t *testing.T) {
 	used := []string{"/", "/dev/shm"}
-	members := []*corev1.Pod{volumeUsePod("w0"), volumeUsePod("w1")}
+	members := make([]*corev1.Pod, 0, 3)
+	members = append(members, volumeUsePod("w0"), volumeUsePod("w1"))
 	results := func() []*CheckpointResult {
 		return []*CheckpointResult{
 			{CheckpointID: "c0", UsedMounts: &used, LargeEmptyDirs: []string{"/config/models"}},
