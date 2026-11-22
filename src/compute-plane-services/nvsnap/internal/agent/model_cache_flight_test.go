@@ -460,3 +460,29 @@ func TestSingleFlightFollowEndsAtItsDeadline(t *testing.T) {
 	}
 	t.Fatal("the stream outlived its deadline")
 }
+
+// Pods that join one by one form a tree, not a chain: the shallowest
+// source with room wins, so the holder feeds maxFeeds before any relay
+// does. (A chain of three relays was seen on a cluster: each hop added
+// its lag.)
+func TestSingleFlightRelaysFormATreeNotAChain(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	n := newFlightNode(t, kube, "n", map[string]string{})
+	key := "0123456789abcdef0123456789abcdef"
+	leaseWithFeeds(t, kube, key, "h/1", map[string]string{})
+	ctx := context.Background()
+	got := map[string]string{}
+	for _, id := range []string{"a/1", "b/1", "c/1", "d/1", "e/1"} {
+		got[id] = n.c.pickSource(ctx, key, id, "h/1", nil)
+	}
+	for _, id := range []string{"a/1", "b/1", "c/1"} {
+		if got[id] != "h/1" {
+			t.Fatalf("%s streams from %s; want the holder while it has room (picks %v)", id, got[id], got)
+		}
+	}
+	for _, id := range []string{"d/1", "e/1"} {
+		if got[id] == "h/1" || got[id] == "d/1" {
+			t.Fatalf("%s streams from %s; want a relay of depth 1 (picks %v)", id, got[id], got)
+		}
+	}
+}

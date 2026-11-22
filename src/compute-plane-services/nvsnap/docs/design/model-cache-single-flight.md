@@ -139,7 +139,9 @@ by an ordinary harvest of that volume.
 - Up to 8 files copy at a time.
 
 **Relay.** Every streaming node is a source as well. A new streaming node picks, among the holder and the nodes
-already streaming, the one with the fewest consumers, at most 3 each. Each node then sends at most 3 copies, so 30
+already streaming, the shallowest one with room (at most 3 consumers each), then the one with the fewest. Fewest
+alone builds a chain, since a node that just joined feeds none; on a cluster that made a 3-hop chain, each hop
+adding its lag. Each node then sends at most 3 copies, so 30
 pods form a tree 4 levels deep. Each level adds its settle time (about 10 s per file), not a full copy. The choice is
 recorded in the Lease's annotations (`nvsnap.io/feeds-<node>`), updated with the Lease's resourceVersion. If a
 node's source fails, it picks another: the failed one leaves the annotation, so no node picks it again, and a node

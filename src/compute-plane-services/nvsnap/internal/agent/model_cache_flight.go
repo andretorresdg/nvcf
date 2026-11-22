@@ -413,13 +413,20 @@ func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder s
 				cands = append(cands, id)
 			}
 		}
+		// Breadth first: the shallowest source with room, then the one
+		// feeding fewest. Fewest alone builds a chain (a pod that just
+		// joined feeds none), and each hop adds its lag.
+		depth := func(id string) int { return feedDepth(feeds, id, holder) }
 		sort.Slice(cands, func(i, j int) bool {
-			ci, cj := count[cands[i]], count[cands[j]]
-			if ci != cj {
-				return ci < cj
+			ri, rj := count[cands[i]] < maxFeeds, count[cands[j]] < maxFeeds
+			if ri != rj {
+				return ri
 			}
-			if (cands[i] == holder) != (cands[j] == holder) {
-				return cands[i] == holder
+			if di, dj := depth(cands[i]), depth(cands[j]); di != dj {
+				return di < dj
+			}
+			if ci, cj := count[cands[i]], count[cands[j]]; ci != cj {
+				return ci < cj
 			}
 			return cands[i] < cands[j]
 		})
@@ -439,6 +446,22 @@ func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder s
 		return pick
 	}
 	return holder
+}
+
+// feedDepth is how many hops id is from the holder (0 for the holder);
+// a broken or cyclic path counts as deepest.
+func feedDepth(feeds map[string]string, id, holder string) int {
+	for d := 0; d <= len(feeds); d++ {
+		if id == holder {
+			return d
+		}
+		src, ok := feeds[id]
+		if !ok {
+			break
+		}
+		id = src
+	}
+	return len(feeds) + 1
 }
 
 // feedsFrom reports whether id streams, directly or through relays, from
