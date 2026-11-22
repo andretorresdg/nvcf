@@ -105,9 +105,11 @@ func TestNodeModelCacheKeyIsPerTenantAndPerRecipe(t *testing.T) {
 		t.Fatal("unrelated env changed the key")
 	}
 	for name, mut := range map[string]func(*corev1.Pod){
-		"tenant":  func(p *corev1.Pod) { p.Namespace = "other" },
-		"image":   func(p *corev1.Pod) { initByName(p, "download-ngc-model").Image = "nvcr.io/org/ultra:vllm2" },
-		"command": func(p *corev1.Pod) { initByName(p, "download-ngc-model").Args = []string{"ngc registry model download-version --dest /config/models x"} },
+		"tenant": func(p *corev1.Pod) { p.Namespace = "other" },
+		"image":  func(p *corev1.Pod) { initByName(p, "download-ngc-model").Image = "nvcr.io/org/ultra:vllm2" },
+		"command": func(p *corev1.Pod) {
+			initByName(p, "download-ngc-model").Args = []string{"ngc registry model download-version --dest /config/models x"}
+		},
 		"model": func(p *corev1.Pod) {
 			for _, c := range []*corev1.Container{initByName(p, "download-ngc-model")} {
 				c.Env[0].Value = "org/team/other:1"
