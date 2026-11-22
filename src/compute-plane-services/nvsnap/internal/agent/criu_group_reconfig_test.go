@@ -7,6 +7,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -93,7 +94,8 @@ func TestClaimGroupRecord_ReplacesARecordOfAnotherConfiguration(t *testing.T) {
 	changed := func(map[string]string) bool { return true }
 	same := func(map[string]string) bool { return false }
 
-	setRecord(t, kc, map[string]string{"state": "complete", "captures": "3"})
+	old := time.Now().Add(-2 * recordReplaceCooldown).UTC().Format(time.RFC3339)
+	setRecord(t, kc, map[string]string{"state": "complete", "captures": "3", "verifiedAt": old})
 	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2, same); err != nil || again != nil {
 		t.Fatalf("claim of a complete record of the same configuration = %v, %v", again, err)
 	}
@@ -110,5 +112,46 @@ func TestClaimGroupRecord_ReplacesARecordOfAnotherConfiguration(t *testing.T) {
 		if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2, changed); err != nil || again != nil {
 			t.Errorf("claim of a %s record = %v, %v; two configurations racing for one key: the first keeps it", st, again, err)
 		}
+	}
+}
+
+// A record younger than the cooldown is not replaced: a value that differs
+// per instance rather than per deploy (or two configurations alternating
+// during a rollout) costs at most one capture per cooldown, not one per
+// instance.
+func TestReplaceableRecordWaitsOutTheCooldown(t *testing.T) {
+	now := time.Now()
+	fresh := map[string]string{"state": criuGroupStateComplete, "verifiedAt": now.Add(-time.Minute).UTC().Format(time.RFC3339)}
+	if replaceableRecord(fresh, now) {
+		t.Fatal("replaced a record verified a minute ago")
+	}
+	old := map[string]string{"state": criuGroupStateComplete, "verifiedAt": now.Add(-2 * recordReplaceCooldown).UTC().Format(time.RFC3339)}
+	if !replaceableRecord(old, now) {
+		t.Fatal("kept a record past the cooldown")
+	}
+	failed := map[string]string{"state": criuGroupStateFailed, "startedAt": now.Add(-2 * recordReplaceCooldown).UTC().Format(time.RFC3339)}
+	if !replaceableRecord(failed, now) {
+		t.Fatal("a failed record of another configuration past the cooldown is not replaceable")
+	}
+}
+
+// A companion is compared as admission compares it: its whole stamp, against
+// any companion slot. Which of its containers the capture checkpointed may
+// differ from instance to instance; an unchanged companion is not changed.
+func TestProcessConfigChangedMatchesACompanionAgainstAnySlot(t *testing.T) {
+	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	nats := stsRank("nats-0", "0", "1", "sts-n", false)
+	nats.Name = "nats-0"
+	etcd := stsRank("etcd-0", "0", "1", "sts-e", false)
+	etcd.Name = "etcd-0"
+	ctr := etcd.Spec.Containers[0].Name
+	cc := map[string]string{"etcd-0": ctr, "nats-0": ctr}
+	members := []*corev1.Pod{stamped(r0, ""), stamped(etcd, ctr, corev1.EnvVar{Name: "E", Value: "1"}), stamped(nats, ctr, corev1.EnvVar{Name: "N", Value: "1"})}
+	data := reconfigRecord(members, 1, cc)
+	data["companion.1"], data["companion.2"] = "true", "true"
+	// The next instance lists its companions in the other order.
+	swapped := []*corev1.Pod{members[0], members[2], members[1]}
+	if got := processConfigChanged(data, swapped, 1, cc); len(got) != 0 {
+		t.Fatalf("unchanged companions in another order: changed %q", got)
 	}
 }
