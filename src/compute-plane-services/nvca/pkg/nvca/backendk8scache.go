@@ -3209,6 +3209,24 @@ func (c *BackendK8sCache) shouldReportInstanceStatusHeartbeat(
 	return false
 }
 
+// awaitsTaskAcknowledgement reports whether req is a task request in progress that has not been
+// acknowledged, while tasks are acknowledged only after their Pods are scheduled. The
+// acknowledgement worker acknowledges such a request only while it is InstancesInProgress, and the
+// status loop holds back its fulfillment until then, so it must not complete before.
+func (c *BackendK8sCache) awaitsTaskAcknowledgement(req *nvcav2beta1new.ICMSRequest) bool {
+	if req.Spec.Action != common.RequestICMSInstancesForTask && req.Spec.Action != common.TaskCreationAction {
+		return false
+	}
+	switch req.Status.RequestStatus {
+	case nvcav2beta1new.ICMSRequestStatusCachingInProgress, nvcav2beta1new.ICMSRequestStatusPending,
+		nvcav2beta1new.ICMSRequestStatusInProgress, nvcav2beta1new.ICMSRequestStatusInstancesInProgress:
+	default:
+		return false
+	}
+	return req.Status.LastACKTimestamp == nil &&
+		c.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.AckTaskRequestAfterPodsScheduled)
+}
+
 func (c *BackendK8sCache) ApplyICMSRequestStatusChange(ctx context.Context, req *nvcav2beta1new.ICMSRequest) error {
 	log := core.GetLogger(ctx)
 
@@ -3216,6 +3234,11 @@ func (c *BackendK8sCache) ApplyICMSRequestStatusChange(ctx context.Context, req 
 
 	switch c.icmsRequestHelper.AggregateInstanceStatuses(ctx, req) {
 	case AggregatedInstanceStatusSucceeded:
+		if c.awaitsTaskAcknowledgement(req) {
+			// Completes once acknowledged, which the acknowledgement worker does only in InstancesInProgress.
+			newReqStatus = reqStatusPtr(nvcav2beta1new.ICMSRequestStatusInstancesInProgress)
+			break
+		}
 		newReqStatus = reqStatusPtr(nvcav2beta1new.ICMSRequestStatusCompleted)
 	case AggregatedInstanceStatusFailed:
 		newReqStatus = reqStatusPtr(nvcav2beta1new.ICMSRequestStatusFailed)

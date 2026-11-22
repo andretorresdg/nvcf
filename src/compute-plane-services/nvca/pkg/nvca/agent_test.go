@@ -33,6 +33,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task"
 	cmnoauth "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/oauth"
 	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
@@ -4214,6 +4215,154 @@ func TestSyncICMSRequest_InstancesReportedTerminated(t *testing.T) {
 				}
 			}
 			assert.ElementsMatch(t, tt.notFound, notFound)
+		})
+	}
+}
+
+// ackRecordingICMSClient is an instanceStatusICMSClient that also counts request acknowledgements.
+type ackRecordingICMSClient struct {
+	instanceStatusICMSClient
+	acks atomic.Int32
+}
+
+func (m *ackRecordingICMSClient) PutRequestAcknowledgement(context.Context, string, string, uint64,
+	nvcav2beta1.ICMSRequestTraceContextConfig,
+) error {
+	m.acks.Add(1)
+	return nil
+}
+
+// With AckTaskRequestAfterPodsScheduled, a task request is acknowledged once its Pods are scheduled,
+// and its fulfillment is posted only after that acknowledgement. A request sync that finds every
+// instance it waits for succeeded completes the request only once it is acknowledged, also when it
+// leaves out an instance reported terminated whose Pod is gone. Until then the request is
+// InstancesInProgress, which the acknowledgement worker acknowledges, and the status loop holds back
+// the fulfillment.
+func TestSyncICMSRequest_TaskCompletesOnlyOnceAcknowledged(t *testing.T) {
+	now := time.Now().UTC()
+	reportedAt := metav1.NewTime(now.Add(-time.Minute))
+	tests := []struct {
+		name      string
+		rs        nvcav2beta1.RequestStatus
+		instances []nvcav2beta1.InstanceStatus
+		pods      []*v1.Pod
+		// ready is the instance whose fulfillment waits for the acknowledgement.
+		ready string
+	}{
+		{
+			name: "an instance reported terminated whose Pod is gone, and a ready one",
+			rs:   nvcav2beta1.ICMSRequestStatusInstancesInProgress,
+			instances: []nvcav2beta1.InstanceStatus{
+				instanceStatusInstance("0-sr", types.ICMSInstanceTerminated, &reportedAt),
+				instanceStatusInstance("1-sr", types.ICMSInstanceStarted, &reportedAt),
+			},
+			pods:  []*v1.Pod{instanceStatusPod("1-sr")},
+			ready: "1-sr",
+		},
+		{
+			name:      "one ready instance",
+			rs:        nvcav2beta1.ICMSRequestStatusInstancesInProgress,
+			instances: []nvcav2beta1.InstanceStatus{instanceStatusInstance("0-sr", types.ICMSInstanceStarted, &reportedAt)},
+			pods:      []*v1.Pod{instanceStatusPod("0-sr")},
+			ready:     "0-sr",
+		},
+		{
+			// The Pod became ready before a request sync saw it scheduled.
+			name:      "one instance ready by the first sync after it was created",
+			rs:        nvcav2beta1.ICMSRequestStatusInProgress,
+			instances: []nvcav2beta1.InstanceStatus{instanceStatusInstance("0-sr", types.ICMSInstanceStarted, &reportedAt)},
+			pods:      []*v1.Pod{instanceStatusPod("0-sr")},
+			ready:     "0-sr",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := core.WithClock(newTestContext(), func() time.Time { return now })
+			req := instanceStatusRequest(tt.rs, tt.instances...)
+			req.Finalizers = []string{NVCAFinalizer}
+			req.Spec.Action = common.TaskCreationAction
+			req.Spec.CreationMsgInfo.InstanceCount = uint64(len(tt.instances))
+			req.Spec.CreationMsgInfo.TaskLaunchSpecification = &task.LaunchSpecification{
+				MaxRuntimeDuration: "PT1H",
+				MaxQueuedDuration:  "PT1H",
+			}
+			icms := &ackRecordingICMSClient{}
+			loop := newInstanceStatusLoop(t, icms, req, tt.pods...)
+			loop.ff.EnabledFFs = append(loop.ff.EnabledFFs, featureflag.AckTaskRequestAfterPodsScheduled)
+
+			require.NoError(t, loop.ag.backendk8scache.syncICMSRequest(ctx, loop.stored(t)))
+			assert.Equal(t, nvcav2beta1.ICMSRequestStatusInstancesInProgress, loop.stored(t).Status.RequestStatus,
+				"the request is not completed before it is acknowledged")
+			loop.syncCache(t)
+			loop.pass(ctx, t)
+			assert.NotContains(t, icms.posted, tt.ready, "the fulfillment waits for the acknowledgement")
+
+			loop.syncCache(t)
+			require.NoError(t, loop.ag.PutICMSRequestAcknowledgement(ctx))
+			loop.ag.ackThreadPool.Wait()
+			require.Equal(t, int32(1), icms.acks.Load(), "the acknowledgement worker acknowledges the request")
+			loop.syncCache(t)
+			require.NoError(t, loop.ag.backendk8scache.syncICMSRequest(ctx, loop.stored(t)))
+			assert.Equal(t, nvcav2beta1.ICMSRequestStatusCompleted, loop.stored(t).Status.RequestStatus,
+				"the acknowledged request completes")
+			loop.syncCache(t)
+			loop.pass(ctx, t)
+			assert.Contains(t, icms.posted, tt.ready, "the fulfillment is posted once the request is acknowledged")
+		})
+	}
+}
+
+// A request sync completes at once a request whose instances all succeeded and that does not wait
+// for an acknowledgement: a task while tasks are acknowledged when created, a task already
+// acknowledged during model caching, a function, and a task reconciled out of an acknowledged
+// failure, which is past acknowledgement.
+func TestSyncICMSRequest_CompletesWithoutWaitingForAcknowledgement(t *testing.T) {
+	reportedAt := metav1.NewTime(time.Now().Add(-time.Minute))
+	tests := []struct {
+		name          string
+		rs            nvcav2beta1.RequestStatus
+		action        common.MessageAction
+		ackAfterSched bool
+		acked         bool
+	}{
+		{name: "a task acknowledged when created", action: common.TaskCreationAction},
+		{name: "a task acknowledged during model caching", action: common.TaskCreationAction, ackAfterSched: true, acked: true},
+		{name: "a function", action: common.FunctionCreationAction, ackAfterSched: true},
+		{
+			name:          "a task reconciled out of an acknowledged failure",
+			rs:            nvcav2beta1.ICMSRequestStatusFailureAcknowledged,
+			action:        common.TaskCreationAction,
+			ackAfterSched: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newTestContext()
+			rs := tt.rs
+			if rs == "" {
+				rs = nvcav2beta1.ICMSRequestStatusInstancesInProgress
+			}
+			req := instanceStatusRequest(rs, instanceStatusInstance("0-sr", types.ICMSInstanceRunning, &reportedAt))
+			req.Finalizers = []string{NVCAFinalizer}
+			req.Spec.Action = tt.action
+			req.Spec.CreationMsgInfo.InstanceCount = 1
+			if tt.action == common.TaskCreationAction {
+				req.Spec.CreationMsgInfo.TaskLaunchSpecification = &task.LaunchSpecification{
+					MaxRuntimeDuration: "PT1H",
+					MaxQueuedDuration:  "PT1H",
+				}
+			}
+			if tt.acked {
+				req.Status.LastACKTimestamp = &reportedAt
+			}
+			loop := newInstanceStatusLoop(t, &instanceStatusICMSClient{}, req, instanceStatusPod("0-sr"))
+			if tt.ackAfterSched {
+				loop.ff.EnabledFFs = append(loop.ff.EnabledFFs, featureflag.AckTaskRequestAfterPodsScheduled)
+			}
+
+			require.NoError(t, loop.ag.backendk8scache.syncICMSRequest(ctx, loop.stored(t)))
+
+			assert.Equal(t, nvcav2beta1.ICMSRequestStatusCompleted, loop.stored(t).Status.RequestStatus)
 		})
 	}
 }
