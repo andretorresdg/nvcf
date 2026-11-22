@@ -329,7 +329,7 @@ func TestMutateTreatsAnAlreadyPlacedBundleAsPlaced(t *testing.T) {
 }
 
 // Pods of one instance differ in the names of their service account token
-// volumes; that must not give each its own key (ct4, rc22c run 1).
+// volumes; that must not give each its own key.
 func TestModelCacheKeyIgnoresPodLocalVolumeNames(t *testing.T) {
 	key := func(tokenVol string) string {
 		p := ngcFunctionPod()
