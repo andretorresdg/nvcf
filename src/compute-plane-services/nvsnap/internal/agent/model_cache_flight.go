@@ -668,9 +668,18 @@ func (c *nodeModelCache) copyPublished(ctx context.Context, s *streamer, key str
 
 // promote makes f's pod the holder after it took the Lease: it stops the
 // pod's relay, empties its volume, and only then writes the download plan.
-// When the volume cannot be emptied, or f's flight ended meanwhile (its pod
-// left the node), it releases the Lease instead: nobody would renew or
-// serve it, and the other pods would wait out its expiry.
+// When the volume cannot be emptied, the pod's helper downloads on its own,
+// or f's flight ended meanwhile (its pod left the node), it releases the
+// Lease instead: nobody would renew or serve it, and the other pods would
+// wait out its expiry.
+//
+// The helper and promote never both touch the volume: promote runs inside
+// follow, so the pod's streaming heartbeat is fresh throughout, and it
+// reads the helper's signal only after that heartbeat started. The helper
+// writes its signal before it reads the heartbeat, and while the heartbeat
+// is fresh it waits, then empties the volume, before it downloads. So
+// either promote sees the signal and leaves the volume, or the helper
+// starts only after promote has returned.
 func (c *nodeModelCache) promote(ctx context.Context, f *flight, log logrus.FieldLogger) {
 	bg := context.WithoutCancel(ctx)
 	if f.src != nil {
@@ -680,6 +689,11 @@ func (c *nodeModelCache) promote(ctx context.Context, f *flight, log logrus.Fiel
 			delete(c.liveSources, f.key)
 		}
 		c.mu.Unlock()
+	}
+	if c.signalled(f) {
+		log.Info("model cache: single flight: the pod's helper downloads on its own; its volume is left to it")
+		c.release(bg, f.key, f.identity)
+		return
 	}
 	if err := emptyVolume(f.vol); err != nil {
 		log.WithError(err).Warn("model cache: single flight: emptying the volume failed; the pod downloads")

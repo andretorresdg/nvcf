@@ -69,8 +69,24 @@ func modelCacheCmd(args []string) (int, error) {
 	fmt.Println("nvsnap: model cache: downloading")
 	if *signal != "" {
 		// Before the download writes anything: the agent never streams
-		// into this volume once it reads this.
+		// into this volume, nor empties it to take the download over,
+		// once it reads this.
 		writeSignal(*signal, modelcache.SignalDownloading)
+		// The agent reads the signal only between its writes, and its
+		// stream may have begun after this helper decided to download
+		// (before its plan arrived). Read after the signal is written,
+		// a fresh stream heartbeat means the agent may still write or
+		// empty the volume: wait for it to stop, then start afresh in an
+		// empty volume. A download plan is written only once the agent
+		// has emptied the volume and stopped writing into it.
+		if w.uid != "" && modelcache.ReadPlan(*cache, w.uid) != modelcache.PlanDownload &&
+			heartbeatFresh(filepath.Join(*cache, modelcache.StreamingFileOf(w.uid)), w.stale) {
+			fmt.Println("nvsnap: model cache: the agent still streams into the volume; waiting for it to stop")
+			if !stopStream(*signal, *cache, w.uid, w.stale, time.Duration(*stopWait)*time.Second, w.poll) {
+				return 1, errors.New("model-cache: the agent still writes into the volume after --stop-wait; the volume is left as it is, and the init's restart looks again")
+			}
+			emptyDir(*to)
+		}
 	}
 	before := treesOf(watch, *maxEntries)
 	code, err := run(argv)

@@ -712,6 +712,67 @@ func TestModelCacheGivingUpWaitsForTheStreamToStop(t *testing.T) {
 	}
 }
 
+// A helper that downloads with no plan in time, while the agent already
+// streams into the volume (it began after its last look at the signal):
+// the helper signals, then waits for the stream to stop and empties the
+// volume before it downloads. Otherwise the agent, which reads the signal
+// only between writes or before it empties the volume to take the
+// download over, could still write or delete under the download.
+func TestModelCacheDownloadWithoutAPlanWaitsForALiveStream(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	agent := newFakeAgent(stop)
+	var stoppedAt time.Time
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		// The agent streams before its plan is written; the helper's plan
+		// wait (1 s) runs out first.
+		time.Sleep(300 * time.Millisecond)
+		if err := os.WriteFile(filepath.Join(to, "partial.bin"), []byte("streamed so far"), 0o644); err != nil {
+			agent.fail(err)
+			return
+		}
+		for i := 0; i < 200; i++ {
+			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && strings.TrimSpace(string(b)) == modelcache.SignalDownloading {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		// It reads the signal, then finishes its last write.
+		if err := os.WriteFile(filepath.Join(to, "late.bin"), []byte("in flight"), 0o644); err != nil {
+			agent.fail(err)
+			return
+		}
+		time.Sleep(time.Second)
+		stoppedAt = time.Now()
+		stop()
+	}()
+	code, err := modelCacheCmd(planArgs(cache, to, "--final-wait", "0", "--signal", sig))
+	returned := time.Now()
+	agent.check(t)
+	if code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fake agent never stopped")
+	}
+	if stoppedAt.IsZero() || stoppedAt.After(returned) {
+		t.Fatal("the helper downloaded before the stream stopped")
+	}
+	for _, name := range []string{"partial.bin", "late.bin"} {
+		if _, err := os.Stat(filepath.Join(to, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s, which the stream wrote, is left under the download", name)
+		}
+	}
+	if got := read(t, filepath.Join(to, "weights.bin")); got != "downloaded\n" {
+		t.Fatalf("weights.bin = %q", got)
+	}
+}
+
 // A wait plan that goes away (the agent restarted, or ended the pod's
 // flight) while the agent streamed into the volume: the helper stops the
 // stream and empties the volume before it downloads, as when a stream

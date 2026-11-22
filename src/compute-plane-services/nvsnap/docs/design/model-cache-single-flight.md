@@ -98,7 +98,12 @@ restart finds the plan and the volume and looks again.
 
 A helper that gave up waiting for a plan writes `downloading` to the signal volume before its download writes
 anything. The agent writes no plan for such a pod, nor for a pod whose volume is not empty, and a stream already
-running checks the signal before each pass of writes and stops. It never writes into a volume a download writes.
+running checks the signal before each pass of writes and stops. A stream may have started after the helper decided
+to download, so after writing the signal the helper reads `.streaming-<pod uid>`. If it is fresh and the plan is not
+`download`, the helper waits for it to go stale, as above, and empties the volume before it downloads. A takeover
+(5) reads the signal after that heartbeat started and before it empties the volume. If the signal is there, the
+agent leaves the volume to the helper and releases the Lease. Either the agent sees the signal, or the helper starts
+only after the agent's last write or delete. The agent never writes into, or empties, a volume a download writes.
 
 The helper knows its pod's uid from `NVSNAP_POD_UID`, a downward-API env var admission adds last to the wrapped init.
 Resolving the key strips exactly that entry, as it strips the wrapper's command and mounts. Admission does not wrap an
@@ -215,7 +220,7 @@ Estimates for the 4-pod, 1.56 TB example, all on nodes with no copy, from the me
 | A stream does not finish within 5 hours, or starts over 20 times | It stops before the helper's own 6-hour bound, so it never writes into a volume the helper has given up on. The pod downloads. |
 | The holder's Lease update conflicts (streaming pods record their sources on it) | The renewal is retried; only another holder ends it. |
 | The holder published a copy, and a stream fails | No takeover: a new download would repeat a published copy. The stream copies the published copy from a node the sources ConfigMap lists, through the routes a fetch from a peer uses, and checks every file against that copy's manifest. If no listed node serves it, the pod downloads. |
-| A takeover cannot empty the volume, or the pod left the node before it was promoted | The new holder releases the Lease at once, so another waiting pod can take it without waiting for it to expire. |
+| A takeover cannot empty the volume, the pod's helper downloads on its own, or the pod left the node before it was promoted | The new holder releases the Lease at once, so another waiting pod can take it without waiting for it to expire. |
 | Agent restarts on a streaming node | The heartbeat goes stale, and the helper downloads. Before writing the `download` plan, the agent empties the volume it was writing. The plan is written only after that, so the helper downloads into an empty volume. |
 | No plan within 60 s (agent down) | The pod downloads, as without single flight. |
 | Lease API unavailable | No election. Each pod downloads, as today. |

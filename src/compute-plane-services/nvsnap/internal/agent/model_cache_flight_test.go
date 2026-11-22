@@ -647,6 +647,34 @@ func TestSingleFlightATakeoverThatCannotEmptyTheVolumeReleasesTheLease(t *testin
 	}
 }
 
+// A waiting pod's helper that gave up and downloads on its own, signalled
+// before the agent took the Lease for it: the takeover must not empty the
+// volume under that download. It leaves the volume and releases the Lease.
+// The helper, having signalled, waits while the pod's streaming heartbeat
+// is fresh (it is, until follow returns), so this check closes the race:
+// either the signal is there when promote reads it, or the helper starts
+// only after promote is done.
+func TestSingleFlightATakeoverLeavesAVolumeTheHelperDownloadsInto(t *testing.T) {
+	a, f, kube := promoteFixture(t)
+	sig := a.c.signalDir(f.vol)
+	if err := os.MkdirAll(sig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sig, modelcache.SignalFile), []byte(modelcache.SignalDownloading+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.c.promote(context.Background(), f, a.c.log)
+	if got, err := os.ReadFile(filepath.Join(f.vol, "w.bin")); err != nil || string(got) != "streamed so far" {
+		t.Fatalf("w.bin = %q, %v; the takeover emptied a volume the helper downloads into", got, err)
+	}
+	if h := leaseHolder(kube, f.key); h == f.identity {
+		t.Fatal("the Lease is held for a pod that downloads on its own")
+	}
+	if a.plan(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: f.uid, Labels: map[string]string{webhook.ModelCacheKeyLabel: f.key}}}) == modelcache.PlanDownload {
+		t.Fatal("a pod that downloads on its own was planned as the holder")
+	}
+}
+
 // A pod that left the node between taking the Lease and its promotion is
 // not made the holder: the Lease is released and no flight is revived.
 func TestSingleFlightATakeoverOfAPodThatLeftReleasesTheLease(t *testing.T) {
