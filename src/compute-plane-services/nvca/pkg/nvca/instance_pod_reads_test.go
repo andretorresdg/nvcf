@@ -360,7 +360,7 @@ func runPodReadsPassPosting(ctx context.Context, kb K8sComputeBackend, req *nvca
 			posted[upd.InstanceID] = getPostedInstanceStatus(ctx, upd)
 		}
 	}
-	req.Status.Instances = getUpdatedInstanceStatusMap(req.Status.Instances, posted)
+	req.Status.Instances = getUpdatedInstanceStatusMap(ctx, req.Status.Instances, req.Status.Instances, posted)
 	return updates
 }
 

@@ -212,7 +212,7 @@ func TestAgentApis(t *testing.T) {
 		},
 	}
 
-	upStatus := getUpdatedInstanceStatusMap(currentInstanceStatus, postedStatus)
+	upStatus := getUpdatedInstanceStatusMap(newTestContext(), currentInstanceStatus, currentInstanceStatus, postedStatus)
 	is, ok := upStatus["randomInstanceID1"]
 	assert.True(t, ok)
 	assert.Equal(t, is.Status, string(types.ICMSInstanceRunning))
@@ -3308,8 +3308,10 @@ func TestGetUpdatedInstanceStatusMap(t *testing.T) {
 	tests := []struct {
 		name    string
 		current map[string]nvcav2beta1.InstanceStatus
-		posted  map[string]nvcav2beta1.InstanceStatus
-		want    map[string]nvcav2beta1.InstanceStatus
+		// listed is the status the posts were decided from, or current when nil.
+		listed map[string]nvcav2beta1.InstanceStatus
+		posted map[string]nvcav2beta1.InstanceStatus
+		want   map[string]nvcav2beta1.InstanceStatus
 	}{
 		{
 			name: "instances not posted are kept",
@@ -3361,12 +3363,44 @@ func TestGetUpdatedInstanceStatusMap(t *testing.T) {
 			name:   "no instances",
 			posted: map[string]nvcav2beta1.InstanceStatus{"a": posted("a", running)},
 		},
+		{
+			name: "posted instance changed since it was listed keeps the latest entry",
+			current: map[string]nvcav2beta1.InstanceStatus{
+				"a": instance("a", terminated, noStatus, nil),
+				"b": instance("b", started, started, &reportedAt),
+			},
+			listed: map[string]nvcav2beta1.InstanceStatus{
+				"a": instance("a", started, started, &reportedAt),
+				"b": instance("b", started, started, &reportedAt),
+			},
+			posted: map[string]nvcav2beta1.InstanceStatus{
+				"a": posted("a", running),
+				"b": posted("b", running),
+			},
+			want: map[string]nvcav2beta1.InstanceStatus{
+				"a": instance("a", terminated, noStatus, nil),
+				"b": instance("b", running, running, &postedAt),
+			},
+		},
+		{
+			name:    "posted instance with an equal timestamp in another location is recorded",
+			current: map[string]nvcav2beta1.InstanceStatus{"a": instance("a", started, started, &reportedAt)},
+			listed: map[string]nvcav2beta1.InstanceStatus{
+				"a": instance("a", started, started, &metav1.Time{Time: reportedAt.In(time.FixedZone("UTC+1", 3600))}),
+			},
+			posted: map[string]nvcav2beta1.InstanceStatus{"a": posted("a", running)},
+			want:   map[string]nvcav2beta1.InstanceStatus{"a": instance("a", running, running, &postedAt)},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			before := (&nvcav2beta1.ICMSRequestStatus{Instances: tt.current}).DeepCopy().Instances
+			listed := tt.listed
+			if listed == nil {
+				listed = tt.current
+			}
 
-			got := getUpdatedInstanceStatusMap(tt.current, tt.posted)
+			got := getUpdatedInstanceStatusMap(newTestContext(), tt.current, listed, tt.posted)
 
 			assert.Equal(t, tt.want, got)
 			assert.Equal(t, before, tt.current, "the current status must not be modified")
@@ -3727,6 +3761,53 @@ func TestPostICMSInstanceRequestStatusUpdates_AppliesPostsToLatestInstances(t *t
 			assert.ElementsMatch(t, tt.wantPosted, icms.posted)
 			assert.Equal(t, tt.wantRS, sr.Status.RequestStatus)
 			assert.Equal(t, tt.want, sr.Status.Instances)
+		})
+	}
+}
+
+// The status loop records a posted report only on an instance that is still as the loop listed it.
+// An instance another writer changed since then, such as maintenance eviction, keeps the newer entry,
+// whether the change lands before the loop reads the request back to write it, or between that read
+// and the write, which then conflicts and is retried. The next pass decides from the newer entry.
+func TestPostICMSInstanceRequestStatusUpdates_KeepsInstancesChangedSinceListed(t *testing.T) {
+	now := time.Now().UTC()
+	reportedAt := metav1.NewTime(now.Add(-time.Minute))
+	// What maintenance eviction records for an instance it terminated.
+	evicted := nvcav2beta1.InstanceStatus{
+		ID:                 "0-sr",
+		Type:               nvcav2beta1.InstanceTypePod,
+		Status:             string(types.ICMSInstanceTerminated),
+		LastReportedStatus: string(types.ICMSInstanceStateNoStatus),
+	}
+	tests := []struct {
+		name   string
+		change func(*fakebartclient.Clientset, func(*nvcav2beta1.ICMSRequest)) func() error
+	}{
+		{name: "changed before the loop reads the request back", change: changeBeforeStatusWrite},
+		{name: "changed between the loop's read and its write", change: conflictOnStatusWrite},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := core.WithClock(newTestContext(), func() time.Time { return now })
+			req := instanceStatusRequest(nvcav2beta1.ICMSRequestStatusCompletionAcknowledged,
+				// Both became Running since they were last reported, so this pass posts both.
+				instanceStatusInstance("0-sr", types.ICMSInstanceStarted, &reportedAt),
+				instanceStatusInstance("1-sr", types.ICMSInstanceStarted, &reportedAt),
+			)
+			icms := &instanceStatusICMSClient{}
+			loop := newInstanceStatusLoop(t, icms, req, instanceStatusPod("0-sr"), instanceStatusPod("1-sr"))
+			changeErr := tt.change(loop.bart, func(sr *nvcav2beta1.ICMSRequest) {
+				sr.Status.Instances[evicted.ID] = evicted
+			})
+
+			sr := loop.pass(ctx, t)
+
+			require.NoError(t, changeErr())
+			assert.ElementsMatch(t, []string{"0-sr", "1-sr"}, icms.posted)
+			assert.Equal(t, map[string]nvcav2beta1.InstanceStatus{
+				evicted.ID: evicted,
+				"1-sr":     instanceStatusInstance("1-sr", types.ICMSInstanceRunning, &metav1.Time{Time: now}),
+			}, sr.Status.Instances, "the evicted instance keeps the entry eviction recorded")
 		})
 	}
 }

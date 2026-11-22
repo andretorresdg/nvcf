@@ -128,6 +128,7 @@ go_library(
         "//src/compute-plane-services/nvca/vendor/k8s.io/api/core/v1:core",
         "//src/compute-plane-services/nvca/vendor/k8s.io/api/networking/v1:networking",
         "//src/compute-plane-services/nvca/vendor/k8s.io/api/rbac/v1:rbac",
+        "//src/compute-plane-services/nvca/vendor/k8s.io/apimachinery/pkg/api/equality",
         "//src/compute-plane-services/nvca/vendor/k8s.io/apimachinery/pkg/api/errors",
         "//src/compute-plane-services/nvca/vendor/k8s.io/apimachinery/pkg/api/meta",
         "//src/compute-plane-services/nvca/vendor/k8s.io/apimachinery/pkg/apis/meta/v1:meta",
