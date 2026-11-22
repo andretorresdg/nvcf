@@ -155,9 +155,12 @@ already streaming, the shallowest one with room (at most 3 consumers each), then
 alone builds a chain, since a node that just joined feeds none; on a cluster that made a 3-hop chain, each hop
 adding its lag. Each node then sends at most 3 copies, so 30
 pods form a tree 4 levels deep. Each level adds its settle time (about 10 s per file), not a full copy. The choice is
-recorded in the Lease's annotations (`nvsnap.io/feeds-<node>`), updated with the Lease's resourceVersion. If a
-node's source fails, it picks another: the failed one leaves the annotation, so no node picks it again, and a node
-never picks one that streams from it (a cycle).
+recorded in one Lease annotation, `nvsnap.io/feeds`: a JSON map from each streaming pod's identity (`<node>/<pod uid>`)
+to the identity it streams from, updated with the Lease's resourceVersion. A conflict or a failed read is retried,
+up to 5 times. The cap is best effort: if the choice still cannot be recorded, the pod streams from the holder
+unrecorded, since one more stream costs less than another download. If a node's source fails, it picks another: the
+failed one leaves the annotation, so no node picks it again, and a node never picks one that streams from it (a
+cycle).
 
 ### 3.4 The end of the download
 

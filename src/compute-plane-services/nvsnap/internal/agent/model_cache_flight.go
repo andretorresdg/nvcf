@@ -404,13 +404,32 @@ func (c *nodeModelCache) release(ctx context.Context, key, identity string) {
 	_ = leases.Delete(ctx, l.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{ResourceVersion: &rv}})
 }
 
+// pickSourceBackoff is the step of pickSource's backoff after a failed
+// Lease read: 100, 200, 300, 400 ms, about 1 s in all.
+const pickSourceBackoff = 100 * time.Millisecond
+
 // pickSource chooses what identity streams from: the holder, or a pod
 // already streaming, whichever feeds the fewest (at most maxFeeds), and
 // records the choice on the Lease. With no room anywhere, the holder.
+// The cap is best effort: when the Lease cannot be read or written after
+// the retries, or names another holder, the pod streams from the holder
+// unrecorded, since one more stream costs less than another download.
 func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder string, bad map[string]bool) string {
 	leases := c.kube.CoordinationV1().Leases(c.ns)
 	for attempt := 0; attempt < 5; attempt++ {
 		l, err := leases.Get(ctx, leaseName(key), metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) && ctx.Err() == nil {
+			// A transient read error is retried as a write conflict is:
+			// a pod that streams unrecorded does not count against its
+			// source's maxFeeds. The bound and backoff are small, not
+			// measured: past them the pod streams from the holder anyway.
+			select {
+			case <-ctx.Done():
+				return holder
+			case <-time.After(time.Duration(attempt+1) * pickSourceBackoff):
+			}
+			continue
+		}
 		if err != nil || l.Spec.HolderIdentity == nil || *l.Spec.HolderIdentity != holder {
 			return holder
 		}

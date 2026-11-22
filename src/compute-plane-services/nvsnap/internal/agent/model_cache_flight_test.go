@@ -362,6 +362,36 @@ func TestSingleFlightPicksARelayWithRoomAndNoCycle(t *testing.T) {
 	}
 }
 
+// A transient failure to read the Lease is retried like a write conflict:
+// a pod that streamed unrecorded would not count against its source's
+// maxFeeds, and later pods could pile onto that source.
+func TestSingleFlightPickSourceRetriesALeaseReadError(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	n := newFlightNode(t, kube, "n", map[string]string{})
+	key := "0123456789abcdef0123456789abcdef"
+	leaseWithFeeds(t, kube, key, "h/1", map[string]string{"a/1": "h/1"})
+	failures := 2
+	kube.PrependReactor("get", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failures > 0 {
+			failures--
+			return true, nil, apierrors.NewServerTimeout(coordv1.Resource("leases"), "get", 1)
+		}
+		return false, nil, nil
+	})
+	if got := n.c.pickSource(context.Background(), key, "d/1", "h/1", nil); got != "h/1" && got != "a/1" {
+		t.Fatalf("picked %q", got)
+	}
+	l, err := kube.CoordinationV1().Leases(mcNS).Get(context.Background(), leaseName(key), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feeds := map[string]string{}
+	_ = json.Unmarshal([]byte(l.Annotations[feedsAnnotation]), &feeds)
+	if feeds["d/1"] == "" {
+		t.Fatalf("feeds %v: the pod streams without its feed recorded after a transient read error", feeds)
+	}
+}
+
 // The holder's renewals survive the conflicts that streaming pods'
 // annotations cause; only another holder ends them.
 func TestSingleFlightRenewRetriesAConflict(t *testing.T) {
