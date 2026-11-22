@@ -104,7 +104,13 @@ func criuFallbackReason(d map[string]string, now time.Time, bundle string) strin
 // criuFallbackFor is the webhook's view: why the configuration uri falls
 // back in namespace ns's scope, and the complete cachedir capture of rank
 // ordinal.
-func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int) (webhook.CRIUFallback, bool) {
+//
+// processConfig is the pod's (webhook.ProcessConfig). A record whose slot
+// for the pod's ordinal holds another process configuration, and that a
+// capture may replace (replaceableRecord), is not this configuration's
+// failure: the pod does not fall back, and its instance's capture replaces
+// the record.
+func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int, processConfig string) (webhook.CRIUFallback, bool) {
 	scope, err := a.criuGroupScope(ctx, ns)
 	if err != nil {
 		return webhook.CRIUFallback{}, false
@@ -125,6 +131,11 @@ func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int
 		}
 		a.nameRecordLater(key, ns)
 		reason = criuFallbackReason(data, time.Now(), a.currentBundle())
+		if reason != "" && otherConfiguration(data, ordinal, processConfig, time.Now()) {
+			a.log.WithFields(logrus.Fields{"criuGroup": key, "state": data["state"]}).
+				Info("CRIU fallback: the record is of another process configuration; the pod's instance captures again")
+			reason = ""
+		}
 	}
 	if reason == "" {
 		return webhook.CRIUFallback{}, false
@@ -135,6 +146,17 @@ func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int
 		fb.Capture = webhook.FallbackCaptureID(key, ordinal)
 	}
 	return fb, true
+}
+
+// otherConfiguration reports whether a record's slot for rank ordinal holds
+// another process configuration than processConfig, and the record may be
+// replaced by a capture of this one.
+func otherConfiguration(data map[string]string, ordinal int, processConfig string, now time.Time) bool {
+	slot := data[fmt.Sprintf("processConfig.%d", ordinal)]
+	if slot == "" || processConfig == "" || !replaceableRecord(data, now) {
+		return false
+	}
+	return len(webhook.ProcessConfigChanges(slot, processConfig)) > 0
 }
 
 // groupRecordData returns the group record of key, through its alias when

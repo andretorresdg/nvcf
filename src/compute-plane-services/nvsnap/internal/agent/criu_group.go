@@ -716,19 +716,14 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	// still says which configuration failed, so the next instance of it
 	// is not taken for another configuration's (processConfigChanged reads
 	// a record without them as unchanged).
+	// In the local snapshot too: the failure path persists record.Data.
 	startedAt := record.Data["startedAt"]
+	recordMemberConfigs(record.Data, members, len(ranks), companionContainers)
 	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
 		if d["state"] != criuGroupStateCapturing || d["startedAt"] != startedAt {
 			return false
 		}
-		for i, m := range members {
-			ctr := gpuContainer(m)
-			if i >= len(ranks) {
-				ctr = companionContainers[m.Name]
-				d[fmt.Sprintf("companion.%d", i)] = "true"
-			}
-			recordProcessConfig(d, i, m, ctr, len(members))
-		}
+		recordMemberConfigs(d, members, len(ranks), companionContainers)
 		return true
 	}); err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot record the members' process configurations at the claim")
@@ -1074,6 +1069,20 @@ func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv
 		c.a.nameRecordLater(key, leader.Namespace)
 	}
 	return updated, err
+}
+
+// recordMemberConfigs writes every member's process configuration, and
+// which members are companions, into record data d: ranks first, then
+// companions, as the capture records them.
+func recordMemberConfigs(d map[string]string, members []*corev1.Pod, ranks int, companionContainers map[string]string) {
+	for i, m := range members {
+		ctr := gpuContainer(m)
+		if i >= ranks {
+			ctr = companionContainers[m.Name]
+			d[fmt.Sprintf("companion.%d", i)] = "true"
+		}
+		recordProcessConfig(d, i, m, ctr, len(members))
+	}
 }
 
 // replaceableRecord reports whether a record may be replaced by a capture of

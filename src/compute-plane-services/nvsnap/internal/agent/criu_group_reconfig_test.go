@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
@@ -153,5 +154,50 @@ func TestProcessConfigChangedMatchesACompanionAgainstAnySlot(t *testing.T) {
 	swapped := []*corev1.Pod{members[0], members[2], members[1]}
 	if got := processConfigChanged(data, swapped, 1, cc); len(got) != 0 {
 		t.Fatalf("unchanged companions in another order: changed %q", got)
+	}
+}
+
+// A failed record out of attempts sends the configuration's pods to the
+// fallback; a pod of another process configuration is not that
+// configuration's, and must reach the capture that replaces the record.
+func TestCRIUFallbackSkipsARecordOfAnotherConfiguration(t *testing.T) {
+	a, _ := fallbackAgent(t)
+	own := fnKey(t, a)
+	old := time.Now().Add(-2 * recordReplaceCooldown).UTC().Format(time.RFC3339)
+	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	was := stamped(r0, "", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "a1"})
+	now := stamped(r0, "", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "b7"})
+	data := reconfigRecord([]*corev1.Pod{was}, 1, nil)
+	data["state"], data["captures"], data["startedAt"], data[groupAgentBundleKey] = "failed", "3", old, fbBundle
+	r := record(criuGroupConfigMapName(own), data)
+	if _, err := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace()).Create(context.Background(), &r, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(was)); !ok {
+		t.Fatal("the failed configuration itself does not fall back")
+	}
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(now)); ok {
+		t.Fatalf("a pod of another process configuration falls back: %+v", fb)
+	}
+	// Within the cooldown the record stays, and so does the fallback.
+	r.Data["startedAt"] = time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace()).Update(context.Background(), &r, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(now)); !ok {
+		t.Fatal("within the cooldown, another configuration's pod does not fall back")
+	}
+}
+
+// The members' configurations written at the claim survive a capture that
+// then fails: the record the failure persists is built from the same data.
+func TestMemberConfigsAreInTheRecordSnapshot(t *testing.T) {
+	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	m := stamped(r0, "", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "b7"})
+	snapshot := map[string]string{"state": criuGroupStateCapturing}
+	recordMemberConfigs(snapshot, []*corev1.Pod{m}, 1, nil)
+	if snapshot["processConfig.0"] == "" {
+		t.Fatal("the local record snapshot lacks the member's configuration")
 	}
 }
