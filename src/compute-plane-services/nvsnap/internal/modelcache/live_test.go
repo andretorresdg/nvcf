@@ -40,11 +40,21 @@ func TestScanLiveReportsInodes(t *testing.T) {
 	if err := os.Rename(filepath.Join(root, "sub", "a.bin"), filepath.Join(root, "b.bin")); err != nil {
 		t.Fatal(err)
 	}
-	ents, _ = ScanLive(root, 0)
+	ents, err = ScanLive(root, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
 	for _, e := range ents {
-		if e.Path == "b.bin" && (e.Ino != a.Ino || e.Dev != a.Dev) {
-			t.Fatalf("renamed file has inode %d/%d, was %d/%d", e.Dev, e.Ino, a.Dev, a.Ino)
+		if e.Path == "b.bin" {
+			found = true
+			if e.Ino != a.Ino || e.Dev != a.Dev {
+				t.Fatalf("renamed file has inode %d/%d, was %d/%d", e.Dev, e.Ino, a.Dev, a.Ino)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("the renamed file is not in the scan")
 	}
 }
 

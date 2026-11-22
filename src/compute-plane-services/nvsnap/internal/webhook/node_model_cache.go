@@ -256,19 +256,25 @@ func unwrapModelCache(pod *corev1.Pod) (*corev1.Pod, bool, bool) {
 		if dash < 0 || dash == len(argv)-1 {
 			return nil, false, false
 		}
+		// Single flight's additions (the pod-uid variable, last, and the
+		// signal mount) come only with a wrapper that has --plan-wait: a
+		// user's own variable or mount of that name stays in the recipe.
+		single := false
+		for _, a := range argv[:dash] {
+			single = single || a == "--plan-wait"
+		}
 		out := pod.DeepCopy()
 		oc := &out.Spec.InitContainers[i]
 		oc.Command, oc.Args = append([]string{}, argv[dash+1:]...), nil
 		var mounts []corev1.VolumeMount
 		for _, vm := range oc.VolumeMounts {
-			if vm.Name != ModelCacheVolume && vm.Name != helperVolumeName && vm.Name != ModelCacheSignalVolume {
+			if vm.Name != ModelCacheVolume && vm.Name != helperVolumeName && !(single && vm.Name == ModelCacheSignalVolume) {
 				mounts = append(mounts, vm)
 			}
 		}
 		oc.VolumeMounts = mounts
-		// The pod-uid variable the wrapper adds is last; the wrapper does
-		// not wrap an init that set one itself.
-		if n := len(oc.Env); n > 0 && isPodUIDEnv(oc.Env[n-1]) {
+		// The wrapper does not wrap an init that set the variable itself.
+		if n := len(oc.Env); single && n > 0 && isPodUIDEnv(oc.Env[n-1]) {
 			oc.Env = oc.Env[:n-1]
 			if len(oc.Env) == 0 {
 				oc.Env = nil

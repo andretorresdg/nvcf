@@ -514,3 +514,18 @@ func TestModelCacheKeyKeepsAUserPodUIDEnvOnAnUnwrappedInit(t *testing.T) {
 		t.Fatal("a user's own variable left out of the key")
 	}
 }
+
+// Without single flight the wrapper adds no pod-uid variable, so an init
+// that sets one itself keeps it in its key after wrapping.
+func TestModelCacheKeyKeepsAUserPodUIDEnvWithoutSingleFlight(t *testing.T) {
+	m := nodeCacheMutator(t)
+	pod := ngcFunctionPod()
+	c := initByName(pod, "download-ngc-model")
+	c.Env = append(c.Env, corev1.EnvVar{Name: PodUIDEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}})
+	before, _ := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, pod, 0)
+	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
+	after, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, out, 0)
+	if !ok || after.Key != before.Key {
+		t.Fatalf("key after wrapping %q, want %q", after.Key, before.Key)
+	}
+}

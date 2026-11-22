@@ -7,12 +7,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache"
 )
@@ -290,7 +295,7 @@ func TestApplyMetaStaysInTheVolume(t *testing.T) {
 	}
 	defer root.Close()
 	m := modelcache.Manifest{Entries: []modelcache.Entry{{Path: "f", Type: modelcache.TypeFile, Mode: 0o777, UID: os.Getuid(), GID: os.Getgid()}}}
-	_ = applyMetaRoot(root, m)
+	_ = applyMetaRoot(root, dst, m)
 	if fi, _ := os.Stat(victim); fi.Mode().Perm() != 0o600 {
 		t.Fatalf("a file outside the volume became %o", fi.Mode().Perm())
 	}
@@ -332,5 +337,127 @@ func TestStreamWaitsForAPreallocatedFileToFill(t *testing.T) {
 	}
 	if n := c.opens.Load(); n != 1 {
 		t.Fatalf("the file was read %d times; want once, when full", n)
+	}
+}
+
+// Two copies whose contents the final manifest swaps: neither is moved
+// over the other on a stale index; both end right.
+func TestStreamFinishHandlesSwappedContents(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	ls := newLiveSource(src, "uid-holder", fastStream())
+	done, _ := runStream(t, localClient{ls}, dst)
+	write(t, src, "a.bin", "AAAA")
+	write(t, src, "b.bin", "BBBB")
+	time.Sleep(700 * time.Millisecond) // both copied
+	// The downloader swaps them (same size, so only the content moves).
+	write(t, src, "a.bin", "BBBB")
+	write(t, src, "b.bin", "AAAA")
+	finish(t, ls)
+	if err := waitDone(t, done); err != nil {
+		t.Fatal(err)
+	}
+	assertTree(t, dst, map[string]string{"a.bin": "BBBB", "b.bin": "AAAA"})
+}
+
+// A source that sends part of a file and then nothing: the copy gives up
+// after the idle bound, not after the stream's hours-long deadline.
+func TestStreamCopyGivesUpOnASilentSource(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-block:
+		case <-r.Context().Done():
+		}
+	}))
+	// Deferred last in, first out: unblock the handler, then close.
+	defer srv.Close()
+	defer close(block)
+	dst := t.TempDir()
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	tm := fastStream()
+	tm.idle = 500 * time.Millisecond
+	s := &streamer{dst: dst, timing: tm, client: urlClient{srv.URL}}
+	start := time.Now()
+	_, err = s.copyOne(context.Background(), root, modelcache.LiveEntry{Entry: modelcache.Entry{Path: "w.bin", Type: modelcache.TypeFile, Size: 1000}})
+	if err == nil {
+		t.Fatal("a silent source's copy succeeded")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("gave up after %v", d)
+	}
+}
+
+// urlClient serves every file from one URL.
+type urlClient struct{ u string }
+
+func (c urlClient) View(context.Context) (liveView, error) { return liveView{}, nil }
+func (c urlClient) Open(ctx context.Context, _ string) (io.ReadCloser, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.u, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// The helper gives up mid-pass: the pass stops before its next file.
+func TestStreamStopsMidPassWhenTheHelperDownloads(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	for i := 0; i < 40; i++ {
+		write(t, src, fmt.Sprintf("w-%02d.bin", i), "x")
+	}
+	ls := newLiveSource(src, "uid-holder", fastStream())
+	c := &countingClient{liveClient: localClient{ls}}
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	var allowed atomic.Int64
+	allowed.Store(3)
+	s := &streamer{dst: dst, timing: fastStream(), client: c, mayWrite: func() bool { return allowed.Add(-1) >= 0 }}
+	s.have, s.first = map[string]copied{}, map[string]observed{}
+	var todo []modelcache.LiveEntry
+	ents, _ := modelcache.ScanLive(src, 0)
+	for _, e := range ents {
+		if e.Type == modelcache.TypeFile {
+			todo = append(todo, e)
+		}
+	}
+	_ = s.copyAll(context.Background(), root, todo, false)
+	if n := c.opens.Load(); n > 3+streamParallel {
+		t.Fatalf("copied %d of 40 files after the helper said it downloads", n)
+	}
+}
+
+func TestStreamRestoresASymlinksOwnMtime(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	write(t, src, "w.bin", "w")
+	if err := os.Symlink("w.bin", filepath.Join(src, "current")); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := unix.Lutimes(filepath.Join(src, "current"), []unix.Timeval{unix.NsecToTimeval(old.UnixNano()), unix.NsecToTimeval(old.UnixNano())}); err != nil {
+		t.Fatal(err)
+	}
+	ls := newLiveSource(src, "uid-holder", fastStream())
+	done, _ := runStream(t, localClient{ls}, dst)
+	finish(t, ls)
+	if err := waitDone(t, done); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(filepath.Join(dst, "current"))
+	if err != nil || !fi.ModTime().Equal(old) {
+		t.Fatalf("symlink mtime %v (%v), want %v", fi.ModTime(), err, old)
+	}
+	if wf, _ := os.Stat(filepath.Join(dst, "w.bin")); wf.ModTime().Equal(old) {
+		t.Fatal("the link's target got the link's mtime")
 	}
 }

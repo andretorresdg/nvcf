@@ -37,6 +37,7 @@ func modelCacheCmd(args []string) (int, error) {
 	planWait := fs.Int("plan-wait", 0, "single flight: most seconds to wait for the agent's plan for this pod (0: no plans)")
 	maxWait := fs.Int("max-wait", 6*3600, "single flight: most seconds a pod told to wait waits in all")
 	signal := fs.String("signal", "", "single flight: the signal volume where the helper tells the agent its download is over")
+	stopWait := fs.Int("stop-wait", 600, "single flight: most seconds to wait for the agent to stop streaming into the volume before downloading")
 	finalWait := fs.Int("final-wait", 120, "single flight: most seconds the downloading pod's init stays open for the agent's final manifest")
 	var watch tryFlags
 	fs.Var(&watch, "watch", "another writable volume a later container reads: if the download changes it, the download is not cached (repeatable)")
@@ -56,14 +57,19 @@ func modelCacheCmd(args []string) (int, error) {
 		report(modelcache.InitSeeded)
 		return 0, nil
 	case streamStopped:
-		// The agent wrote part of a tree; the download starts afresh.
+		// The agent wrote part of a tree. Say the pod downloads, wait for
+		// the agent to stop writing, then start afresh in an empty volume.
+		if *signal != "" {
+			writeSignal(*signal, modelcache.SignalDownloading)
+		}
+		waitStreamStopped(*cache, w.uid, w.stale, time.Duration(*stopWait)*time.Second, w.poll)
 		emptyDir(*to)
 	}
 	fmt.Println("nvsnap: model cache: downloading")
 	if *signal != "" {
 		// Before the download writes anything: the agent never streams
 		// into this volume once it reads this.
-		_ = os.WriteFile(filepath.Join(*signal, modelcache.SignalFile), []byte(modelcache.SignalDownloading+"\n"), 0o644)
+		writeSignal(*signal, modelcache.SignalDownloading)
 	}
 	before := treesOf(watch, *maxEntries)
 	code, err := run(argv)
@@ -81,9 +87,7 @@ func modelCacheCmd(args []string) (int, error) {
 			if w.uid != "" && modelcache.ReadPlan(*cache, w.uid) == modelcache.PlanDownload {
 				if *signal != "" {
 					// The agent reads the volume once this is there.
-					if err := os.WriteFile(filepath.Join(*signal, modelcache.SignalFile), []byte(tree+"\n"), 0o644); err != nil {
-						fmt.Println("nvsnap: model cache: cannot signal the agent:", err)
-					}
+					writeSignal(*signal, tree)
 				}
 				if !holdForFinal(*cache, w.uid, tree, time.Duration(*finalWait)*time.Second, w.poll) {
 					msg += " " + modelcache.FinalMismatch
@@ -159,14 +163,21 @@ const (
 // seed a complete generation, waiting only while a fetch's heartbeat is
 // fresh, and never past wait.
 func seedFromCache(cache, to string, w waitRules) outcome {
-	if ents, err := os.ReadDir(to); err != nil || len(ents) > 0 {
-		// A restarted init finds what its last run downloaded; the
-		// download knows how to go on from it.
-		fmt.Println("nvsnap: model cache: the volume already has content; the download goes on from it")
-		return mustDownload
-	}
 	start := time.Now()
 	waiting := false
+	if ents, err := os.ReadDir(to); err != nil || len(ents) > 0 {
+		if err == nil && w.uid != "" && modelcache.ReadPlan(cache, w.uid) == modelcache.PlanWait {
+			// Restarted while the agent streams into the volume: what
+			// is there is the stream's, and the stream goes on.
+			waiting = true
+			fmt.Println("nvsnap: model cache: restarted while another node's copy streams in; still waiting for it")
+		} else {
+			// A restarted init finds what its last run downloaded; the
+			// download knows how to go on from it.
+			fmt.Println("nvsnap: model cache: the volume already has content; the download goes on from it")
+			return mustDownload
+		}
+	}
 	for {
 		plan := ""
 		if w.uid != "" {
@@ -237,6 +248,33 @@ func treesOf(paths []string, max int) string {
 		fmt.Fprintf(&b, "%s:%s;", p, modelcache.Fingerprint(ents))
 	}
 	return b.String()
+}
+
+// writeSignal replaces the signal file whole (a temporary file renamed
+// over it), so the agent reads the old value or the new, never part.
+func writeSignal(dir, content string) {
+	p := filepath.Join(dir, modelcache.SignalFile)
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content+"\n"), 0o644); err == nil {
+		err = os.Rename(tmp, p)
+		if err == nil {
+			return
+		}
+	}
+	fmt.Println("nvsnap: model cache: cannot signal the agent")
+}
+
+// waitStreamStopped waits, at most max, until the agent's stream into the
+// volume has stopped: its heartbeat is gone or stale.
+func waitStreamStopped(cache, uid string, stale, max, poll time.Duration) {
+	if uid == "" {
+		return
+	}
+	hb := filepath.Join(cache, modelcache.StreamingFileOf(uid))
+	deadline := time.Now().Add(max)
+	for heartbeatFresh(hb, stale) && time.Now().Before(deadline) {
+		time.Sleep(poll)
+	}
 }
 
 func hasCopy(cache string) bool {

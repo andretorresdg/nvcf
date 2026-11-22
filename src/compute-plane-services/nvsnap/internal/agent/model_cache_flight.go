@@ -19,6 +19,11 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -695,12 +701,17 @@ func (h *httpLiveClient) base(ctx context.Context) (string, error) {
 }
 
 func (h *httpLiveClient) View(ctx context.Context) (liveView, error) {
+	ctx, span := tracing.Tracer().Start(ctx, "model_cache.live_view")
+	defer span.End()
+	span.SetAttributes(attribute.String("nvsnap.model_cache.key", h.key), attribute.String("nvsnap.peer", h.node))
 	var v liveView
 	b, err := h.base(ctx)
 	if err == nil {
 		err = h.c.getJSON(ctx, b, &v)
 	}
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		// A source that is gone is a failed one, after a few polls.
 		if h.fails++; h.fails >= 5 {
 			return liveView{State: liveFailed}, nil
@@ -712,21 +723,42 @@ func (h *httpLiveClient) View(ctx context.Context) (liveView, error) {
 }
 
 func (h *httpLiveClient) Open(ctx context.Context, rel string) (io.ReadCloser, error) {
+	ctx, span := tracing.Tracer().Start(ctx, "model_cache.live_file")
+	span.SetAttributes(attribute.String("nvsnap.model_cache.key", h.key), attribute.String("nvsnap.peer", h.node))
+	fail := func(err error) (io.ReadCloser, error) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.End()
+		return nil, err
+	}
 	b, err := h.base(ctx)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b+"/file?path="+url.QueryEscape(rel), nil)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	resp, err := h.c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("source answered %s for %s", resp.Status, rel)
+		return fail(fmt.Errorf("source answered %s for %s", resp.Status, rel))
 	}
-	return resp.Body, nil
+	// The span covers the transfer: it ends when the body is closed.
+	return spanBody{ReadCloser: resp.Body, end: span.End}, nil
+}
+
+type spanBody struct {
+	io.ReadCloser
+	end func(...trace.SpanEndOption)
+}
+
+func (b spanBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.end()
+	return err
 }

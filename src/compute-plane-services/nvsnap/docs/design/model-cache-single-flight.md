@@ -31,7 +31,9 @@ Status: built, behind `agent.nodeModelCache.singleFlight` (default off). Design 
 
 The node cache serves a model only once some node holds a complete copy. When an instance's pods start together on
 nodes that have none, every pod runs the download. A 4-pod instance of a 1.56 TB model pulls 6.2 TB from the
-registry, 30 minutes per pod at about 870 MB/s, where one pull would do: 4 times the egress, the registry's rate
+registry, where one pull would do. Measured in November 2026 on a 4-pod GB300 instance (nvsnap with the node cache,
+node-model-cache.md section 1): each pod's download init ran 30 to 32 minutes by its start and end times, about
+870 MB/s: 4 times the egress, the registry's rate
 limits shared 4 ways, and 4 times the chance one pod's download fails.
 
 Only a pod's own download init can download: it holds the tenant's registry credentials, and the agent must not.
@@ -182,7 +184,8 @@ streaming. The harvest afterwards reserves as today.
 
 ## 4. Timeline
 
-The 4-pod, 1.56 TB example, all on nodes with no copy:
+Estimates for the 4-pod, 1.56 TB example, all on nodes with no copy, from the measured download times above; not
+measured with single flight:
 
 | | Today | Single flight |
 |---|---|---|

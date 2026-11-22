@@ -286,7 +286,7 @@ func heartbeat(t *testing.T, cache, name string) (stop func()) {
 }
 
 func planArgs(cache, to string, extra ...string) []string {
-	a := append([]string{"--cache", cache, "--to", to, "--plan-wait", "1", "--poll", "100ms", "--stale", "1"}, extra...)
+	a := append([]string{"--cache", cache, "--to", to, "--plan-wait", "1", "--poll", "100ms", "--stale", "1", "--stop-wait", "3"}, extra...)
 	return append(append(a, "--"), download(to)...)
 }
 
@@ -567,5 +567,62 @@ func TestModelCacheSignalsDownloadingBeforeItDownloads(t *testing.T) {
 	}
 	if got := strings.TrimSpace(read(t, filepath.Join(to, "seen"))); got != modelcache.SignalDownloading {
 		t.Fatalf("signal during the download = %q, want %q", got, modelcache.SignalDownloading)
+	}
+}
+
+// An init restarted while the agent streams into its volume finds files in
+// it: with a wait plan it keeps waiting for the stream, rather than run a
+// download over the streamed files.
+func TestModelCacheRestartedWaitingInitKeepsWaiting(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(to, "partial.bin"), []byte("streamed so far"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	writePlan(t, cache, modelcache.PlanWait)
+	go func() {
+		time.Sleep(time.Second)
+		_ = os.WriteFile(filepath.Join(to, "weights.bin"), []byte("streamed"), 0o644)
+		_ = os.Remove(filepath.Join(to, "partial.bin"))
+		atomicWrite(t, cache, modelcache.DoneFile(testUID), "")
+	}()
+	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30")); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if got := read(t, filepath.Join(to, "weights.bin")); got != "streamed" {
+		t.Fatalf("weights.bin = %q; want the stream's, not a download's", got)
+	}
+}
+
+// A helper that gives up on a live stream says so, then waits for the
+// agent to stop writing before it empties the volume.
+func TestModelCacheGivingUpWaitsForTheStreamToStop(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	writePlan(t, cache, modelcache.PlanWait)
+	var stoppedAt time.Time
+	go func() {
+		// The agent sees the signal and stops; meanwhile it still writes.
+		for i := 0; i < 100; i++ {
+			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && strings.TrimSpace(string(b)) == modelcache.SignalDownloading {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		_ = os.WriteFile(filepath.Join(to, "late.bin"), []byte("in flight"), 0o644)
+		time.Sleep(time.Second)
+		stoppedAt = time.Now()
+		stop()
+	}()
+	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "1", "--final-wait", "0", "--signal", sig)); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if stoppedAt.IsZero() {
+		t.Fatal("the helper downloaded before the stream stopped")
+	}
+	if _, err := os.Stat(filepath.Join(to, "late.bin")); !os.IsNotExist(err) {
+		t.Fatal("a file the stream wrote before stopping is left in the volume")
 	}
 }

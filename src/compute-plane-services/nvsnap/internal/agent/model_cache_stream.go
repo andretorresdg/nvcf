@@ -35,11 +35,21 @@ import (
 // streamTiming: settle is how long a file's size, mtime and change time
 // must hold before it is copied (or hashed); poll is how often a streamer
 // looks at its source; stall is how long a source may show no progress.
+// idle bounds how long one file's copy may receive nothing before it is
+// given up (0: a minute): a source that stops sending mid-file would
+// otherwise hold the stream past its stall check.
 type streamTiming struct {
-	settle, poll, stall time.Duration
+	settle, poll, stall, idle time.Duration
 }
 
-var defaultStreamTiming = streamTiming{settle: 10 * time.Second, poll: 2 * time.Second, stall: 5 * time.Minute}
+var defaultStreamTiming = streamTiming{settle: 10 * time.Second, poll: 2 * time.Second, stall: 5 * time.Minute, idle: time.Minute}
+
+func (t streamTiming) idleBound() time.Duration {
+	if t.idle <= 0 {
+		return time.Minute
+	}
+	return t.idle
+}
 
 const (
 	liveDownloading = "downloading"
@@ -85,7 +95,8 @@ type liveSource struct {
 	hashing map[string]bool
 	final   *modelcache.Manifest
 	finalAt map[string]modelcache.LiveEntry // file -> its stat in the final manifest
-	sem     chan struct{}
+	queue   chan modelcache.LiveEntry       // settled files to hash, bounded
+	workers sync.Once
 }
 
 type observed struct {
@@ -100,7 +111,7 @@ type hashed struct {
 
 func newLiveSource(root, uid string, tm streamTiming) *liveSource {
 	return &liveSource{root: root, uid: uid, timing: tm, state: liveDownloading,
-		seen: map[string]observed{}, hashes: map[string]hashed{}, hashing: map[string]bool{}, sem: make(chan struct{}, 2)}
+		seen: map[string]observed{}, hashes: map[string]hashed{}, hashing: map[string]bool{}, queue: make(chan modelcache.LiveEntry, 64)}
 }
 
 // view scans the volume and returns what it serves. Files that settled are
@@ -136,23 +147,33 @@ func (s *liveSource) view() liveView {
 			continue
 		}
 		if now.Sub(o.since) >= s.timing.settle && modelcache.Filled(*e) && !s.hashing[e.Path] {
-			s.hashing[e.Path] = true
-			go s.hash(*e)
+			s.workers.Do(func() {
+				for i := 0; i < 2; i++ {
+					go s.hashWorker()
+				}
+			})
+			select {
+			case s.queue <- *e:
+				s.hashing[e.Path] = true
+			default:
+				// Full: the next poll queues it.
+			}
 		}
 	}
 	v.Entries = ents
 	return v
 }
 
-func (s *liveSource) hash(e modelcache.LiveEntry) {
-	s.sem <- struct{}{}
-	defer func() { <-s.sem }()
-	sum, err := s.hashNow(e)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.hashing, e.Path)
-	if err == nil {
-		s.hashes[e.Path] = hashed{e: e, sum: sum}
+// hashWorker hashes queued files; two run per source, for its lifetime.
+func (s *liveSource) hashWorker() {
+	for e := range s.queue {
+		sum, err := s.hashNow(e)
+		s.mu.Lock()
+		delete(s.hashing, e.Path)
+		if err == nil {
+			s.hashes[e.Path] = hashed{e: e, sum: sum}
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -287,9 +308,10 @@ func (s *liveSource) fail() {
 }
 
 // open serves a file of the volume. Once done, only a file of the final
-// manifest, and only while it is still the file manifested: the engine
-// that then runs on the volume may write it, and nothing it writes is
-// served.
+// manifest that is still, when opened, the file manifested: the engine
+// that then runs on the volume may write it. A write after the open can
+// still reach the reader; a streamer checks every file it copies at the
+// end against the manifest's sha256, so such bytes are never kept.
 func (s *liveSource) open(_ context.Context, rel string) (io.ReadCloser, error) {
 	s.mu.Lock()
 	state, at := s.state, s.finalAt
@@ -513,6 +535,14 @@ func (s *streamer) copyAll(ctx context.Context, root *os.Root, todo []modelcache
 		go func() {
 			defer wg.Done()
 			for e := range work {
+				if s.mayWrite != nil && !s.mayWrite() {
+					mu.Lock()
+					if first == nil {
+						first = errHelperDownloads
+					}
+					mu.Unlock()
+					continue
+				}
 				sum, err := s.copyOne(ctx, root, e)
 				if err == nil && exact && sum != e.SHA256 {
 					err = fmt.Errorf("%w: %s", modelcache.ErrCorrupt, e.Path)
@@ -540,11 +570,16 @@ func (s *streamer) copyAll(ctx context.Context, root *os.Root, todo []modelcache
 }
 
 func (s *streamer) copyOne(ctx context.Context, root *os.Root, e modelcache.LiveEntry) (string, error) {
-	r, err := s.client.Open(ctx, e.Path)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	idle := time.AfterFunc(s.timing.idleBound(), cancel)
+	defer idle.Stop()
+	rc, err := s.client.Open(ctx, e.Path)
 	if err != nil {
 		return "", err
 	}
-	defer r.Close()
+	defer rc.Close()
+	r := idleReader{r: rc, t: idle, d: s.timing.idleBound()}
 	dir := path.Dir(e.Path)
 	if err := root.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -575,6 +610,22 @@ func (s *streamer) copyOne(ctx context.Context, root *os.Root, e modelcache.Live
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// idleReader pushes its timer back on every read that returns bytes: the
+// copy is cancelled only after d with nothing received.
+type idleReader struct {
+	r io.Reader
+	t *time.Timer
+	d time.Duration
+}
+
+func (i idleReader) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	if n > 0 {
+		i.t.Reset(i.d)
+	}
+	return n, err
 }
 
 func randHex() string {
@@ -629,7 +680,10 @@ func (s *streamer) finish(ctx context.Context, root *os.Root, m modelcache.Manif
 		if c, ok := s.have[e.Path]; ok && c.sum == e.SHA256 {
 			continue
 		}
-		if from, ok := bySum[e.SHA256]; ok {
+		// Move a held copy only if it still has that digest and nothing
+		// held is in the way; otherwise copy it, checked.
+		_, inTheWay := s.have[e.Path]
+		if from, ok := bySum[e.SHA256]; ok && !inTheWay && s.have[from].sum == e.SHA256 && s.intact(from, s.have[from]) {
 			if root.Rename(from, e.Path) == nil {
 				delete(bySum, e.SHA256)
 				c := s.have[from]
@@ -672,21 +726,25 @@ func (s *streamer) finish(ctx context.Context, root *os.Root, m modelcache.Manif
 			return err
 		}
 	}
-	return applyMetaRoot(root, m)
+	return applyMetaRoot(root, s.dst, m)
 }
 
 // applyMetaRoot gives every entry of m, and the volume, its recorded owner,
 // mode and mtime, as a seed does, through root: the agent runs as root on
 // the host, and a path swapped for a symlink under it must not lead a
 // chown or chmod outside the volume.
-func applyMetaRoot(root *os.Root, m modelcache.Manifest) error {
+func applyMetaRoot(root *os.Root, dst string, m modelcache.Manifest) error {
 	for i := len(m.Entries) - 1; i >= 0; i-- {
 		e := m.Entries[i]
 		if err := root.Lchown(e.Path, e.UID, e.GID); err != nil {
 			return err
 		}
 		if e.Type == modelcache.TypeSymlink {
-			continue // no mode, and its time is not followed
+			// No mode; its own time, never its target's.
+			if err := modelcache.LutimesBeneath(dst, e.Path, e.Mtime); err != nil {
+				return err
+			}
+			continue
 		}
 		if err := root.Chmod(e.Path, os.FileMode(e.Mode&0o777)|specialBits(e.Mode)); err != nil {
 			return err

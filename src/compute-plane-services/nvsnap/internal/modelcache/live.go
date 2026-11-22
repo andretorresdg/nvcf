@@ -134,6 +134,31 @@ func OpenBeneath(root, rel string) (*os.File, unix.Stat_t, error) {
 	return os.NewFile(uintptr(fd), rel), st, nil
 }
 
+// LutimesBeneath sets the mtime (and atime) of rel under root without
+// following a symlink anywhere: not the entry itself, which may be one,
+// nor any directory on the way.
+func LutimesBeneath(root, rel string, mtime int64) error {
+	if !validRel(rel) {
+		return fmt.Errorf("%w: path %q", ErrUnsupported, rel)
+	}
+	dirfd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { unix.Close(dirfd) }()
+	parts := strings.Split(rel, "/")
+	for _, p := range parts[:len(parts)-1] {
+		next, err := unix.Openat(dirfd, p, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		unix.Close(dirfd)
+		dirfd = next
+	}
+	ts := []unix.Timespec{unix.NsecToTimespec(mtime), unix.NsecToTimespec(mtime)}
+	return unix.UtimesNanoAt(dirfd, parts[len(parts)-1], ts, unix.AT_SYMLINK_NOFOLLOW)
+}
+
 // HashOpen hashes the open file f from its start, whose status was st, and
 // checks it did not change while it was read (size, mtime, change time).
 func HashOpen(f *os.File, st unix.Stat_t) (string, error) {
