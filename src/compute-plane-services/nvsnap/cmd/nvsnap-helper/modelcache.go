@@ -59,10 +59,11 @@ func modelCacheCmd(args []string) (int, error) {
 	case streamStopped:
 		// The agent wrote part of a tree. Say the pod downloads, wait for
 		// the agent to stop writing, then start afresh in an empty volume.
-		if *signal != "" {
-			writeSignal(*signal, modelcache.SignalDownloading)
+		// Until the stream has stopped, the volume is left as it is: a
+		// download over a copy still being written would mix the two.
+		if !stopStream(*signal, *cache, w.uid, w.stale, time.Duration(*stopWait)*time.Second, w.poll) {
+			return 1, errors.New("model-cache: the agent still writes into the volume after --stop-wait; the volume is left as it is, and the init's restart looks again")
 		}
-		waitStreamStopped(*cache, w.uid, w.stale, time.Duration(*stopWait)*time.Second, w.poll)
 		emptyDir(*to)
 	}
 	fmt.Println("nvsnap: model cache: downloading")
@@ -207,6 +208,12 @@ func seedFromCache(cache, to string, w waitRules) outcome {
 				fmt.Printf("nvsnap: model cache: no copy after %s; downloading\n", w.maxWait)
 				return streamStopped
 			}
+		case waiting:
+			// The wait plan is gone (the agent restarted, or ended this
+			// pod's flight) while the agent may have written into the
+			// volume: stop its stream and empty the volume first.
+			fmt.Println("nvsnap: model cache: no plan any more; downloading")
+			return streamStopped
 		case w.uid != "" && time.Since(start) < w.planWait && !hasCopy(cache):
 			// The agent has not planned this pod yet. A node with a copy
 			// gets no plan: the default rule seeds from it at once.
@@ -251,30 +258,46 @@ func treesOf(paths []string, max int) string {
 }
 
 // writeSignal replaces the signal file whole (a temporary file renamed
-// over it), so the agent reads the old value or the new, never part.
-func writeSignal(dir, content string) {
+// over it), so the agent reads the old value or the new, never part. It
+// reports whether the signal was written.
+func writeSignal(dir, content string) bool {
 	p := filepath.Join(dir, modelcache.SignalFile)
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, []byte(content+"\n"), 0o644); err == nil {
 		err = os.Rename(tmp, p)
 		if err == nil {
-			return
+			return true
 		}
 	}
 	fmt.Println("nvsnap: model cache: cannot signal the agent")
+	return false
 }
 
-// waitStreamStopped waits, at most max, until the agent's stream into the
-// volume has stopped: its heartbeat is gone or stale.
-func waitStreamStopped(cache, uid string, stale, max, poll time.Duration) {
+// stopStream tells the agent the pod downloads (when there is a signal
+// volume) and waits, at most max, until the agent's stream into the volume
+// has stopped: its heartbeat is gone or stale. The agent stops its
+// heartbeat only once its last write has returned, so a stale heartbeat
+// means nothing writes the volume any more. A signal that could not be
+// written is written again on every poll. It reports whether the stream
+// stopped; false leaves the volume to the agent.
+func stopStream(signal, cache, uid string, stale, max, poll time.Duration) bool {
+	signalled := signal == "" || writeSignal(signal, modelcache.SignalDownloading)
 	if uid == "" {
-		return
+		return true
 	}
 	hb := filepath.Join(cache, modelcache.StreamingFileOf(uid))
 	deadline := time.Now().Add(max)
-	for heartbeatFresh(hb, stale) && time.Now().Before(deadline) {
+	for heartbeatFresh(hb, stale) {
+		if !time.Now().Before(deadline) {
+			fmt.Printf("nvsnap: model cache: the agent's stream into the volume did not stop within %s\n", max)
+			return false
+		}
 		time.Sleep(poll)
+		if !signalled {
+			signalled = writeSignal(signal, modelcache.SignalDownloading)
+		}
 	}
+	return true
 }
 
 func hasCopy(cache string) bool {

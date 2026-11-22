@@ -89,6 +89,13 @@ The agent writes each pod's plan into the key's directory, which the init mounts
 A `wait` plan can change to `download` (the holder failed, 5). The agent first stops writing the pod's volume and
 empties it, then writes the plan. The helper downloads into an empty volume.
 
+A helper that gives up on a stream (`--max-wait`, a stale heartbeat, or a `wait` plan that went away) writes
+`downloading` to the signal volume, and writes it again on every poll until it lands. It then waits, at most
+`--stop-wait` (600 s), for `.streaming-<pod uid>` to go stale. The agent stops that heartbeat only after its last write
+has returned. Only then does the helper empty the volume and download. If the heartbeat is still fresh after
+`--stop-wait` (a long file still copying), the helper exits with an error and leaves the volume as it is. The init's
+restart finds the plan and the volume and looks again.
+
 A helper that gave up waiting for a plan writes `downloading` to the signal volume before its download writes
 anything. The agent writes no plan for such a pod, nor for a pod whose volume is not empty, and a stream already
 running checks the signal before each pass of writes and stops. It never writes into a volume a download writes.

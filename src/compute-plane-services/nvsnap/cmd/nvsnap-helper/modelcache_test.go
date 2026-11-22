@@ -243,14 +243,21 @@ func TestModelCacheDoesNotReportADownloadThatWroteAnotherVolume(t *testing.T) {
 
 const testUID = "6f1c2c1e-1d2b-4c47-9a0e-2b3f4c5d6e7f"
 
-// atomicWrite writes name in dir by a rename, as the agent does.
-func atomicWrite(t *testing.T, dir, name, content string) {
-	t.Helper()
+// publish writes name in dir by a rename, as the agent does. It returns
+// its error: the fake agents run it off the test goroutine, where
+// t.Fatal must not be called.
+func publish(dir, name, content string) error {
 	p := filepath.Join(dir, name)
 	if err := os.WriteFile(p+".tmp", []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+		return err
 	}
-	if err := os.Rename(p+".tmp", p); err != nil {
+	return os.Rename(p+".tmp", p)
+}
+
+// atomicWrite is publish on the test goroutine.
+func atomicWrite(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := publish(dir, name, content); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -258,6 +265,37 @@ func atomicWrite(t *testing.T, dir, name, content string) {
 func writePlan(t *testing.T, cache, plan string) {
 	t.Helper()
 	atomicWrite(t, cache, modelcache.PlanFile(testUID), plan+"\n")
+}
+
+// fakeAgent runs an agent's part beside the helper. A step that fails
+// stops the agent's heartbeat (when there is one), which ends any wait of
+// the helper's, and is reported by check, on the test goroutine.
+type fakeAgent struct {
+	errc   chan error
+	stopHB func()
+}
+
+func newFakeAgent(stopHB func()) *fakeAgent {
+	return &fakeAgent{errc: make(chan error, 8), stopHB: stopHB}
+}
+
+func (a *fakeAgent) fail(err error) {
+	if err == nil {
+		return
+	}
+	a.errc <- err
+	if a.stopHB != nil {
+		a.stopHB()
+	}
+}
+
+func (a *fakeAgent) check(t *testing.T) {
+	t.Helper()
+	select {
+	case err := <-a.errc:
+		t.Fatalf("the fake agent failed: %v", err)
+	default:
+	}
 }
 
 // heartbeat keeps cache/name fresh until the test ends or stop is called.
@@ -315,6 +353,7 @@ func TestModelCacheDownloadPlanHoldsTheExitUntilTheFinalManifest(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
 	writePlan(t, cache, modelcache.PlanDownload)
+	agent := newFakeAgent(nil) // a failure ends the hold at --final-wait
 	go func() {
 		// The agent waits for the helper's signal, then reads the tree.
 		for i := 0; i < 100; i++ {
@@ -326,12 +365,15 @@ func TestModelCacheDownloadPlanHoldsTheExitUntilTheFinalManifest(t *testing.T) {
 		time.Sleep(time.Second)
 		ents, err := modelcache.Scan(to, 0)
 		if err != nil {
+			agent.fail(err)
 			return
 		}
-		atomicWrite(t, cache, modelcache.FinalFile(testUID), modelcache.Fingerprint(ents)+"\n")
+		agent.fail(publish(cache, modelcache.FinalFile(testUID), modelcache.Fingerprint(ents)+"\n"))
 	}()
 	start := time.Now()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--final-wait", "30", "--signal", sig)); code != 0 || err != nil {
+	code, err := modelCacheCmd(planArgs(cache, to, "--final-wait", "30", "--signal", sig))
+	agent.check(t)
+	if code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
 	if d := time.Since(start); d < time.Second || d > 6*time.Second {
@@ -394,14 +436,19 @@ func TestModelCacheDownloadPlanDoesNotHoldAFailedDownload(t *testing.T) {
 func TestModelCacheWaitPlanEndsWhenTheAgentFilledTheVolume(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
-	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	agent := newFakeAgent(heartbeat(t, cache, modelcache.StreamingFileOf(testUID)))
 	writePlan(t, cache, modelcache.PlanWait)
 	go func() {
 		time.Sleep(2500 * time.Millisecond)
-		_ = os.WriteFile(filepath.Join(to, "weights.bin"), []byte("streamed"), 0o644)
-		atomicWrite(t, cache, modelcache.DoneFile(testUID), "")
+		if err := os.WriteFile(filepath.Join(to, "weights.bin"), []byte("streamed"), 0o644); err != nil {
+			agent.fail(err)
+			return
+		}
+		agent.fail(publish(cache, modelcache.DoneFile(testUID), ""))
 	}()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--wait", "1")); code != 0 || err != nil {
+	code, err := modelCacheCmd(planArgs(cache, to, "--wait", "1", "--max-wait", "30"))
+	agent.check(t)
+	if code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
 	if got := read(t, filepath.Join(to, "weights.bin")); got != "streamed" {
@@ -415,14 +462,20 @@ func TestModelCacheWaitPlanEndsWhenTheAgentFilledTheVolume(t *testing.T) {
 func TestModelCacheWaitPlanFlippedToDownloadDownloads(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
-	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	agent := newFakeAgent(stop)
 	writePlan(t, cache, modelcache.PlanWait)
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		writePlan(t, cache, modelcache.PlanDownload)
+		// The agent took the download over: it wrote the plan, then its
+		// stream ended.
+		agent.fail(publish(cache, modelcache.PlanFile(testUID), modelcache.PlanDownload+"\n"))
+		stop()
 	}()
 	start := time.Now()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30", "--final-wait", "0")); code != 0 || err != nil {
+	code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30", "--final-wait", "0"))
+	agent.check(t)
+	if code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
 	if d := time.Since(start); d < time.Second || d > 6*time.Second {
@@ -493,11 +546,21 @@ func TestModelCacheNoPlanDownloadsAfterThePlanWait(t *testing.T) {
 
 func TestModelCacheWaitPlanIsCappedByMaxWait(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
-	cache, to := t.TempDir(), t.TempDir()
-	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanWait)
+	go func() {
+		// The stream stops once the helper says the pod downloads.
+		for i := 0; i < 200; i++ {
+			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && strings.TrimSpace(string(b)) == modelcache.SignalDownloading {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		stop()
+	}()
 	start := time.Now()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "2", "--final-wait", "0")); code != 0 || err != nil {
+	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "2", "--final-wait", "0", "--signal", sig)); code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
 	if d := time.Since(start); d > 6*time.Second {
@@ -579,15 +642,23 @@ func TestModelCacheRestartedWaitingInitKeepsWaiting(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(to, "partial.bin"), []byte("streamed so far"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	agent := newFakeAgent(heartbeat(t, cache, modelcache.StreamingFileOf(testUID)))
 	writePlan(t, cache, modelcache.PlanWait)
 	go func() {
 		time.Sleep(time.Second)
-		_ = os.WriteFile(filepath.Join(to, "weights.bin"), []byte("streamed"), 0o644)
-		_ = os.Remove(filepath.Join(to, "partial.bin"))
-		atomicWrite(t, cache, modelcache.DoneFile(testUID), "")
+		if err := os.WriteFile(filepath.Join(to, "weights.bin"), []byte("streamed"), 0o644); err != nil {
+			agent.fail(err)
+			return
+		}
+		if err := os.Remove(filepath.Join(to, "partial.bin")); err != nil {
+			agent.fail(err)
+			return
+		}
+		agent.fail(publish(cache, modelcache.DoneFile(testUID), ""))
 	}()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30")); code != 0 || err != nil {
+	code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30"))
+	agent.check(t)
+	if code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
 	if got := read(t, filepath.Join(to, "weights.bin")); got != "streamed" {
@@ -602,8 +673,11 @@ func TestModelCacheGivingUpWaitsForTheStreamToStop(t *testing.T) {
 	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
 	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanWait)
+	agent := newFakeAgent(stop)
 	var stoppedAt time.Time
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped) // after stoppedAt is set: the read below is ordered after it
 		// The agent sees the signal and stops; meanwhile it still writes.
 		for i := 0; i < 100; i++ {
 			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && strings.TrimSpace(string(b)) == modelcache.SignalDownloading {
@@ -611,18 +685,136 @@ func TestModelCacheGivingUpWaitsForTheStreamToStop(t *testing.T) {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		_ = os.WriteFile(filepath.Join(to, "late.bin"), []byte("in flight"), 0o644)
+		if err := os.WriteFile(filepath.Join(to, "late.bin"), []byte("in flight"), 0o644); err != nil {
+			agent.fail(err)
+			return
+		}
 		time.Sleep(time.Second)
 		stoppedAt = time.Now()
 		stop()
 	}()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "1", "--final-wait", "0", "--signal", sig)); code != 0 || err != nil {
+	code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "1", "--final-wait", "0", "--signal", sig))
+	returned := time.Now()
+	agent.check(t)
+	if code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
-	if stoppedAt.IsZero() {
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fake agent never stopped")
+	}
+	if stoppedAt.IsZero() || stoppedAt.After(returned) {
 		t.Fatal("the helper downloaded before the stream stopped")
 	}
 	if _, err := os.Stat(filepath.Join(to, "late.bin")); !os.IsNotExist(err) {
 		t.Fatal("a file the stream wrote before stopping is left in the volume")
+	}
+}
+
+// A wait plan that goes away (the agent restarted, or ended the pod's
+// flight) while the agent streamed into the volume: the helper stops the
+// stream and empties the volume before it downloads, as when a stream
+// stops.
+func TestModelCacheWaitPlanThatGoesAwayStopsTheStreamFirst(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	writePlan(t, cache, modelcache.PlanWait)
+	agent := newFakeAgent(stop)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		if err := os.WriteFile(filepath.Join(to, "partial.bin"), []byte("streamed so far"), 0o644); err != nil {
+			agent.fail(err)
+			return
+		}
+		if err := os.Remove(filepath.Join(cache, modelcache.PlanFile(testUID))); err != nil {
+			agent.fail(err)
+			return
+		}
+		// The stream stops once it reads the signal.
+		for i := 0; i < 200; i++ {
+			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && strings.TrimSpace(string(b)) == modelcache.SignalDownloading {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		stop()
+	}()
+	code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30", "--final-wait", "0", "--signal", sig))
+	agent.check(t)
+	if code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if _, err := os.Stat(filepath.Join(to, "partial.bin")); !os.IsNotExist(err) {
+		t.Fatal("the download ran over the stream's files")
+	}
+	if got := read(t, filepath.Join(to, "weights.bin")); got != "downloaded\n" {
+		t.Fatalf("weights.bin = %q", got)
+	}
+}
+
+// A stream that does not stop within --stop-wait (a long file mid-copy):
+// the helper neither empties the volume nor downloads into it. It fails,
+// and the init's restart looks again.
+func TestModelCacheLeavesTheVolumeToAStreamThatHasNotStopped(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
+	heartbeat(t, cache, modelcache.StreamingFileOf(testUID)) // never stops
+	writePlan(t, cache, modelcache.PlanWait)
+	if err := os.WriteFile(filepath.Join(to, "partial.bin"), []byte("streamed so far"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	code, err := modelCacheCmd(append([]string{"--cache", cache, "--to", to, "--plan-wait", "1", "--poll", "100ms", "--stale", "1",
+		"--max-wait", "1", "--stop-wait", "1", "--final-wait", "0", "--signal", sig, "--"}, download(to)...))
+	if code == 0 || err == nil {
+		t.Fatalf("code %d err %v; want a failure", code, err)
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("returned after %v", d)
+	}
+	if got := read(t, filepath.Join(to, "partial.bin")); got != "streamed so far" {
+		t.Fatalf("partial.bin = %q; the volume was changed under the stream", got)
+	}
+	if _, err := os.Stat(filepath.Join(to, "weights.bin")); !os.IsNotExist(err) {
+		t.Fatal("the download ran while the stream still wrote")
+	}
+}
+
+// A signal the helper could not write is written again while it waits:
+// otherwise the agent never learns the pod downloads, and never stops.
+func TestModelCacheWritesTheSignalAgainUntilItLands(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to := t.TempDir(), t.TempDir()
+	sig := filepath.Join(t.TempDir(), "not-yet") // unwritable until it exists
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
+	writePlan(t, cache, modelcache.PlanWait)
+	agent := newFakeAgent(stop)
+	saw := make(chan struct{})
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		if err := os.Mkdir(sig, 0o755); err != nil {
+			agent.fail(err)
+			return
+		}
+		for i := 0; i < 200; i++ {
+			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && strings.TrimSpace(string(b)) == modelcache.SignalDownloading {
+				close(saw)
+				stop()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "1", "--final-wait", "0", "--signal", sig, "--stop-wait", "20"))
+	agent.check(t)
+	if code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	select {
+	case <-saw:
+	default:
+		t.Fatal("the agent never read the signal")
 	}
 }
