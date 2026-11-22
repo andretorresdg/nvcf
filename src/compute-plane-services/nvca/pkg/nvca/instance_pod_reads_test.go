@@ -1643,6 +1643,13 @@ func TestInstancePodLiveReads(t *testing.T) {
 	t.Run("an instance seen for the first time is not due", func(t *testing.T) {
 		var r instancePodLiveReads
 		assert.False(t, r.refreshDue("0-sr-a", start))
+		assert.False(t, r.refreshDue("1-sr-b", start.Add(instancePodLiveReadRetention-time.Nanosecond)),
+			"the instances there are at agent start are not all read live at once")
+	})
+	t.Run("an instance seen for the first time once the tracker is in use is due", func(t *testing.T) {
+		var r instancePodLiveReads
+		r.refreshDue("0-sr-a", start)
+		assert.True(t, r.refreshDue("1-sr-b", start.Add(instancePodLiveReadRetention)))
 	})
 	t.Run("an instance is due once its refresh slot passes, and a live read resets it", func(t *testing.T) {
 		var r instancePodLiveReads
@@ -1665,7 +1672,9 @@ func TestInstancePodLiveReads(t *testing.T) {
 		assert.True(t, r.refreshDue("0-sr-a", revisit))
 	})
 	t.Run("the time without a live read stays under a window plus the time between visits", func(t *testing.T) {
-		for _, every := range []time.Duration{podReadsPassInterval, time.Minute, 110 * time.Second, 3 * time.Minute} {
+		for _, every := range []time.Duration{
+			podReadsPassInterval, time.Minute, 110 * time.Second, 3 * time.Minute, instancePodLiveReadRetention + time.Minute,
+		} {
 			var r instancePodLiveReads
 			r.recordLive("0-sr-a", start)
 			last := start
@@ -1678,14 +1687,14 @@ func TestInstancePodLiveReads(t *testing.T) {
 			}
 		}
 	})
-	t.Run("an instance forgotten before each visit is never due", func(t *testing.T) {
+	t.Run("an instance forgotten before each visit is due on each visit", func(t *testing.T) {
 		var r instancePodLiveReads
 		r.recordLive("0-sr-a", start)
 		// Each visit comes more than the retention after the last and prunes the instance before
-		// looking it up, so it starts a new window every time.
+		// looking it up, as when the status loop runs its passes that far apart.
 		for visit := 1; visit <= 10; visit++ {
 			now := start.Add(time.Duration(visit) * (instancePodLiveReadRetention + time.Minute))
-			assert.False(t, r.refreshDue("0-sr-a", now), "visit %d", visit)
+			assert.True(t, r.refreshDue("0-sr-a", now), "visit %d", visit)
 		}
 	})
 	t.Run("instances not seen for the retention are forgotten", func(t *testing.T) {

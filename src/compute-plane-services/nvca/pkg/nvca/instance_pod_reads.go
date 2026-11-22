@@ -44,20 +44,16 @@ import (
 const (
 	// instancePodRefreshWindow is how often the instance status loop reads a Pod instance live that it
 	// otherwise serves from the informer cache: once in each window, on its first visit after the
-	// instance's refresh slot. While the loop revisits the instance within
-	// instancePodLiveReadRetention, that bounds how long a watch that stalls without an error can hide
-	// a change to less than one window plus the time between visits, whether or not periodic instance
+	// instance's refresh slot. That bounds how long a watch that stalls without an error can hide a
+	// change to less than one window plus the time between visits, whether or not periodic instance
 	// status reporting is enabled.
 	instancePodRefreshWindow = 2 * time.Minute
 	// instancePodLiveReadRetention is how long the refresh tracker remembers an instance the status
 	// loop has stopped visiting. An instance revisited within it keeps its last live read and is
 	// refreshed on that visit when a refresh slot has passed since then. An instance not visited for
-	// that long, as when the loop pauses or its passes run that far apart, can be forgotten, and then
-	// starts a new window on its next visit, so an instance the loop keeps revisiting less often than
-	// the retention can go without a refresh for as long as that lasts. Its periodic instance status
-	// report still reads it live when due, but with periodic reporting disabled a watch that stalls
-	// without an error can hide a change to it until the loop revisits it within the retention again
-	// after a refresh slot.
+	// that long, as when the loop pauses or its passes run that far apart, can be forgotten, and is
+	// then refreshed on its next visit, as it would be if it were remembered: a refresh slot has
+	// passed since its last live read.
 	instancePodLiveReadRetention = 3 * instancePodRefreshWindow
 )
 
@@ -320,6 +316,9 @@ type instancePodLiveReads struct {
 	mu        sync.Mutex
 	instances map[string]*instancePodLiveRead
 	lastPrune time.Time
+	// firstUse is when the tracker was first used, which right after agent start follows the
+	// informer's initial list.
+	firstUse time.Time
 }
 
 type instancePodLiveRead struct {
@@ -329,10 +328,12 @@ type instancePodLiveRead struct {
 }
 
 // refreshDue reports whether the instance, served from the cache at now, is due a live read
-// because a refresh slot has passed since its last live read. The window of an instance seen for
-// the first time starts at now, which right after agent start follows the informer's initial list.
-// An instance forgotten after not being seen for instancePodLiveReadRetention counts as seen for
-// the first time.
+// because a refresh slot has passed since its last live read. An instance seen for the first time
+// within instancePodLiveReadRetention of the tracker's first use, as the instances there are at
+// agent start, starts its window at now, so that they are not all read live at once right after the
+// informer listed their Pods. An instance seen for the first time later is due at once: it is new,
+// and read live anyway before its state is first reported, or it was forgotten after not being seen
+// for instancePodLiveReadRetention, and a refresh slot has passed since its last live read.
 func (r *instancePodLiveReads) refreshDue(id string, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -349,12 +350,13 @@ func (r *instancePodLiveReads) recordLive(id string, now time.Time) {
 	e.lastLive, e.lastSeen = now, now
 }
 
-// entry returns the instance's entry, creating it at now. Once per window it drops the entries of
-// instances not seen for instancePodLiveReadRetention, so the map only holds instances the status
-// loop still visits.
+// entry returns the instance's entry, creating it at now as refreshDue describes. Once per window it
+// drops the entries of instances not seen for instancePodLiveReadRetention, so the map only holds
+// instances the status loop still visits.
 func (r *instancePodLiveReads) entry(id string, now time.Time) *instancePodLiveRead {
 	if r.instances == nil {
 		r.instances = map[string]*instancePodLiveRead{}
+		r.firstUse = now
 	}
 	if now.Sub(r.lastPrune) >= instancePodRefreshWindow {
 		for k, e := range r.instances {
@@ -366,7 +368,10 @@ func (r *instancePodLiveReads) entry(id string, now time.Time) *instancePodLiveR
 	}
 	e, ok := r.instances[id]
 	if !ok {
-		e = &instancePodLiveRead{slotOffset: refreshSlotOffset(id), lastLive: now}
+		e = &instancePodLiveRead{slotOffset: refreshSlotOffset(id)}
+		if now.Sub(r.firstUse) < instancePodLiveReadRetention {
+			e.lastLive = now
+		}
 		r.instances[id] = e
 	}
 	return e

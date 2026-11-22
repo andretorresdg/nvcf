@@ -196,11 +196,10 @@ func podReadsRatesIn(passes []podReadsRatePass, span podReadsSpan) podReadsRates
 // The instance status loop reads Pods live no more often than its refresh window and the periodic
 // reports call for: from an agent start, steadily, through an ICMS or API server outage, and after
 // the loop pauses. Every update it posts is built from a live read, and while live reads succeed no
-// instance goes a refresh window without one, except right after a pause with periodic reports
-// disabled. Once the loop revisits instances less often than the refresh tracker's retention, with
-// periodic reports disabled, it stops reading them live. An instance ICMS was told terminated, whose
-// Pod is gone, is read live no more often than a running one. With cache reads disabled, every pass
-// reads every instance live.
+// instance goes a refresh window without one. After a pause, and while the loop revisits instances
+// less often than the refresh tracker's retention, it reads every instance live on each visit. An
+// instance ICMS was told terminated, whose Pod is gone, is read live no more often than a running
+// one. With cache reads disabled, every pass reads every instance live.
 func TestInstancePodReads_LiveReadRates(t *testing.T) {
 	// A refresh only bounds how long a stalled watch hides a change while it comes more often than the
 	// periodic reports.
@@ -237,6 +236,10 @@ func TestInstancePodReads_LiveReadRates(t *testing.T) {
 		resume      = podReadsSpan{40 * time.Minute, 40*time.Minute + podReadsPassInterval}
 		firstWindow = podReadsSpan{40 * time.Minute, 40*time.Minute + instancePodRefreshWindow + podReadsPassInterval}
 		afterPause  = podReadsSpan{40 * time.Minute, 45 * time.Minute}
+		// slowEvery runs passes further apart than the refresh tracker's retention, so slowVisits
+		// visit each instance in an hour.
+		slowEvery  = instancePodLiveReadRetention + time.Minute
+		slowVisits = math.Ceil(float64(time.Hour) / float64(slowEvery))
 	)
 	type window struct {
 		name string
@@ -347,23 +350,22 @@ func TestInstancePodReads_LiveReadRates(t *testing.T) {
 			},
 		},
 		{
-			// The tracker forgets the instances during the pause, so each starts a new refresh
-			// window when the loop resumes.
+			// The tracker forgets the instances during the pause, and each is due when the loop resumes.
 			name: "loop paused with periodic reports disabled",
 			run:  podReadsRateRun{cacheReads: true, paused: pause},
 			windows: []window{
-				// Each instance starts a new window, so the first pass reads none live.
-				{name: "first pass after the pause", span: resume, maxGets: 0, stale: true},
-				{name: "first window after the pause", span: firstWindow, maxGets: everyPass, readsAll: true, stale: true},
-				{name: "after the pause", span: afterPause, maxGets: liveReads(5*time.Minute, false, false), stale: true},
+				{name: "first pass after the pause", span: resume, maxGets: everyPass, minGets: everyPass},
+				{name: "first window after the pause", span: firstWindow, maxGets: everyPass, readsAll: true},
+				{name: "after the pause", span: afterPause, maxGets: liveReads(5*time.Minute, false, true)},
 			},
 		},
 		{
-			// The tracker forgets each instance between visits, so no instance is ever refreshed.
+			// The tracker forgets each instance between visits, and each is due on every visit once the
+			// tracker is in use: the first pass, at agent start, reads none live.
 			name: "loop revisits slower than the retention with periodic reports disabled",
-			run:  podReadsRateRun{cacheReads: true, every: instancePodLiveReadRetention + time.Minute},
+			run:  podReadsRateRun{cacheReads: true, every: slowEvery},
 			windows: []window{
-				{name: "hour", span: hour, maxGets: 0, stale: true},
+				{name: "hour", span: hour, maxGets: n * slowVisits / 60, minGets: n * (slowVisits - 1) / 60},
 			},
 		},
 	}
