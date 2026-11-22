@@ -294,7 +294,7 @@ func TestModelCacheDownloadPlanDownloadsAtOnce(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
 	heartbeat(t, cache, modelcache.IncomingFile) // a fetch for another pod must not hold this one
-	heartbeat(t, cache, modelcache.StreamingFile)
+	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanDownload)
 	start := time.Now()
 	if code, err := modelCacheCmd(planArgs(cache, to, "--wait", "30", "--final-wait", "0")); code != 0 || err != nil {
@@ -394,7 +394,7 @@ func TestModelCacheDownloadPlanDoesNotHoldAFailedDownload(t *testing.T) {
 func TestModelCacheWaitPlanEndsWhenTheAgentFilledTheVolume(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
-	heartbeat(t, cache, modelcache.StreamingFile)
+	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanWait)
 	go func() {
 		time.Sleep(2500 * time.Millisecond)
@@ -415,7 +415,7 @@ func TestModelCacheWaitPlanEndsWhenTheAgentFilledTheVolume(t *testing.T) {
 func TestModelCacheWaitPlanFlippedToDownloadDownloads(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
-	heartbeat(t, cache, modelcache.StreamingFile)
+	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanWait)
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
@@ -438,7 +438,7 @@ func TestModelCacheWaitPlanFlippedToDownloadDownloads(t *testing.T) {
 func TestModelCacheWaitPlanWithADeadStreamEmptiesTheVolumeAndDownloads(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
-	stop := heartbeat(t, cache, modelcache.StreamingFile)
+	stop := heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanWait)
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -494,7 +494,7 @@ func TestModelCacheNoPlanDownloadsAfterThePlanWait(t *testing.T) {
 func TestModelCacheWaitPlanIsCappedByMaxWait(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
 	cache, to := t.TempDir(), t.TempDir()
-	heartbeat(t, cache, modelcache.StreamingFile)
+	heartbeat(t, cache, modelcache.StreamingFileOf(testUID))
 	writePlan(t, cache, modelcache.PlanWait)
 	start := time.Now()
 	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "2", "--final-wait", "0")); code != 0 || err != nil {
@@ -534,5 +534,38 @@ func TestModelCacheSeedsAtOnceWithACopyAndNoPlan(t *testing.T) {
 	}
 	if got := read(t, filepath.Join(to, "weights.bin")); got != "cached" {
 		t.Fatalf("weights.bin = %q", got)
+	}
+}
+
+// Another pod's stream on this node is not this pod's: its heartbeat
+// stopping must not end this pod's wait, nor keep it waiting.
+func TestModelCacheWaitPlanFollowsOnlyItsOwnStream(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to := t.TempDir(), t.TempDir()
+	heartbeat(t, cache, modelcache.StreamingFileOf("another-pod"))
+	writePlan(t, cache, modelcache.PlanWait)
+	start := time.Now()
+	if code, err := modelCacheCmd(planArgs(cache, to, "--max-wait", "30", "--final-wait", "0")); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("waited %v on another pod's stream", d)
+	}
+}
+
+// Before it downloads, the helper says so in the signal volume, so the
+// agent never streams into a volume a download writes.
+func TestModelCacheSignalsDownloadingBeforeItDownloads(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
+	marker := filepath.Join(sig, modelcache.SignalFile)
+	// The download records what the signal said while it ran.
+	dl := []string{"/bin/sh", "-c", "cat " + marker + " > " + filepath.Join(to, "seen") + "; echo downloaded > " + filepath.Join(to, "weights.bin")}
+	args := append([]string{"--cache", cache, "--to", to, "--plan-wait", "1", "--poll", "100ms", "--final-wait", "0", "--signal", sig, "--"}, dl...)
+	if code, err := modelCacheCmd(args); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if got := strings.TrimSpace(read(t, filepath.Join(to, "seen"))); got != modelcache.SignalDownloading {
+		t.Fatalf("signal during the download = %q, want %q", got, modelcache.SignalDownloading)
 	}
 }

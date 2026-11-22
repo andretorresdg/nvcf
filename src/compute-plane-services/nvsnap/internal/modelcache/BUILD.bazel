@@ -3,8 +3,8 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "modelcache",
     srcs = [
-        "modelcache.go",
         "live.go",
+        "modelcache.go",
         "plan.go",
         "walk.go",
     ],

@@ -79,6 +79,10 @@ type NodeModelCacheConfig struct {
 	// SingleFlight: one pod per key downloads, and the others stream its
 	// download (docs/design/model-cache-single-flight.md).
 	SingleFlight bool
+	// PodsRoot is the kubelet pods directory, mounted read-write: single
+	// flight writes into waiting pods' volumes. The host root the agent
+	// reads pods through is read-only.
+	PodsRoot string
 }
 
 // nodeModelCache is the agent's cache controller.
@@ -107,6 +111,8 @@ type nodeModelCache struct {
 
 	// Single flight (model_cache_flight.go).
 	singleFlight  bool
+	podsWrite     string // kubelet pods directory, writable
+	followMax     time.Duration
 	timing        streamTiming
 	leaseDuration time.Duration
 	flights       map[types.UID]*flight
@@ -128,7 +134,8 @@ func newNodeModelCache(cfg NodeModelCacheConfig, kube kubernetes.Interface, node
 		podsRoot: cachedirPodsRoot, tenants: tenants, main: main, peerURL: peerURL,
 		client: peerHTTPClient, maxPercent: pct, fetchTimeout: to, log: log, statfs: statfsBytes,
 		busy: map[string]int{}, failed: map[string]time.Time{}, harvested: map[types.UID]bool{}, counted: map[types.UID]bool{}, inUse: map[string]bool{},
-		singleFlight: cfg.SingleFlight, timing: defaultStreamTiming, leaseDuration: 30 * time.Second,
+		singleFlight: cfg.SingleFlight, podsWrite: cfg.PodsRoot, followMax: 5 * time.Hour,
+		timing: defaultStreamTiming, leaseDuration: 30 * time.Second,
 		flights: map[types.UID]*flight{}, liveSources: map[string]*liveSource{}, leaseSeen: map[string]leaseObs{},
 	}
 }
@@ -635,6 +642,35 @@ func (c *nodeModelCache) emptyDirPath(pod *corev1.Pod, vol string) (string, erro
 	return "", fmt.Errorf("volume %q is not an emptyDir of the pod", vol)
 }
 
+// emptyDirWritePath is the host path of the pod's emptyDir vol under the
+// writable pods directory.
+func (c *nodeModelCache) emptyDirWritePath(pod *corev1.Pod, vol string) (string, error) {
+	p, err := c.emptyDirPath(pod, vol)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(c.podsRoot, p)
+	if err != nil || c.podsWrite == "" {
+		return "", fmt.Errorf("no writable pods directory")
+	}
+	return filepath.Join(c.podsWrite, rel), nil
+}
+
+// podsWritable checks the agent can write under dir, where single flight
+// writes waiting pods' volumes.
+func podsWritable(dir string) error {
+	if dir == "" {
+		return errors.New("no pods directory")
+	}
+	f, err := os.CreateTemp(dir, ".nvsnap-write-probe-")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	f.Close()
+	return os.Remove(name)
+}
+
 var errNoRoom = errors.New("model cache: no room within the budget")
 
 // reserve promises n bytes to an attempt, evicting unused keys to make
@@ -807,7 +843,7 @@ func (a *Agent) webhookNodeModelCache() *webhook.NodeModelCache {
 	// The helper must be the one that reads plans: admission mounts it
 	// from its own bundle version, which a webhook without a bundle id
 	// does not name.
-	if a.config.NodeModelCache.SingleFlight && a.currentBundle() != "" {
+	if a.config.NodeModelCache.SingleFlight && a.currentBundle() != "" && podsWritable(a.config.NodeModelCache.PodsRoot) == nil {
 		c.PlanWait = singleFlightPlanWait
 	}
 	return c
@@ -846,7 +882,13 @@ func (a *Agent) startNodeModelCache(ctx context.Context, router *mux.Router) {
 	router.HandleFunc("/v1/model-cache/{key}", c.manifestHandler).Methods("GET")
 	router.HandleFunc("/v1/model-cache/{key}/{gen}/file", c.fileHandler).Methods("GET")
 	if cfg.SingleFlight {
-		c.addLiveRoutes(router)
+		if err := podsWritable(cfg.PodsRoot); err != nil {
+			// Admission adds no plans either (webhookNodeModelCache).
+			log.WithError(err).Error("model cache: single flight needs a writable kubelet pods directory; it is off")
+			c.singleFlight = false
+		} else {
+			c.addLiveRoutes(router)
+		}
 	}
 	go c.run(ctx)
 	log.WithField("root", cfg.Root).Info("model cache: on")

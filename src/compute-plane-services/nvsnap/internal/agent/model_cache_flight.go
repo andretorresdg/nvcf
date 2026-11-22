@@ -35,6 +35,22 @@ import (
 // from the downloading node or from a node already streaming (a relay).
 // The pods learn their part from plan files in the key's directory.
 
+// maxFollowAttempts bounds how often a waiting pod's stream starts over
+// (a failed relay, a new holder) before the pod downloads.
+const maxFollowAttempts = 20
+
+// signalled reports whether f's helper said it downloads on its own.
+func (c *nodeModelCache) signalled(f *flight) bool {
+	_, err := os.Stat(filepath.Join(c.signalDir(f.vol), modelcache.SignalFile))
+	return err == nil
+}
+
+// signalDir is the signal volume of the pod whose download volume is vol:
+// a sibling emptyDir.
+func (c *nodeModelCache) signalDir(vol string) string {
+	return filepath.Join(filepath.Dir(vol), webhook.ModelCacheSignalVolume)
+}
+
 const (
 	leasePrefix = "nvsnap-model-dl-"
 	// feedsAnnotation, on the Lease, maps each streaming pod's identity to
@@ -70,7 +86,7 @@ type flight struct {
 	vol           string
 	src           *liveSource // what this node serves for the key, when this pod's volume is it
 	cancel        context.CancelFunc
-	finalized     bool
+	finalized     bool // finalize started (it runs once, in the background)
 }
 
 type leaseObs struct {
@@ -100,7 +116,7 @@ func (c *nodeModelCache) flightPod(ctx context.Context, pod *corev1.Pod, d webho
 	if len(c.sources(ctx, d.Key)) > 0 {
 		return false
 	}
-	vol, err := c.emptyDirPath(pod, d.Landing.VolumeName)
+	vol, err := c.emptyDirWritePath(pod, d.Landing.VolumeName)
 	if err != nil {
 		return true
 	}
@@ -113,7 +129,7 @@ func (c *nodeModelCache) flightPod(ctx context.Context, pod *corev1.Pod, d webho
 		c.becomeHolder(ctx, d.Key, identity, pod.UID, vol, log)
 		return true
 	}
-	if !dirEmpty(vol) {
+	if !dirEmpty(vol) || c.downloadingOnItsOwn(pod) {
 		// The helper gave up waiting for a plan and downloads.
 		c.track(&flight{key: d.Key, identity: identity, uid: pod.UID, role: roleNone, vol: vol})
 		return true
@@ -167,22 +183,37 @@ func (c *nodeModelCache) holderStep(pod *corev1.Pod, f *flight) {
 		return
 	}
 	b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile))
-	if err != nil {
+	fp := strings.TrimSpace(string(b))
+	if err != nil || fp == "" || fp == modelcache.SignalDownloading {
 		return
 	}
 	f.finalized = true
-	fp := strings.TrimSpace(string(b))
 	keyDir := c.store.KeyDir(f.key)
 	log := c.log.WithFields(logrus.Fields{"key": f.key, "pod": pod.Namespace + "/" + pod.Name})
-	start := time.Now()
-	if err := f.src.finalize(fp); err != nil {
-		log.WithError(err).Warn("model cache: single flight: no final manifest; streaming pods download")
-		// Any value but the tree tells the helper to stop holding.
-		_ = writeMarker(keyDir, modelcache.FinalFile(string(f.uid)), "failed")
-		return
+	// In the background: after an agent restart nothing is hashed yet, and
+	// a tick must not wait on a pass over the model.
+	go func() {
+		start := time.Now()
+		if err := f.src.finalize(fp); err != nil {
+			log.WithError(err).Warn("model cache: single flight: no final manifest; streaming pods download")
+			// Any value but the tree tells the helper to stop holding.
+			_ = writeMarker(keyDir, modelcache.FinalFile(string(f.uid)), "failed")
+			return
+		}
+		_ = writeMarker(keyDir, modelcache.FinalFile(string(f.uid)), fp)
+		log.WithField("seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds())).Info("model cache: single flight: final manifest served")
+	}()
+}
+
+// downloadingOnItsOwn reports whether the pod's helper said it downloads:
+// it gave up waiting for a plan.
+func (c *nodeModelCache) downloadingOnItsOwn(pod *corev1.Pod) bool {
+	sig, err := c.emptyDirPath(pod, webhook.ModelCacheSignalVolume)
+	if err != nil {
+		return false
 	}
-	_ = writeMarker(keyDir, modelcache.FinalFile(string(f.uid)), fp)
-	log.WithField("seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds())).Info("model cache: single flight: final manifest served")
+	_, err = os.Stat(filepath.Join(sig, modelcache.SignalFile))
+	return err == nil
 }
 
 func writeMarker(dir, name, content string) error {
@@ -202,22 +233,42 @@ func writeMarker(dir, name, content string) error {
 func (c *nodeModelCache) renewLoop(ctx context.Context, f *flight) {
 	t := time.NewTicker(c.leaseDuration / 6)
 	defer t.Stop()
+	ok := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		_, _, published := c.store.Latest(f.key)
-		if published || f.src.view().State == liveFailed {
+		// Released once others can fetch the copy: published and listed.
+		if c.listed(ctx, f.key) || f.src.view().State == liveFailed {
 			c.release(ctx, f.key, f.identity)
 			return
 		}
-		if err := c.renew(ctx, f.key, f.identity); err != nil {
-			c.log.WithError(err).WithField("key", f.key).Warn("model cache: single flight: lost the Lease")
+		err := c.renew(ctx, f.key, f.identity)
+		switch {
+		case err == nil:
+			ok = time.Now()
+		case errors.Is(err, errNotHolder):
+			c.log.WithField("key", f.key).Warn("model cache: single flight: another pod holds the download now")
+			return
+		case time.Since(ok) > c.leaseDuration:
+			c.log.WithError(err).WithField("key", f.key).Warn("model cache: single flight: could not renew the Lease")
 			return
 		}
 	}
+}
+
+var errNotHolder = errors.New("model cache: the Lease is held by another")
+
+// listed reports whether this node is a source of key: its copy is
+// published and others can fetch it.
+func (c *nodeModelCache) listed(ctx context.Context, key string) bool {
+	if _, _, ok := c.store.Latest(key); !ok {
+		return false
+	}
+	cm, err := c.kube.CoreV1().ConfigMaps(c.ns).Get(ctx, sourcesName(key), metav1.GetOptions{})
+	return err == nil && cm.Data[c.node] != ""
 }
 
 // acquire takes the key's Lease for identity if it is free or expired,
@@ -237,6 +288,9 @@ func (c *nodeModelCache) acquire(ctx context.Context, key, identity string) (boo
 			Labels: map[string]string{"app.kubernetes.io/component": modelCacheComponent}},
 			Spec: coordv1.LeaseSpec{HolderIdentity: &identity, LeaseDurationSeconds: &dur, AcquireTime: &now, RenewTime: &now}}, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
+			if l, gerr := leases.Get(ctx, leaseName(key), metav1.GetOptions{}); gerr == nil && l.Spec.HolderIdentity != nil {
+				return false, *l.Spec.HolderIdentity, nil
+			}
 			return false, "", nil
 		}
 		return err == nil, identity, err
@@ -283,18 +337,25 @@ func (c *nodeModelCache) holds(ctx context.Context, key, identity string) bool {
 	return err == nil && l.Spec.HolderIdentity != nil && *l.Spec.HolderIdentity == identity
 }
 
+// renew sets the Lease's renew time. A conflict (streaming pods record
+// their sources on it) is retried; only another holder ends it.
 func (c *nodeModelCache) renew(ctx context.Context, key, identity string) error {
 	leases := c.kube.CoordinationV1().Leases(c.ns)
-	l, err := leases.Get(ctx, leaseName(key), metav1.GetOptions{})
-	if err != nil {
-		return err
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		var l *coordv1.Lease
+		if l, err = leases.Get(ctx, leaseName(key), metav1.GetOptions{}); err != nil {
+			return err
+		}
+		if l.Spec.HolderIdentity == nil || *l.Spec.HolderIdentity != identity {
+			return errNotHolder
+		}
+		now := metav1.NewMicroTime(time.Now())
+		l.Spec.RenewTime = &now
+		if _, err = leases.Update(ctx, l, metav1.UpdateOptions{}); !apierrors.IsConflict(err) {
+			return err
+		}
 	}
-	if l.Spec.HolderIdentity == nil || *l.Spec.HolderIdentity != identity {
-		return errors.New("held by another")
-	}
-	now := metav1.NewMicroTime(time.Now())
-	l.Spec.RenewTime = &now
-	_, err = leases.Update(ctx, l, metav1.UpdateOptions{})
 	return err
 }
 
@@ -314,7 +375,7 @@ func (c *nodeModelCache) release(ctx context.Context, key, identity string) {
 // pickSource chooses what identity streams from: the holder, or a pod
 // already streaming, whichever feeds the fewest (at most maxFeeds), and
 // records the choice on the Lease. With no room anywhere, the holder.
-func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder string) string {
+func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder string, bad map[string]bool) string {
 	leases := c.kube.CoordinationV1().Leases(c.ns)
 	for attempt := 0; attempt < 5; attempt++ {
 		l, err := leases.Get(ctx, leaseName(key), metav1.GetOptions{})
@@ -326,6 +387,13 @@ func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder s
 			_ = json.Unmarshal([]byte(s), &feeds)
 		}
 		delete(feeds, identity)
+		// A source that failed this pod is no relay: its entry goes, so
+		// no pod picks it again.
+		for b := range bad {
+			if b != holder {
+				delete(feeds, b)
+			}
+		}
 		count := map[string]int{holder: 0}
 		for consumer, src := range feeds {
 			count[src]++
@@ -335,7 +403,7 @@ func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder s
 		}
 		var cands []string
 		for id := range count {
-			if id != identity {
+			if id != identity && !bad[id] && !feedsFrom(feeds, id, identity) {
 				cands = append(cands, id)
 			}
 		}
@@ -367,16 +435,33 @@ func (c *nodeModelCache) pickSource(ctx context.Context, key, identity, holder s
 	return holder
 }
 
+// feedsFrom reports whether id streams, directly or through relays, from
+// ancestor: picking id as ancestor's source would make a cycle.
+func feedsFrom(feeds map[string]string, id, ancestor string) bool {
+	for hops := 0; hops <= len(feeds); hops++ {
+		src, ok := feeds[id]
+		if !ok {
+			return false
+		}
+		if src == ancestor {
+			return true
+		}
+		id = src
+	}
+	return true // a cycle already: keep out of it
+}
+
 func (c *nodeModelCache) clientFor(key, source string) liveClient {
-	node := source
+	node, uid := source, ""
 	if i := strings.IndexByte(source, '/'); i >= 0 {
-		node = source[:i]
+		node, uid = source[:i], source[i+1:]
 	}
 	if node == c.node {
+		// Only the source pod's own volume: never this node's other one.
 		c.mu.Lock()
 		src := c.liveSources[key]
 		c.mu.Unlock()
-		if src != nil {
+		if src != nil && src.uid == uid {
 			return localClient{src}
 		}
 	}
@@ -385,7 +470,7 @@ func (c *nodeModelCache) clientFor(key, source string) liveClient {
 
 func (c *nodeModelCache) becomeFollower(ctx context.Context, key, identity string, uid types.UID, vol, holder string, log logrus.FieldLogger) {
 	keyDir := c.store.KeyDir(key)
-	stopHB := c.heartbeatFile(key, modelcache.StreamingFile)
+	stopHB := c.heartbeatFile(key, modelcache.StreamingFileOf(string(uid)))
 	if err := modelcache.WritePlan(keyDir, string(uid), modelcache.PlanWait); err != nil {
 		stopHB()
 		log.WithError(err).Warn("model cache: single flight: writing the plan failed")
@@ -411,14 +496,36 @@ func (c *nodeModelCache) becomeFollower(ctx context.Context, key, identity strin
 func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, stopHB func(), log logrus.FieldLogger) {
 	defer stopHB()
 	keyDir := c.store.KeyDir(f.key)
-	s := &streamer{dst: f.vol, timing: c.timing}
-	for {
-		source := c.pickSource(ctx, f.key, f.identity, holder)
+	// The helper may give up on its plan and download: never write then.
+	s := &streamer{dst: f.vol, timing: c.timing, mayWrite: func() bool { return !c.signalled(f) }}
+	deadline := time.Now().Add(c.followMax)
+	bad := map[string]bool{}
+	done := false
+	defer func() {
+		if !done && f.src != nil {
+			// A stream that ended without the model is no relay.
+			f.src.fail()
+			c.mu.Lock()
+			if c.liveSources[f.key] == f.src {
+				delete(c.liveSources, f.key)
+			}
+			c.mu.Unlock()
+		}
+	}()
+	for attempt := 0; ; attempt++ {
+		if attempt >= maxFollowAttempts || time.Now().After(deadline) {
+			log.Warn("model cache: single flight: no copy in time; the pod downloads")
+			return
+		}
+		source := c.pickSource(ctx, f.key, f.identity, holder, bad)
 		s.client = c.clientFor(f.key, source)
+		sctx, cancel := context.WithDeadline(ctx, deadline)
 		log.WithField("source", source).Info("model cache: single flight: streaming from another node")
 		start := time.Now()
-		err := s.run(ctx)
+		err := s.run(sctx)
+		cancel()
 		if err == nil {
+			done = true
 			if f.src != nil {
 				f.src.setDone(*s.final)
 			}
@@ -429,9 +536,24 @@ func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, s
 		if ctx.Err() != nil {
 			return
 		}
-		if errors.Is(err, errStall) {
-			log.Warn("model cache: single flight: the source made no progress; the pod downloads")
+		if errors.Is(err, errStall) || errors.Is(err, errHelperDownloads) {
+			log.WithError(err).Warn("model cache: single flight: the pod downloads")
 			return
+		}
+		if source != holder {
+			// A relay failed: pick another, the holder at worst.
+			bad[source] = true
+			continue
+		}
+		if len(c.sources(ctx, f.key)) > 0 {
+			// The holder published a copy: do not download it again;
+			// try the holder's source until the deadline.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(c.timing.poll):
+			}
+			continue
 		}
 		got, h, aerr := c.acquire(ctx, f.key, f.identity)
 		if aerr != nil {

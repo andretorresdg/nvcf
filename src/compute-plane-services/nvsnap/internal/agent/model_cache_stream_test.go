@@ -272,3 +272,26 @@ func TestLiveSourceServesOnlyUnchangedManifestFilesOnceDone(t *testing.T) {
 		t.Fatal("served a manifest file that changed")
 	}
 }
+
+// Applying the manifest's owners and modes runs as root on the host: a
+// path swapped for a symlink must not lead it outside the volume.
+func TestApplyMetaStaysInTheVolume(t *testing.T) {
+	dst, outside := t.TempDir(), t.TempDir()
+	victim := filepath.Join(outside, "victim")
+	if err := os.WriteFile(victim, []byte("v"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(dst, "f")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	m := modelcache.Manifest{Entries: []modelcache.Entry{{Path: "f", Type: modelcache.TypeFile, Mode: 0o777, UID: os.Getuid(), GID: os.Getgid()}}}
+	_ = applyMetaRoot(root, m)
+	if fi, _ := os.Stat(victim); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("a file outside the volume became %o", fi.Mode().Perm())
+	}
+}

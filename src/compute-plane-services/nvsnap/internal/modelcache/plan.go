@@ -23,10 +23,12 @@ const (
 	PlanDownload = "download"
 	// PlanWait: the pod waits while the agent streams into its volume.
 	PlanWait = "wait"
-	// StreamingFile is the heartbeat the agent refreshes while it streams
-	// into a waiting pod's volume. It is not IncomingFile: a helper from
-	// before single flight waits on that one for at most its --wait.
-	StreamingFile = ".streaming"
+	// StreamingPrefix starts the heartbeat the agent refreshes while it
+	// streams into a waiting pod's volume; the pod's uid follows, so one
+	// pod's stream ending never ends another's wait. It is not
+	// IncomingFile: a helper from before single flight waits on that one
+	// for at most its --wait.
+	StreamingPrefix = ".streaming-"
 	// FinalPrefix and DonePrefix start the names of a pod's end markers;
 	// the pod's uid follows. Final: the agent read the downloading pod's
 	// volume for the final manifest, and holds the tree's Fingerprint.
@@ -37,6 +39,10 @@ const (
 	// agent's final manifest is not of the tree the download left.
 	FinalMismatch = "final-manifest-mismatch"
 )
+
+// StreamingFileOf names pod uid's streaming heartbeat, or "" for a uid
+// that is not one.
+func StreamingFileOf(uid string) string { return marker(StreamingPrefix, uid) }
 
 // FinalFile and DoneFile name pod uid's end markers, or "" for a uid that
 // is not one.

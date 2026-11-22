@@ -5,6 +5,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,8 +18,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -68,6 +73,7 @@ func newFlightNode(t *testing.T, kube *fake.Clientset, node string, urls map[str
 	t.Helper()
 	n := newMCNode(t, kube, node, urls)
 	n.c.singleFlight = true
+	n.c.podsWrite = n.c.podsRoot
 	n.c.timing = streamTiming{settle: 100 * time.Millisecond, poll: 50 * time.Millisecond, stall: 10 * time.Second}
 	n.c.leaseDuration = 2 * time.Second
 	n.c.client.Timeout = 5 * time.Second
@@ -134,9 +140,12 @@ func TestSingleFlightOnePodDownloadsAndTheOthersStreamItsTree(t *testing.T) {
 	if got := []string{a.plan(pa), b.plan(pb), c.plan(pc)}; got[0] != modelcache.PlanDownload || got[1] != modelcache.PlanWait || got[2] != modelcache.PlanWait {
 		t.Fatalf("plans %q; want download, wait, wait", got)
 	}
-	for _, n := range []*mcNode{b, c} {
-		if !n.marker(pa, modelcache.StreamingFile) {
-			t.Fatal("a waiting node keeps no streaming heartbeat")
+	for _, x := range []struct {
+		n *mcNode
+		p *corev1.Pod
+	}{{b, pb}, {c, pc}} {
+		if !x.n.marker(x.p, modelcache.StreamingFileOf(string(x.p.UID))) {
+			t.Fatal("a waiting pod has no streaming heartbeat of its own")
 		}
 	}
 
@@ -298,7 +307,7 @@ func TestSingleFlightARestartedAgentKeepsItsPodsLease(t *testing.T) {
 
 	// A new controller for node a: same disk, no memory.
 	a2 := newFlightNode(t, kube, "a", urls)
-	a2.c.store, a2.c.podsRoot = a.c.store, a.c.podsRoot
+	a2.c.store, a2.c.podsRoot, a2.c.podsWrite = a.c.store, a.c.podsRoot, a.c.podsWrite
 	before, _ := kube.CoordinationV1().Leases(mcNS).Get(context.Background(), leaseName(keyOf(pa)), metav1.GetOptions{})
 	a2.c.tick(context.Background())
 	mcEventually(t, "the restarted agent renews", func() bool {
@@ -311,4 +320,143 @@ func TestSingleFlightARestartedAgentKeepsItsPodsLease(t *testing.T) {
 	if f == nil || f.role != roleHolder {
 		t.Fatalf("flight %+v; want the holder adopted", f)
 	}
+}
+
+func leaseWithFeeds(t *testing.T, kube *fake.Clientset, key, holder string, feeds map[string]string) {
+	t.Helper()
+	b, _ := json.Marshal(feeds)
+	dur := int32(30)
+	now := metav1.NewMicroTime(time.Now())
+	if _, err := kube.CoordinationV1().Leases(mcNS).Create(context.Background(), &coordv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: leaseName(key), Namespace: mcNS, Annotations: map[string]string{feedsAnnotation: string(b)}},
+		Spec:       coordv1.LeaseSpec{HolderIdentity: &holder, LeaseDurationSeconds: &dur, RenewTime: &now}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// No source feeds more than maxFeeds; a source that failed this pod is
+// not picked again; and no pod streams from its own downstream.
+func TestSingleFlightPicksARelayWithRoomAndNoCycle(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	n := newFlightNode(t, kube, "n", map[string]string{})
+	key := "0123456789abcdef0123456789abcdef"
+	leaseWithFeeds(t, kube, key, "h/1", map[string]string{"a/1": "h/1", "b/1": "h/1", "c/1": "h/1", "e/1": "a/1"})
+	ctx := context.Background()
+	if got := n.c.pickSource(ctx, key, "d/1", "h/1", nil); got != "b/1" {
+		t.Fatalf("picked %q; want b/1 (the holder feeds 3, a feeds 1, b and c none)", got)
+	}
+	if got := n.c.pickSource(ctx, key, "f/1", "h/1", map[string]bool{"c/1": true}); got == "c/1" {
+		t.Fatal("picked a source that failed this pod")
+	}
+	// a's downstream (e) must not become a's source.
+	if got := n.c.pickSource(ctx, key, "a/1", "h/1", nil); got == "e/1" {
+		t.Fatal("a pod picked its own downstream: a cycle")
+	}
+}
+
+// The holder's renewals survive the conflicts that streaming pods'
+// annotations cause; only another holder ends them.
+func TestSingleFlightRenewRetriesAConflict(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	a := newFlightNode(t, kube, "a", map[string]string{})
+	key := "0123456789abcdef0123456789abcdef"
+	if got, _, err := a.c.acquire(context.Background(), key, "a/ua"); !got || err != nil {
+		t.Fatal(got, err)
+	}
+	conflicts := 2
+	kube.PrependReactor("update", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if conflicts > 0 {
+			conflicts--
+			return true, nil, apierrors.NewConflict(coordv1.Resource("leases"), leaseName(key), errors.New("changed"))
+		}
+		return false, nil, nil
+	})
+	if err := a.c.renew(context.Background(), key, "a/ua"); err != nil {
+		t.Fatalf("renew after two conflicts: %v", err)
+	}
+	if err := a.c.renew(context.Background(), key, "z/uz"); !errors.Is(err, errNotHolder) {
+		t.Fatalf("renew by a non-holder: %v", err)
+	}
+}
+
+// The holder releases only once others can fetch the copy: published on
+// disk is not enough, it must be listed.
+func TestSingleFlightListedNeedsTheSourcesEntry(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	urls := map[string]string{}
+	a := newFlightNode(t, kube, "a", urls)
+	p := initDone(cachePod(t, "p1", "a", "u1"), 0)
+	addPod(t, kube, p)
+	a.downloaded(t, p, map[string]string{"w.bin": "w"})
+	key := keyOf(p)
+	src := filepath.Join(a.c.podsRoot, "u1", "volumes", "kubernetes.io~empty-dir", "ngc-models")
+	if _, err := a.c.store.Harvest(key, src, modelcache.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if a.c.listed(context.Background(), key) {
+		t.Fatal("listed with no sources entry")
+	}
+	gen, _, _ := a.c.store.Latest(key)
+	if err := a.c.register(context.Background(), key, filepath.Base(gen)); err != nil {
+		t.Fatal(err)
+	}
+	if !a.c.listed(context.Background(), key) {
+		t.Fatal("not listed after registering")
+	}
+}
+
+// A waiting pod whose helper gave up and downloads: the agent stops
+// writing into its volume and stops its heartbeat.
+func TestSingleFlightStopsStreamingWhenTheHelperDownloads(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	urls := map[string]string{}
+	a, b := newFlightNode(t, kube, "a", urls), newFlightNode(t, kube, "b", urls)
+	pa, pb := flightPod(t, "pa", "a", "ua"), flightPod(t, "pb", "b", "ub")
+	addPod(t, kube, pa)
+	addPod(t, kube, pb)
+	emptyVolumes(t, map[*mcNode]*corev1.Pod{a: pa, b: pb})
+	tickAll(a, b)
+	if b.plan(pb) != modelcache.PlanWait {
+		t.Fatalf("plan %q", b.plan(pb))
+	}
+	sig := b.volume(pb, webhook.ModelCacheSignalVolume)
+	if err := os.MkdirAll(sig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sig, modelcache.SignalFile), []byte(modelcache.SignalDownloading), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.downloadedLive(t, pa, map[string]string{"w.bin": "after the helper gave up"})
+	mcEventually(t, "b stops", func() bool {
+		tickAll(a, b)
+		return !b.marker(pb, modelcache.StreamingFileOf(string(pb.UID)))
+	})
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(b.volume(pb, "ngc-models"), "w.bin")); !os.IsNotExist(err) {
+		t.Fatal("the agent wrote into a volume the pod's own download writes")
+	}
+}
+
+// A stream has a deadline below the helper's: it never writes into a
+// volume the helper has given up on.
+func TestSingleFlightFollowEndsAtItsDeadline(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	urls := map[string]string{}
+	a, b := newFlightNode(t, kube, "a", urls), newFlightNode(t, kube, "b", urls)
+	b.c.followMax = time.Second
+	pa, pb := flightPod(t, "pa", "a", "ua"), flightPod(t, "pb", "b", "ub")
+	addPod(t, kube, pa)
+	addPod(t, kube, pb)
+	emptyVolumes(t, map[*mcNode]*corev1.Pod{a: pa, b: pb})
+	tickAll(a, b)
+	stop := time.Now().Add(5 * time.Second)
+	for i := 0; time.Now().Before(stop); i++ { // a keeps making progress
+		a.downloadedLive(t, pa, map[string]string{fmt.Sprintf("w-%d.bin", i): "x"})
+		tickAll(a, b)
+		if !b.marker(pb, modelcache.StreamingFileOf(string(pb.UID))) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("the stream outlived its deadline")
 }

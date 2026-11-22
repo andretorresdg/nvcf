@@ -60,6 +60,11 @@ func modelCacheCmd(args []string) (int, error) {
 		emptyDir(*to)
 	}
 	fmt.Println("nvsnap: model cache: downloading")
+	if *signal != "" {
+		// Before the download writes anything: the agent never streams
+		// into this volume once it reads this.
+		_ = os.WriteFile(filepath.Join(*signal, modelcache.SignalFile), []byte(modelcache.SignalDownloading+"\n"), 0o644)
+	}
 	before := treesOf(watch, *maxEntries)
 	code, err := run(argv)
 	if code == 0 {
@@ -183,7 +188,7 @@ func seedFromCache(cache, to string, w waitRules) outcome {
 				fmt.Printf("nvsnap: model cache: copied from another node in %s\n", time.Since(start).Round(time.Second))
 				return filled
 			}
-			if !heartbeatFresh(filepath.Join(cache, modelcache.StreamingFile), w.stale) {
+			if !heartbeatFresh(filepath.Join(cache, modelcache.StreamingFileOf(w.uid)), w.stale) {
 				fmt.Println("nvsnap: model cache: the copy stopped; downloading")
 				return streamStopped
 			}

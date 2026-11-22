@@ -271,8 +271,11 @@ one pod per model downloads, and the others stream its download.
 - **What was a pod told?** On its node, `<root>/<key>/.plan-<pod uid>` holds `download` or `wait`. The init logs
   `this pod downloads; other nodes copy from it` or `another node downloads this model; the agent copies it here`,
   then `copied from another node in ...`. The agent logs `single flight:` lines with the key.
-- **A pod waits too long.** It waits while the agent's `<root>/<key>/.streaming` heartbeat is fresh. The agent
+- **A pod waits too long.** It waits while the agent's `<root>/<key>/.streaming-<pod uid>` heartbeat is fresh. The agent
   stops it after 5 minutes without progress at the source, and the pod then downloads. Deleting the downloading
   pod moves the download to a waiting pod within about 30 seconds.
+- **Is it on?** With it on, the agent mounts the kubelet pods directory read-write (`kubeletPodsDir`) to write
+  waiting pods' volumes. If it cannot write there, it logs `single flight needs a writable kubelet pods directory; it
+  is off` and admission adds no plans.
 - **Turn it off.** Set `agent.nodeModelCache.singleFlight=false` and upgrade. New pods are admitted without plans,
   and each downloads or seeds as without single flight. Leases left by a running download expire on their own.

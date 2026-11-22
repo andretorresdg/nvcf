@@ -169,6 +169,48 @@ func (s *liveSource) hashNow(e modelcache.LiveEntry) (string, error) {
 	return modelcache.HashOpen(f, st)
 }
 
+// hashAll hashes the files of ents not hashed for their current state,
+// streamParallel at a time.
+func (s *liveSource) hashAll(ents []modelcache.LiveEntry) error {
+	var todo []modelcache.LiveEntry
+	s.mu.Lock()
+	for _, e := range ents {
+		if h, ok := s.hashes[e.Path]; e.Type == modelcache.TypeFile && (!ok || !modelcache.SameFile(h.e, e)) {
+			todo = append(todo, e)
+		}
+	}
+	s.mu.Unlock()
+	var mu sync.Mutex
+	var first error
+	work := make(chan modelcache.LiveEntry)
+	var wg sync.WaitGroup
+	for i := 0; i < streamParallel; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range work {
+				sum, err := s.hashNow(e)
+				mu.Lock()
+				if err != nil && first == nil {
+					first = err
+				}
+				mu.Unlock()
+				if err == nil {
+					s.mu.Lock()
+					s.hashes[e.Path] = hashed{e: e, sum: sum}
+					s.mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, e := range todo {
+		work <- e
+	}
+	close(work)
+	wg.Wait()
+	return first
+}
+
 // finalize builds the final manifest once the download is over (the
 // helper's signal, holding the tree's fingerprint, fp), while the init is
 // held open and nothing else writes the volume. It reuses the hashes made
@@ -180,6 +222,10 @@ func (s *liveSource) finalize(fp string) error {
 		err = fmt.Errorf("%w: the volume is not the tree the download reported", modelcache.ErrChanged)
 	}
 	if err != nil {
+		s.fail()
+		return err
+	}
+	if err := s.hashAll(ents); err != nil {
 		s.fail()
 		return err
 	}
@@ -284,7 +330,12 @@ type streamer struct {
 	have  map[string]copied    // file in dst -> what it was copied from
 	first map[string]observed  // file at the source -> its stat, since when
 	final *modelcache.Manifest // once done: the tree dst holds
+	// mayWrite, when set, is asked before each pass of writes: false
+	// ends the stream (the pod's helper downloads on its own).
+	mayWrite func() bool
 }
+
+var errHelperDownloads = errors.New("model cache: the pod downloads on its own")
 
 type copied struct {
 	from  modelcache.LiveEntry // the source's file when it was copied
@@ -336,6 +387,8 @@ func (s *streamer) run(ctx context.Context) error {
 		case err != nil:
 		case v.State == liveFailed:
 			return errSourceFailed
+		case s.mayWrite != nil && !s.mayWrite():
+			return errHelperDownloads
 		case v.State == liveDone && v.Final != nil:
 			if err := s.finish(ctx, root, *v.Final); err != nil {
 				return err
@@ -619,7 +672,56 @@ func (s *streamer) finish(ctx context.Context, root *os.Root, m modelcache.Manif
 			return err
 		}
 	}
-	return modelcache.ApplyMeta(s.dst, m)
+	return applyMetaRoot(root, m)
+}
+
+// applyMetaRoot gives every entry of m, and the volume, its recorded owner,
+// mode and mtime, as a seed does, through root: the agent runs as root on
+// the host, and a path swapped for a symlink under it must not lead a
+// chown or chmod outside the volume.
+func applyMetaRoot(root *os.Root, m modelcache.Manifest) error {
+	for i := len(m.Entries) - 1; i >= 0; i-- {
+		e := m.Entries[i]
+		if err := root.Lchown(e.Path, e.UID, e.GID); err != nil {
+			return err
+		}
+		if e.Type == modelcache.TypeSymlink {
+			continue // no mode, and its time is not followed
+		}
+		if err := root.Chmod(e.Path, os.FileMode(e.Mode&0o777)|specialBits(e.Mode)); err != nil {
+			return err
+		}
+		t := time.Unix(0, e.Mtime)
+		if err := root.Chtimes(e.Path, t, t); err != nil {
+			return err
+		}
+	}
+	if r := m.Root; r != nil {
+		if err := root.Lchown(".", r.UID, r.GID); err != nil {
+			return err
+		}
+		if err := root.Chmod(".", os.FileMode(r.Mode&0o777)|specialBits(r.Mode)); err != nil {
+			return err
+		}
+		t := time.Unix(0, r.Mtime)
+		_ = root.Chtimes(".", t, t)
+	}
+	return nil
+}
+
+// specialBits maps setuid, setgid and sticky from a stat mode to Go's.
+func specialBits(mode uint32) os.FileMode {
+	var m os.FileMode
+	if mode&0o4000 != 0 {
+		m |= os.ModeSetuid
+	}
+	if mode&0o2000 != 0 {
+		m |= os.ModeSetgid
+	}
+	if mode&0o1000 != 0 {
+		m |= os.ModeSticky
+	}
+	return m
 }
 
 // prune removes from dst every entry the manifest does not list: the

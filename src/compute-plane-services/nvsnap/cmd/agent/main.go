@@ -209,6 +209,8 @@ func main() {
 		"Most time one fetch of a model from one peer may take")
 	flag.BoolVar(&config.NodeModelCache.SingleFlight, "node-model-cache-single-flight", false,
 		"One pod per model downloads; the others stream its download from its node (docs/design/model-cache-single-flight.md)")
+	flag.StringVar(&config.NodeModelCache.PodsRoot, "node-model-cache-pods-root", "/var/lib/nvsnap/kubelet-pods",
+		"The kubelet pods directory, mounted read-write: single flight writes waiting pods' volumes there")
 	flag.StringVar(&config.ModelVolume.TenantLabel, "model-volume-tenant-label", "",
 		"Namespace label naming the tenant a namespace belongs to; model volumes are shared only between namespaces of one tenant (empty = --tenant-label)")
 	flag.BoolVar(&config.ModelVolume.RefreshDisabled, "cache-set-refresh-disabled", false,

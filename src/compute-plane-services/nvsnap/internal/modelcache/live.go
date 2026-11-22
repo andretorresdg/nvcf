@@ -23,6 +23,10 @@ import (
 // the model volume, whose directories' times are part of the tree.
 const SignalFile = "downloaded"
 
+// SignalDownloading is what the signal file holds while the pod's own
+// download runs: the agent never streams into that volume.
+const SignalDownloading = "downloading"
+
 // LiveEntry is an entry of a tree being written: an Entry, plus what
 // tells a file renamed apart from a new one (device and inode) and its
 // change time. A follower copies by these.

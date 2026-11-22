@@ -81,14 +81,15 @@ The agent writes each pod's plan into the key's directory, which the init mounts
 | Plan | The helper |
 |---|---|
 | `download` | Runs the download. When it exits 0, the helper writes the tree's fingerprint to the signal volume (below) and does not exit yet: it waits for `<key>/.final-<pod uid>` (3.4), at most `--final-wait` (120 s), then exits as today. |
-| `wait` | Waits while `<key>/.streaming` is fresh. When `<key>/.done-<pod uid>` appears, the agent has filled the pod's volume and checked it: the helper exits `seeded`. |
+| `wait` | Waits while `<key>/.streaming-<pod uid>` is fresh: its own stream, so another pod's ending never ends it. When `<key>/.done-<pod uid>` appears, the agent has filled the pod's volume and checked it: the helper exits `seeded`. |
 | (none yet) | Waits for a plan for at most `--plan-wait` (60 s), then behaves as without single flight. |
 
 A `wait` plan can change to `download` (the holder failed, 5). The agent first stops writing the pod's volume and
 empties it, then writes the plan. The helper downloads into an empty volume.
 
-A helper that gave up waiting for a plan and started its download is downloading. When the agent finds a non-empty
-volume and no plan, it writes none, so it never streams into a volume a download writes.
+A helper that gave up waiting for a plan writes `downloading` to the signal volume before its download writes
+anything. The agent writes no plan for such a pod, nor for a pod whose volume is not empty, and a stream already
+running checks the signal before each pass of writes and stops. It never writes into a volume a download writes.
 
 The helper knows its pod's uid from `NVSNAP_POD_UID`, a downward-API env var admission adds last to the wrapped init.
 Resolving the key strips exactly that entry, as it strips the wrapper's command and mounts. Admission does not wrap an
@@ -100,7 +101,7 @@ of 1 MiB mounted only into the wrapped init (`--signal`). The helper writes `dow
 fingerprint, once its download exits 0. The agent reads it from the host, and knows the download is over while the
 init is still running. Resolving the key strips that mount as well.
 
-The streaming heartbeat is `.streaming`, not today's `.incoming`. A helper from before single flight waits on
+The streaming heartbeat is `.streaming-<pod uid>`, not today's `.incoming`. A helper from before single flight waits on
 `.incoming` for at most `--wait` (600 s), and must not be held by a 30-minute stream.
 
 The helper and the flags admission passes it always match: admission mounts the helper from its own bundle version
@@ -121,7 +122,9 @@ opening it, so a pod that swaps a directory for a symlink cannot lead the agent 
 files the final manifest lists are served, and only while their device, inode and change time are unchanged.
 
 A streaming node's agent writes straight into its own pod's volume (the `emptyDir`, on the host), while the pod's
-helper waits. This adds no copy in the cache and no seed on the pod's critical path. The cache gets its copy afterwards
+helper waits. The agent reads pods through a read-only view of the host, so the chart mounts the kubelet pods
+directory read-write for this (`agent.nodeModelCache.kubeletPodsDir`). The agent checks at start that it can write
+there; if not, single flight stays off, and admission adds no plans. This adds no copy in the cache and no seed on the pod's critical path. The cache gets its copy afterwards
 by an ordinary harvest of that volume.
 
 - It polls `live` every 2 s. A file is copied once its size, mtime and change time have not changed for 10 s, and
@@ -135,14 +138,15 @@ by an ordinary harvest of that volume.
 already streaming, the one with the fewest consumers, at most 3 each. Each node then sends at most 3 copies, so 30
 pods form a tree 4 levels deep. Each level adds its settle time (about 10 s per file), not a full copy. The choice is
 recorded in the Lease's annotations (`nvsnap.io/feeds-<node>`), updated with the Lease's resourceVersion. If a
-node's source fails, it picks another.
+node's source fails, it picks another: the failed one leaves the annotation, so no node picks it again, and a node
+never picks one that streams from it (a cycle).
 
 ### 3.4 The end of the download
 
 The holder's download has exited 0, and its helper is still running and holding the init open, so nothing else
 writes the volume.
 
-1. When the signal appears, the holder's agent scans the volume. Nothing else writes it while the init is held, so
+1. When the signal appears, the holder's agent scans the volume, in the background so a tick does not wait on it. Nothing else writes it while the init is held, so
    this is the download's tree, and its fingerprint must equal the signal's.
 2. It builds the final manifest from the hashes it made as files settled, hashing only the rest. Each hash is reused
    only while the file's device, inode, size, mtime and change time are those it was made for.
@@ -150,7 +154,8 @@ writes the volume.
 4. The holder's helper compares that fingerprint with its own scan of the volume. It reports a mismatch in its
    termination message, then exits, and its engine starts. A mismatch means something else wrote the volume during
    the hold (a sidecar). The agent then keeps no copy, and counts the mismatch.
-5. The agent harvests the volume into its cache as today, lists itself as a source, and releases the Lease.
+5. The agent harvests the volume into its cache as today, lists itself as a source, and releases the Lease only
+   once it is listed, so a pod that arrives in between fetches the copy rather than downloading.
 
 Holding the init open closes a race the cache has today: an engine that writes into its volume at once would change
 the tree before the agent reads it. Here the manifest is read while the volume is quiet.
@@ -193,6 +198,9 @@ The 4-pod, 1.56 TB example, all on nodes with no copy:
 | Holder makes no progress for 5 min (no entry's size or mtime changes) | Streaming nodes stop their heartbeat, and their helpers download. A downloader that writes nothing into the volume until the end looks like a stall, so this costs it 5 minutes and a second download, as today. Reading the pod's network bytes would tell it apart; that is section 9. |
 | Final manifest not ready within 120 s | The holder's helper exits anyway. The agent harvests as today if it can; streaming nodes see `failed` and download. |
 | A streamed file fails its hash at the end | It is copied again from the source's final tree. A second mismatch fails the stream, and the pod downloads. |
+| A stream does not finish within 5 hours, or starts over 20 times | It stops before the helper's own 6-hour bound, so it never writes into a volume the helper has given up on. The pod downloads. |
+| The holder's Lease update conflicts (streaming pods record their sources on it) | The renewal is retried; only another holder ends it. |
+| The holder published a copy, and a stream fails | No takeover: a new download would repeat a published copy. The stream retries until its deadline. |
 | Agent restarts on a streaming node | The heartbeat goes stale, and the helper downloads. Before writing the `download` plan, the agent empties the volume it was writing. The plan is written only after that, so the helper downloads into an empty volume. |
 | No plan within 60 s (agent down) | The pod downloads, as without single flight. |
 | Lease API unavailable | No election. Each pod downloads, as today. |
