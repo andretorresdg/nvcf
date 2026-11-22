@@ -3001,8 +3001,9 @@ struct rt { int oif, type, len, family; unsigned char dst[16]; };
 
 /* The routes of address family FAM in every table, as UCX reads them
  * (RTM_GETROUTE dump; a route without an interface or a destination it
- * needs is left out): up to N into RT. Their count, or -1. */
-static int rt_dump(int fam, struct rt *rt, int n)
+ * needs is left out): each to EACH as it arrives, however many there are.
+ * Their count, or -1. */
+static int rt_dump(int fam, void (*each)(const struct rt *, void *), void *arg)
 {
     struct { struct nlmsghdr h; struct rtmsg r; } req = {
         { NLMSG_LENGTH(sizeof(struct rtmsg)), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, 0 },
@@ -3023,7 +3024,7 @@ static int rt_dump(int fam, struct rt *rt, int n)
                 done = 1;
                 break;
             }
-            if (h->nlmsg_type != RTM_NEWROUTE || k >= n) continue;
+            if (h->nlmsg_type != RTM_NEWROUTE) continue;
             struct rtmsg *m = NLMSG_DATA(h);
             struct rt e = { -1, m->rtm_type, m->rtm_dst_len, m->rtm_family, { 0 } };
             int alen = RTM_PAYLOAD(h), dst = 0;
@@ -3034,11 +3035,24 @@ static int rt_dump(int fam, struct rt *rt, int n)
                     dst = 1;
                 }
             }
-            if (e.oif != -1 && (!e.len || dst)) rt[k++] = e;
+            if (e.oif != -1 && (!e.len || dst)) each(&e, arg), k++;
         }
     }
     close(fd);
     return k;
+}
+
+struct rt_match { const unsigned char *a; int bits, oif, type, best, dev; };
+
+static void rt_match(const struct rt *e, void *arg)
+{
+    struct rt_match *q = arg;
+    int full = e->len / 8, rem = e->len % 8;
+    if ((q->oif >= 0 && e->oif != q->oif) || (q->type && e->type != q->type) || e->len > q->bits || e->len <= q->best)
+        return;
+    if (memcmp(q->a, e->dst, full) || (rem && ((q->a[full] ^ e->dst[full]) & (0xff << (8 - rem)) & 0xff))) return;
+    q->best = e->len;
+    q->dev = e->oif;
 }
 
 /* The longest prefix among the routes that hold SA, out of interface OIF
@@ -3046,21 +3060,14 @@ static int rt_dump(int fam, struct rt *rt, int n)
  * -1 if none. */
 static int rt_len(const struct sockaddr *sa, int oif, int type, int *dev)
 {
-    struct rt rt[1024];
-    const unsigned char *a = sa->sa_family == AF_INET ? (const unsigned char *)&((const struct sockaddr_in *)sa)->sin_addr
-                           : sa->sa_family == AF_INET6 ? (const unsigned char *)&((const struct sockaddr_in6 *)sa)->sin6_addr
-                           : NULL;
-    int bits = sa->sa_family == AF_INET ? 32 : 128, best = -1, n;
-    if (!a || (n = rt_dump(sa->sa_family, rt, 1024)) < 0) return -1;
-    for (int i = 0; i < n; i++) {
-        const struct rt *e = &rt[i];
-        int full = e->len / 8, rem = e->len % 8;
-        if ((oif >= 0 && e->oif != oif) || (type && e->type != type) || e->len > bits || e->len <= best) continue;
-        if (memcmp(a, e->dst, full) || (rem && ((a[full] ^ e->dst[full]) & (0xff << (8 - rem)) & 0xff))) continue;
-        best = e->len;
-        *dev = e->oif;
-    }
-    return best;
+    struct rt_match q = {
+        sa->sa_family == AF_INET ? (const unsigned char *)&((const struct sockaddr_in *)sa)->sin_addr
+        : sa->sa_family == AF_INET6 ? (const unsigned char *)&((const struct sockaddr_in6 *)sa)->sin6_addr
+        : NULL,
+        sa->sa_family == AF_INET ? 32 : 128, oif, type, -1, -1 };
+    if (!q.a || rt_dump(sa->sa_family, rt_match, &q) < 0) return -1;
+    if (q.best >= 0) *dev = q.dev;
+    return q.best;
 }
 
 int ucs_netlink_route_exists(int if_index, const struct sockaddr *sa_remote, int *netmask_len_p)

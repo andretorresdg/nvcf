@@ -15,7 +15,8 @@ again. The test checks that
   * in a new one, the routes are read again, from every table (loopback is
     local, a TEST-NET address has no route, and one with a route only in
     table 200, as the RoCE interfaces in a pod have, has one), for UCX 1.22;
-  * any other UCX version keeps UCX's answers.
+  * any other UCX version keeps UCX's answers;
+  * a route the kernel lists after more than 1,024 others still counts.
 
 Needs root, or passwordless sudo, for the network namespace.
 Run: python3 -I tests/gpushare/host/test_ucx_routes.py
@@ -83,8 +84,8 @@ PROBE = r"""
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-/* 198.51.100.0/24 dev lo, in table 200 only. */
-static int add_table_route(void)
+/* DST/24 dev lo, in table 200 only. */
+static int add_table_route(const char *dst_s)
 {
     struct { struct nlmsghdr h; struct rtmsg r; char a[64]; } q = {
         { NLMSG_LENGTH(sizeof(struct rtmsg)), RTM_NEWROUTE, NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, 1, 0 },
@@ -93,7 +94,7 @@ static int add_table_route(void)
     struct in_addr dst;
     int oif = 1, s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     char ack[256];
-    inet_pton(AF_INET, "198.51.100.0", &dst);
+    inet_pton(AF_INET, dst_s, &dst);
     struct rtattr *a = (struct rtattr *)((char *)&q + NLMSG_ALIGN(q.h.nlmsg_len));
     a->rta_type = RTA_DST; a->rta_len = RTA_LENGTH(4); memcpy(RTA_DATA(a), &dst, 4);
     q.h.nlmsg_len = NLMSG_ALIGN(q.h.nlmsg_len) + RTA_ALIGN(a->rta_len);
@@ -122,7 +123,13 @@ int main(int argc, char **argv)
         ifr.ifr_flags |= IFF_UP;
         if (ioctl(s, SIOCSIFFLAGS, &ifr)) { perror("lo up"); return 2; }
         close(s);
-        if (add_table_route()) { fprintf(stderr, "route in table 200 not added\n"); return 2; }
+        /* "many": 1,100 routes listed before the one the probe looks up. */
+        for (int i = 0; argc > 4 && i < 1100; i++) {
+            char d[32];
+            snprintf(d, sizeof(d), "10.%d.%d.0", i / 256, i % 256);
+            if (add_table_route(d)) { fprintf(stderr, "route %s not added\n", d); return 2; }
+        }
+        if (add_table_route("198.51.100.0")) { fprintf(stderr, "route in table 200 not added\n"); return 2; }
     }
     probe("then");
     fflush(stdout);
@@ -167,10 +174,10 @@ class UcxRoutes(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def run_probe(self, minor, new_netns):
+    def run_probe(self, minor, new_netns, many=False):
         cmd = [*self.root, "env", "LD_PRELOAD=" + os.path.join(self.tmp, "libnvsnap_gpushare.so"),
                "LD_LIBRARY_PATH=" + self.tmp, "UCX_MINOR=%d" % minor,
-               self.probe_bin, self.ucp, self.uct] + (["newns"] if new_netns else [])
+               self.probe_bin, self.ucp, self.uct] + (["newns"] if new_netns else []) + (["many"] if many else [])
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         out = dict(kv.split("=", 1) for kv in p.stdout.split())
@@ -194,6 +201,11 @@ class UcxRoutes(unittest.TestCase):
         self.assertEqual(out["then_local"], "1", out)  # lo
         self.assertEqual((out["then_tbl"], out["then_tbl_len"]), ("1", "24"), out)
         self.assertIn("UCX route checks read the routes again", err)
+
+    def test_route_after_many_others_counts(self):
+        out, _ = self.run_probe(22, True, many=True)
+        self.assertEqual((out["then_tbl"], out["then_tbl_len"]), ("1", "24"), out)
+        self.assertEqual((out["then_lo"], out["then_lo_len"], out["then_local"]), ("1", "32", "1"), out)
 
     def test_other_ucx_version_keeps_ucx_answers(self):
         out, err = self.run_probe(21, True)
