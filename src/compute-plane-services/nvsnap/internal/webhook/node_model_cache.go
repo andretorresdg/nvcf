@@ -60,7 +60,17 @@ type NodeModelCache struct {
 	// Tenants scopes keys: a tree downloaded with one tenant's
 	// credentials is never seeded into another tenant's pod.
 	Tenants TenantScoper
+	// PlanWait, when positive, turns on single flight
+	// (docs/design/model-cache-single-flight.md): the helper waits that
+	// many seconds for the agent's plan for its pod (download, or wait
+	// for a node that downloads), and reads it by the pod's uid.
+	PlanWait int
 }
+
+// PodUIDEnv gives a wrapped download init its pod's uid, from the
+// downward API, so the helper can read its pod's plan. It is the wrapper's
+// own, like its command and mounts, so it is not part of the key.
+const PodUIDEnv = modelcache.PodUIDEnv
 
 // orchestrationEnv are env var prefixes the platform sets per instance or
 // deployment (names, namespaces, ids). They do not steer what a download
@@ -99,6 +109,15 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 	for _, w := range d.Watch {
 		argv = append(argv, "--watch", w)
 	}
+	if c.PlanWait > 0 {
+		for _, e := range init.Env {
+			if e.Name == PodUIDEnv {
+				log.WithField("init", init.Name).Info("node model cache: not wrapping; the init sets " + PodUIDEnv + " itself")
+				return nil
+			}
+		}
+		argv = append(argv, "--plan-wait", strconv.Itoa(c.PlanWait))
+	}
 	argv = append(append(argv, "--"), containerArgv(init)...)
 	base := fmt.Sprintf("/spec/initContainers/%d", idx)
 	patches := []PatchOp{{Op: "replace", Path: base + "/command", Value: argv}}
@@ -109,6 +128,14 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 	if !ok {
 		log.WithField("init", init.Name).Info("node model cache: not wrapping; the init already uses a path or volume name the cache needs")
 		return nil
+	}
+	if c.PlanWait > 0 {
+		uid := corev1.EnvVar{Name: PodUIDEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}
+		if init.Env == nil {
+			patches = append(patches, PatchOp{Op: "add", Path: base + "/env", Value: []corev1.EnvVar{uid}})
+		} else {
+			patches = append(patches, PatchOp{Op: "add", Path: base + "/env/-", Value: uid})
+		}
 	}
 	if init.VolumeMounts == nil {
 		patches = append(patches, PatchOp{Op: "add", Path: base + "/volumeMounts", Value: mounts})
@@ -227,9 +254,22 @@ func unwrapModelCache(pod *corev1.Pod) (*corev1.Pod, bool, bool) {
 			}
 		}
 		oc.VolumeMounts = mounts
+		// The pod-uid variable the wrapper adds is last; the wrapper does
+		// not wrap an init that set one itself.
+		if n := len(oc.Env); n > 0 && isPodUIDEnv(oc.Env[n-1]) {
+			oc.Env = oc.Env[:n-1]
+			if len(oc.Env) == 0 {
+				oc.Env = nil
+			}
+		}
 		return out, true, true
 	}
 	return pod, false, true
+}
+
+func isPodUIDEnv(e corev1.EnvVar) bool {
+	return e.Name == PodUIDEnv && e.Value == "" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil &&
+		e.ValueFrom.FieldRef.FieldPath == "metadata.uid"
 }
 
 // seedable reports whether the download init at idx can be replaced by a

@@ -412,3 +412,73 @@ func TestModelCacheKeyCoversUserPodAndNodeEnv(t *testing.T) {
 		}
 	}
 }
+
+// Single flight: the helper reads its pod's plan by the pod's uid, from a
+// downward-API env var the wrapper adds; wrapping must not change the key.
+func TestNodeModelCacheSingleFlightGivesTheHelperItsPodUID(t *testing.T) {
+	m := nodeCacheMutator(t)
+	m.NodeModelCache.PlanWait = 60
+	pod := ngcFunctionPod()
+	before, _ := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, pod, 0)
+	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
+	init := initByName(out, "download-ngc-model")
+	var uid *corev1.EnvVar
+	for i := range init.Env {
+		if init.Env[i].Name == PodUIDEnv {
+			uid = &init.Env[i]
+		}
+	}
+	if uid == nil || uid.ValueFrom == nil || uid.ValueFrom.FieldRef == nil || uid.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
+		t.Fatalf("init env = %+v; want %s from metadata.uid", init.Env, PodUIDEnv)
+	}
+	if !strings.Contains(strings.Join(init.Command, " "), "--plan-wait 60 --") {
+		t.Fatalf("init command = %q; want --plan-wait 60", init.Command)
+	}
+	after, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, out, 0)
+	if !ok || after.Key != before.Key {
+		t.Fatalf("key after wrapping %q ok=%v; want %q", after.Key, ok, before.Key)
+	}
+}
+
+func TestNodeModelCacheWithoutSingleFlightAddsNoPlanWait(t *testing.T) {
+	m := nodeCacheMutator(t)
+	pod := ngcFunctionPod()
+	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
+	init := initByName(out, "download-ngc-model")
+	for _, e := range init.Env {
+		if e.Name == PodUIDEnv {
+			t.Fatalf("env %s added with single flight off", PodUIDEnv)
+		}
+	}
+	if strings.Contains(strings.Join(init.Command, " "), "--plan-wait") {
+		t.Fatalf("init command = %q", init.Command)
+	}
+}
+
+// An init that already names the variable keeps its own; the wrapper does
+// not wrap it rather than shadow or remove the user's value.
+func TestNodeModelCacheSingleFlightLeavesAnInitThatNamesThePodUIDEnv(t *testing.T) {
+	m := nodeCacheMutator(t)
+	m.NodeModelCache.PlanWait = 60
+	pod := ngcFunctionPod()
+	c := initByName(pod, "download-ngc-model")
+	c.Env = append(c.Env, corev1.EnvVar{Name: PodUIDEnv, Value: "mine"})
+	if p := m.nodeModelCachePatches(context.Background(), pod, true); p != nil {
+		t.Fatalf("wrapped an init that names %s: %+v", PodUIDEnv, p)
+	}
+}
+
+// The user's own variable of that name, with no wrapper, is part of the
+// recipe like any other.
+func TestModelCacheKeyKeepsAUserPodUIDEnvOnAnUnwrappedInit(t *testing.T) {
+	key := func(v string) string {
+		p := ngcFunctionPod()
+		c := initByName(p, "download-ngc-model")
+		c.Env = append(c.Env, corev1.EnvVar{Name: PodUIDEnv, Value: v})
+		d, _ := ResolveModelCacheDownload(context.Background(), nil, p, 0)
+		return d.Key
+	}
+	if key("a") == key("b") {
+		t.Fatal("a user's own variable left out of the key")
+	}
+}

@@ -4,6 +4,7 @@ go_library(
     name = "modelcache",
     srcs = [
         "modelcache.go",
+        "plan.go",
         "walk.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache",

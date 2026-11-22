@@ -34,6 +34,9 @@ func modelCacheCmd(args []string) (int, error) {
 	stale := fs.Int("stale", 20, "seconds after which the fetch heartbeat counts as dead")
 	poll := fs.Duration("poll", 2*time.Second, "how often to look again while waiting")
 	maxEntries := fs.Int("max-entries", 500000, "most entries a tree may have to be reported for caching")
+	planWait := fs.Int("plan-wait", 0, "single flight: most seconds to wait for the agent's plan for this pod (0: no plans)")
+	maxWait := fs.Int("max-wait", 6*3600, "single flight: most seconds a pod told to wait waits in all")
+	finalWait := fs.Int("final-wait", 120, "single flight: most seconds the downloading pod's init stays open for the agent's final manifest")
 	var watch tryFlags
 	fs.Var(&watch, "watch", "another writable volume a later container reads: if the download changes it, the download is not cached (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -43,9 +46,17 @@ func modelCacheCmd(args []string) (int, error) {
 	if *cache == "" || *to == "" || len(argv) == 0 {
 		return 2, errors.New("model-cache: --cache, --to and the download command are required")
 	}
-	if seedFromCache(*cache, *to, time.Duration(*wait)*time.Second, time.Duration(*stale)*time.Second, *poll) {
+	w := waitRules{wait: time.Duration(*wait) * time.Second, stale: time.Duration(*stale) * time.Second, poll: *poll}
+	if *planWait > 0 {
+		w.uid, w.planWait, w.maxWait = os.Getenv(modelcache.PodUIDEnv), time.Duration(*planWait)*time.Second, time.Duration(*maxWait)*time.Second
+	}
+	switch seedFromCache(*cache, *to, w) {
+	case filled:
 		report(modelcache.InitSeeded)
 		return 0, nil
+	case streamStopped:
+		// The agent wrote part of a tree; the download starts afresh.
+		emptyDir(*to)
 	}
 	fmt.Println("nvsnap: model cache: downloading")
 	before := treesOf(watch, *maxEntries)
@@ -59,7 +70,13 @@ func modelCacheCmd(args []string) (int, error) {
 		if after := treesOf(watch, *maxEntries); after != before {
 			fmt.Println("nvsnap: model cache: the download changed another volume; it is not cached")
 		} else if ents, serr := modelcache.Scan(*to, *maxEntries); serr == nil {
-			msg += " " + modelcache.TreeField + modelcache.Fingerprint(ents)
+			tree := modelcache.Fingerprint(ents)
+			msg += " " + modelcache.TreeField + tree
+			if w.uid != "" && modelcache.ReadPlan(*cache, w.uid) == modelcache.PlanDownload {
+				if !holdForFinal(*cache, w.uid, tree, time.Duration(*finalWait)*time.Second, w.poll) {
+					msg += " " + modelcache.FinalMismatch
+				}
+			}
 		}
 		report(msg)
 	}
@@ -72,37 +89,125 @@ var terminationLog = "/dev/termination-log"
 
 func report(msg string) { _ = os.WriteFile(terminationLog, []byte(msg), 0o644) }
 
-// seedFromCache fills to from the cache and reports whether it did. It
-// leaves to as it found it otherwise.
-func seedFromCache(cache, to string, wait, stale, poll time.Duration) bool {
+// holdForFinal keeps the downloading pod's init open until the agent has
+// read the volume for its final manifest (nothing else writes it while
+// the init runs), or for at most wait. It reports false when the agent's
+// manifest is of another tree than the download left.
+func holdForFinal(cache, uid, tree string, wait, poll time.Duration) bool {
+	p := filepath.Join(cache, modelcache.FinalFile(uid))
+	deadline := time.Now().Add(wait)
+	for {
+		if b, err := os.ReadFile(p); err == nil {
+			if strings.TrimSpace(string(b)) != tree {
+				fmt.Println("nvsnap: model cache: the final manifest is not of the tree the download left")
+				return false
+			}
+			fmt.Println("nvsnap: model cache: other nodes have the final manifest")
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			if wait > 0 {
+				fmt.Printf("nvsnap: model cache: no final manifest after %s\n", wait)
+			}
+			return true
+		}
+		time.Sleep(poll)
+	}
+}
+
+// waitRules bound how long the helper waits for a copy instead of
+// downloading.
+type waitRules struct {
+	// wait bounds a wait on the agent's fetch heartbeat without a plan;
+	// stale is the heartbeat's age past which the fetch counts as dead.
+	wait, stale, poll time.Duration
+	// Single flight: uid is the pod's uid ("" without single flight);
+	// planWait bounds the wait for a plan; maxWait bounds a wait plan.
+	uid               string
+	planWait, maxWait time.Duration
+}
+
+// outcome is how seedFromCache ended.
+type outcome int
+
+const (
+	mustDownload  outcome = iota // the volume is as it was; download
+	filled                       // the volume holds the model
+	streamStopped                // the agent wrote part of a tree; empty, then download
+)
+
+// seedFromCache fills to from the cache, or waits for the agent to fill
+// it, and says how it ended.
+//
+// With single flight the agent plans each pod. "download" runs the
+// download at once. "wait" waits while the agent streams into the volume
+// (StreamingFile fresh), however long the node it copies from takes, up to
+// maxWait, and ends when the agent marks the volume done. With no plan
+// within planWait, or no pod uid, the rules without single flight apply:
+// seed a complete generation, waiting only while a fetch's heartbeat is
+// fresh, and never past wait.
+func seedFromCache(cache, to string, w waitRules) outcome {
 	if ents, err := os.ReadDir(to); err != nil || len(ents) > 0 {
 		// A restarted init finds what its last run downloaded; the
 		// download knows how to go on from it.
 		fmt.Println("nvsnap: model cache: the volume already has content; the download goes on from it")
-		return false
+		return mustDownload
 	}
-	deadline := time.Now().Add(wait)
+	start := time.Now()
+	waiting := false
 	for {
-		if gen, m, ok := modelcache.LatestIn(cache); ok {
-			start := time.Now()
-			err := modelcache.Seed(gen, m, to)
-			if err == nil {
-				fmt.Printf("nvsnap: model cache: seeded %d bytes from %s in %s\n", m.Bytes, filepath.Base(gen), time.Since(start).Round(time.Millisecond))
-				return true
+		plan := ""
+		if w.uid != "" {
+			plan = modelcache.ReadPlan(cache, w.uid)
+		}
+		switch {
+		case plan == modelcache.PlanDownload:
+			fmt.Println("nvsnap: model cache: this pod downloads; other nodes copy from it")
+			if waiting {
+				return streamStopped
 			}
-			fmt.Println("nvsnap: model cache: the cached copy is unusable:", err)
-			emptyDir(to)
-			return false
+			return mustDownload
+		case plan == modelcache.PlanWait:
+			if !waiting {
+				fmt.Println("nvsnap: model cache: another node downloads this model; the agent copies it here")
+				waiting = true
+			}
+			if _, err := os.Stat(filepath.Join(cache, modelcache.DoneFile(w.uid))); err == nil {
+				fmt.Printf("nvsnap: model cache: copied from another node in %s\n", time.Since(start).Round(time.Second))
+				return filled
+			}
+			if !heartbeatFresh(filepath.Join(cache, modelcache.StreamingFile), w.stale) {
+				fmt.Println("nvsnap: model cache: the copy stopped; downloading")
+				return streamStopped
+			}
+			if time.Since(start) > w.maxWait {
+				fmt.Printf("nvsnap: model cache: no copy after %s; downloading\n", w.maxWait)
+				return streamStopped
+			}
+		case w.uid != "" && time.Since(start) < w.planWait:
+			// The agent has not planned this pod yet.
+		default:
+			if gen, m, ok := modelcache.LatestIn(cache); ok {
+				began := time.Now()
+				err := modelcache.Seed(gen, m, to)
+				if err == nil {
+					fmt.Printf("nvsnap: model cache: seeded %d bytes from %s in %s\n", m.Bytes, filepath.Base(gen), time.Since(began).Round(time.Millisecond))
+					return filled
+				}
+				fmt.Println("nvsnap: model cache: the cached copy is unusable:", err)
+				emptyDir(to)
+				return mustDownload
+			}
+			if !heartbeatFresh(filepath.Join(cache, modelcache.IncomingFile), w.stale) {
+				fmt.Println("nvsnap: model cache: no copy on this node")
+				return mustDownload
+			}
+			if time.Since(start) > w.wait {
+				fmt.Printf("nvsnap: model cache: no copy after %s\n", w.wait)
+				return mustDownload
+			}
 		}
-		if !heartbeatFresh(filepath.Join(cache, modelcache.IncomingFile), stale) {
-			fmt.Println("nvsnap: model cache: no copy on this node")
-			return false
-		}
-		if time.Now().After(deadline) {
-			fmt.Printf("nvsnap: model cache: no copy after %s\n", wait)
-			return false
-		}
-		time.Sleep(poll)
+		time.Sleep(w.poll)
 	}
 }
 
