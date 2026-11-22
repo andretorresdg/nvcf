@@ -31,6 +31,7 @@ import (
 	"hash"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -313,6 +314,9 @@ func (m Manifest) Check(lim Limits) error {
 			if _, err := hex.DecodeString(e.SHA256); err != nil {
 				return fmt.Errorf("%w: file %q checksum", ErrUnsupported, e.Path)
 			}
+			if e.Size > math.MaxInt64-total {
+				return fmt.Errorf("%w: file sizes overflow", ErrTooLarge)
+			}
 			total += e.Size
 		case TypeSymlink:
 			if !validLink(e.Path, e.Target) {
@@ -415,9 +419,10 @@ func (s *Store) Harvest(key, src string, lim Limits) (string, error) {
 // through its parent's descriptor, checking it is the regular file it
 // examined, before copying any. The tree is then checked against its
 // fingerprint and the bounds, and the files copied Parallel at a time from
-// those descriptors: a pod torn down mid-harvest takes its volume's names
-// away, not the open files. A file that changed during its copy, or
-// anything changed after lim.NotAfter, is refused.
+// those descriptors. A file that changed during its copy (its size, mtime
+// or change time), or anything changed after lim.NotAfter, is refused; so
+// is a harvest the pod's teardown overtakes, since unlinking a file changes
+// it too.
 func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	m := Manifest{Version: ManifestVersion}
 	root, err := rootEntry(src)
@@ -561,7 +566,11 @@ func copyFrom(in *os.File, st unix.Stat_t, dst string) (string, error) {
 	if err := unix.Fstat(int(in.Fd()), &after); err != nil {
 		return "", err
 	}
-	if k != st.Size || after.Size != st.Size || after.Mtim != st.Mtim {
+	// The change time catches what size and mtime do not: a rewrite in
+	// place with its mtime set back, and an unlink (a pod torn down
+	// mid-harvest), after which nothing says the open file is still the
+	// download's.
+	if k != st.Size || after.Size != st.Size || after.Mtim != st.Mtim || after.Ctim != st.Ctim {
 		return "", ErrChanged
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

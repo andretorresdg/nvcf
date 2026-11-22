@@ -317,6 +317,12 @@ func TestModelCacheReserveRefusesPastTheBudget(t *testing.T) {
 	if _, err := a.c.reserve(context.Background(), 100); err == nil {
 		t.Fatal("a reservation went under the free-space floor")
 	}
+	// A negative request would shrink what is promised and let others past
+	// the budget.
+	a.c.statfs = func(string) (int64, int64, error) { return 1000, 1000, nil }
+	if _, err := a.c.reserve(context.Background(), -500); err == nil {
+		t.Fatal("a negative reservation was accepted")
+	}
 }
 
 func TestModelCacheFileRouteStaysInTheTree(t *testing.T) {

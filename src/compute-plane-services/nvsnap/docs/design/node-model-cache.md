@@ -55,12 +55,14 @@ cluster would need an elected writer and a wait on it; it is not built (section 
 ## 4. Design
 
 **Key.** A download's key is a hash of:
+
 - the tenant of the pod's namespace;
 - the model identity and its layout in the volume (`modelid` `ShareKey`);
 - the download init's image;
 - its command and arguments;
 - its env in declared order, except the platform's per-instance metadata (`GROVE_*`, `NVCF_*`, `KUBERNETES_*`,
-  `POD_*`, `NODE_*`, `HOSTNAME`, `OTEL_*`), which would split every redeploy's key;
+  `HOSTNAME`, `OTEL_*`), which would split every redeploy's key. A value from a field reference (the pod's own
+  name, labels, node) is keyed by its path, so it does not split the key;
 - its `envFrom` sources in order (the last one wins);
 - its volume mounts, each with its volume's full source;
 - the pod's and the init's security contexts (`fsGroup` and the users decide the owners a download leaves).
@@ -96,6 +98,7 @@ Admission cannot tell, so it passes each one to the helper with `--watch`. The h
 before and after the download; a download that changed one is not cached.
 
 **The helper**, in the init:
+
 1. If the volume already has content, a restarted init, it runs the download, which knows how to continue.
    Copies run 8 files at a time: a model of a terabyte and more, in shards of gigabytes, copies at disk or network
    speed only with several streams. The same holds for a peer fetch.
@@ -116,6 +119,7 @@ sets any owner. If not, every entry must belong to the helper's own user, as whe
 otherwise it refuses before writing and the pod downloads. The cache's own copies are readable by any user.
 
 **The agent** (`nodeModelCache`) looks at the pods on its node every 10 s:
+
 - **Sources.** Every 5 minutes the agent makes the ConfigMaps match its disk, which repairs a registration that
   failed. A ConfigMap left with no source is deleted.
 - **Fill.** For a pod whose init has not finished and a key the node does not have, it fetches the key from a peer
@@ -127,8 +131,11 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
   init reported, so a file the engine removed, added or rewrote after starting is never cached. A download that
   reported no fingerprint is not kept.
   - The walk opens every file before copying any, then copies `Parallel` (8) files at a time from those
-    descriptors. A pod torn down mid-harvest, as the originals are once a capture's restore replaces them, takes
-    away its volume's names but not the open files, so the harvest completes.
+    descriptors. After each copy the file's size, mtime and change time must still be those the walk saw, so a
+    shard rewritten in place, even with its mtime set back, is refused. Unlinking a file changes it too, so a pod
+    torn down mid-harvest (as the originals are once a capture's restore replaces them) leaves nothing kept; the
+    next cold start downloads and harvests again. A harvest normally ends long before that: on a 1.56 TB model it
+    took about 5.5 minutes, and the engine took about 13 more to load.
   - The walk never follows a symlink anywhere in a path. Each entry is opened through its parent's descriptor and
     checked to be the entry examined, so a workload that swaps a directory for a symlink mid-walk cannot lead the
     agent out of the volume. A FIFO or device is refused without blocking.
@@ -148,6 +155,7 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
 | Peer serves bytes that do not match its manifest | The fetch is discarded; the next peer is tried; with none left, the key is not fetched again for 10 minutes |
 | Agent restarts during a fetch | The heartbeat goes stale; waiting inits download; the attempt is removed at the next start |
 | Download init fails | Nothing is harvested |
+| A file changes, or the pod is torn down, during a harvest | The harvest is discarded; the next cold start downloads and harvests again |
 | Disk short | The attempt is skipped; the pod downloads as before |
 | Feature off, or auth not required | The webhook does not wrap inits; the agent does not start the cache |
 

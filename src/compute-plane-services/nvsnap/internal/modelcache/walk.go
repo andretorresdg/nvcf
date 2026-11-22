@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 
@@ -223,12 +224,20 @@ func Fingerprint(entries []Entry) string {
 
 // AllocEstimate is the disk a tree takes, rounding each file to 4 KiB and
 // counting 4 KiB per entry for its inode and directory slot, so a tree of
-// many small files is not reserved as if it were their byte count.
+// many small files is not reserved as if it were their byte count. It
+// saturates at MaxInt64, which no budget admits, rather than wrap.
 func AllocEstimate(entries []Entry) int64 {
 	const block = 4096
 	total := int64(block) // the manifest
 	for _, e := range entries {
-		total += block + (e.Size+block-1)/block*block
+		if e.Size < 0 || e.Size > math.MaxInt64-2*block {
+			return math.MaxInt64
+		}
+		n := block + (e.Size+block-1)/block*block
+		if n > math.MaxInt64-total {
+			return math.MaxInt64
+		}
+		total += n
 	}
 	return total
 }

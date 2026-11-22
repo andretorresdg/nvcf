@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -499,21 +500,52 @@ func TestParallelSeedCopiesEveryShardAndCatchesOneBadOne(t *testing.T) {
 	}
 }
 
-// The pod whose volume is harvested may be torn down mid-harvest: the files
-// are open by then, and the copy completes.
-func TestHarvestCompletesWhenTheVolumeGoesAwayMidHarvest(t *testing.T) {
-	src := modelTree(t)
-	afterOpen = func() { must(t, os.RemoveAll(src)) }
-	defer func() { afterOpen = nil }()
-	s := &Store{Root: t.TempDir()}
-	harvest(t, s, "k1", src)
-	gen, m, ok := s.Latest("k1")
-	if !ok {
-		t.Fatal("nothing published")
+// A file whose inode changes during its copy is refused, whatever kept its
+// size and mtime: a shard rewritten in place with its mtime set back, and
+// a pod torn down mid-harvest (unlinking changes the inode too). Nothing
+// is published; the next cold start downloads and harvests again.
+func TestHarvestRefusesAFileChangedDuringItsCopy(t *testing.T) {
+	for name, change := range map[string]func(src string){
+		"rewritten, mtime restored": func(src string) {
+			w := filepath.Join(src, "m/weights/w-0001.safetensors")
+			fi, err := os.Stat(w)
+			must(t, err)
+			must(t, os.WriteFile(w, bytes.Repeat([]byte{9}, 3<<20), 0o644))
+			must(t, os.Chtimes(w, fi.ModTime(), fi.ModTime()))
+		},
+		"volume removed": func(src string) { must(t, os.RemoveAll(src)) },
+	} {
+		src := modelTree(t)
+		afterOpen = func() { change(src) }
+		s := &Store{Root: t.TempDir()}
+		_, err := s.Harvest("k1", src, Limits{})
+		afterOpen = nil
+		if !errors.Is(err, ErrChanged) {
+			t.Errorf("%s: err = %v, want ErrChanged", name, err)
+		}
+		if _, _, ok := s.Latest("k1"); ok {
+			t.Errorf("%s: published a copy", name)
+		}
 	}
-	dst := t.TempDir()
-	must(t, Seed(gen, m, dst))
-	if fi, err := os.Stat(filepath.Join(dst, "m/weights/w-0001.safetensors")); err != nil || fi.Size() != 3<<20 {
-		t.Fatalf("weights after a mid-harvest teardown: %v, %v", fi, err)
+}
+
+// Sizes a peer's manifest gives cannot wrap the totals that bound the copy
+// and its disk reservation.
+func TestManifestSizesCannotOverflow(t *testing.T) {
+	sum := "0000000000000000000000000000000000000000000000000000000000000000"
+	big := int64(math.MaxInt64/2 + 1)
+	m := Manifest{Version: ManifestVersion, Entries: []Entry{
+		{Path: "a", Type: TypeFile, Size: big, SHA256: sum},
+		{Path: "b", Type: TypeFile, Size: big, SHA256: sum},
+	}}
+	m.Bytes = big + big // wraps, as a lying peer would send it
+	if err := m.Check(Limits{}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("Check of a wrapping total: %v, want ErrTooLarge", err)
+	}
+	if got := AllocEstimate(m.Entries); got != math.MaxInt64 {
+		t.Fatalf("AllocEstimate = %d, want it to saturate at MaxInt64", got)
+	}
+	if got := AllocEstimate([]Entry{{Path: "a", Type: TypeFile, Size: math.MaxInt64}}); got != math.MaxInt64 {
+		t.Fatalf("AllocEstimate of one huge file = %d", got)
 	}
 }

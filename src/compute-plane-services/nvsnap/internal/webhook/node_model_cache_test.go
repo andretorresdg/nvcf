@@ -349,3 +349,66 @@ func TestModelCacheKeyIgnoresPodLocalVolumeNames(t *testing.T) {
 		t.Fatal("a pod-local volume name changed the key")
 	}
 }
+
+// An init that already mounts something else at a path the cache mounts,
+// or a pod that already has a volume of the cache's name, is left as it
+// is: a second mount at one path is a pod Kubernetes rejects.
+func TestNodeModelCacheLeavesAConflictingMountAlone(t *testing.T) {
+	m := nodeCacheMutator(t)
+	for name, mut := range map[string]func(*corev1.Pod){
+		"cache path": func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "theirs", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+			c := initByName(p, "download-ngc-model")
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "theirs", MountPath: ModelCacheMount})
+		},
+		"helper path": func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "theirs", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+			c := initByName(p, "download-ngc-model")
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "theirs", MountPath: helperMount().MountPath})
+		},
+		"cache volume name": func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: ModelCacheVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+		},
+	} {
+		pod := ngcFunctionPod()
+		mut(pod)
+		if p := m.nodeModelCachePatches(context.Background(), pod, true); p != nil {
+			t.Errorf("%s: patched a pod whose mounts conflict: %v", name, p)
+		}
+	}
+	// The helper's own volume already mounted where the helper goes is not
+	// a conflict.
+	pod := ngcFunctionPod()
+	c := initByName(pod, "download-ngc-model")
+	c.VolumeMounts = append(c.VolumeMounts, helperMount())
+	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
+	n := 0
+	for _, vm := range initByName(out, "download-ngc-model").VolumeMounts {
+		if vm.MountPath == helperMount().MountPath {
+			n++
+		}
+	}
+	if out.Labels[ModelCacheKeyLabel] == "" || n != 1 {
+		t.Fatalf("helper already mounted: wrapped=%v, helper mounts=%d", out.Labels[ModelCacheKeyLabel] != "", n)
+	}
+}
+
+// A user can name an env var anything, POD_ and NODE_ included; only the
+// prefixes the platform sets per instance are left out of the key.
+func TestModelCacheKeyCoversUserPodAndNodeEnv(t *testing.T) {
+	for _, name := range []string{"POD_MODEL_VARIANT", "NODE_PRECISION"} {
+		key := func(v string) string {
+			p := ngcFunctionPod()
+			c := initByName(p, "download-ngc-model")
+			c.Env = append(c.Env, corev1.EnvVar{Name: name, Value: v})
+			d, ok := ResolveModelCacheDownload(context.Background(), nil, p, 0)
+			if !ok {
+				t.Fatal("not a cache download")
+			}
+			return d.Key
+		}
+		if key("a") == key("b") {
+			t.Errorf("%s left out of the key", name)
+		}
+	}
+}

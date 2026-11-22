@@ -621,6 +621,9 @@ func (c *nodeModelCache) reserve(ctx context.Context, n int64) (func(), error) {
 		return nil, err
 	}
 	budget := total * int64(c.maxPercent) / 100
+	if n < 0 {
+		return nil, fmt.Errorf("%w: a reservation of %d bytes", errNoRoom, n)
+	}
 	if n > budget {
 		return nil, fmt.Errorf("%w: %d bytes over a %d-byte budget", errNoRoom, n, budget)
 	}

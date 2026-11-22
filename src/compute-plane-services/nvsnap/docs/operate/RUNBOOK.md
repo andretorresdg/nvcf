@@ -252,10 +252,12 @@ a copy on the node.
   `model cache: harvested`, `fetched from peer` and `evicted` with the key.
 - **Which nodes have a model?** `kubectl -n nvsnap-system get cm -l app.kubernetes.io/component=model-cache -o yaml`:
   one ConfigMap per key, one entry per node.
-- **A pod seeded a bad model.** Every copy is checked against its manifest. A tree that was wrong when it was
-  downloaded was kept as downloaded. To remove a key from a node, delete `<root>/<key>` on the node and remove the
-  node's entry from `nvsnap-model-cache-<key>`. Admission keeps wrapping inits; they download until a new copy is
-  kept.
+- **A pod seeded a bad model.** Every copy is checked against its manifest, so a bad tree was bad when it was
+  downloaded, and every node that has the key may serve it to its peers. Remove it everywhere, and keep it from being
+  kept again:
+  1. Turn the cache off (below), so no init waits on a fetch and no download is kept while you clean up.
+  2. On every node listed in `nvsnap-model-cache-<key>`, delete `<root>/<key>`. Then delete the ConfigMap.
+  3. Fix what made the download bad (the model version, the init's inputs) before turning the cache back on. A
+     download with the same inputs has the same key, and the first cold start after that keeps a copy of it again.
 - **Turn it off.** Set `agent.nodeModelCache.enabled=false` and upgrade. New pods are admitted unwrapped. The files
   under `root` stay until removed by hand.
-

@@ -65,8 +65,10 @@ type NodeModelCache struct {
 // orchestrationEnv are env var prefixes the platform sets per instance or
 // deployment (names, namespaces, ids). They do not steer what a download
 // writes and would split every redeploy's key; every other env var is part
-// of the recipe.
-var orchestrationEnv = []string{"GROVE_", "NVCF_", "KUBERNETES_", "POD_", "NODE_", "HOSTNAME", "OTEL_"}
+// of the recipe. POD_ and NODE_ are not here: a user may name a variable
+// that steers the download so, and the platform's per-pod values arrive by
+// field reference, whose path, not value, is in the recipe.
+var orchestrationEnv = []string{"GROVE_", "NVCF_", "KUBERNETES_", "HOSTNAME", "OTEL_"}
 
 // nodeModelCachePatches wraps the pod's model download init, or returns
 // nil when the pod has none the cache can serve.
@@ -103,7 +105,11 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 	if init.Args != nil {
 		patches = append(patches, PatchOp{Op: "remove", Path: base + "/args"})
 	}
-	mounts := []corev1.VolumeMount{{Name: ModelCacheVolume, MountPath: ModelCacheMount, ReadOnly: true}, helperMount()}
+	mounts, ok := cacheMounts(pod, init)
+	if !ok {
+		log.WithField("init", init.Name).Info("node model cache: not wrapping; the init already uses a path or volume name the cache needs")
+		return nil
+	}
 	if init.VolumeMounts == nil {
 		patches = append(patches, PatchOp{Op: "add", Path: base + "/volumeMounts", Value: mounts})
 	} else {
@@ -345,4 +351,32 @@ func valueFromRef(v *corev1.EnvVarSource) string {
 		return "resource " + v.ResourceFieldRef.Resource
 	}
 	return "?"
+}
+
+// cacheMounts returns the mounts the download init needs added: the cache,
+// read-only, and the helper, unless the init already mounts the helper's
+// own volume there. ok is false when the init mounts something else at
+// either path, or the pod already has a volume of the cache's name: a
+// second mount at one path is a pod Kubernetes rejects, and another
+// volume under the cache's name would be mounted in its place.
+func cacheMounts(pod *corev1.Pod, init *corev1.Container) (mounts []corev1.VolumeMount, ok bool) {
+	if podHasVolume(pod, ModelCacheVolume) {
+		return nil, false
+	}
+	for _, want := range []corev1.VolumeMount{{Name: ModelCacheVolume, MountPath: ModelCacheMount, ReadOnly: true}, helperMount()} {
+		have := false
+		for _, vm := range init.VolumeMounts {
+			if path.Clean(vm.MountPath) != path.Clean(want.MountPath) {
+				continue
+			}
+			if vm.Name != want.Name || want.Name == ModelCacheVolume {
+				return nil, false
+			}
+			have = true
+		}
+		if !have {
+			mounts = append(mounts, want)
+		}
+	}
+	return mounts, true
 }
