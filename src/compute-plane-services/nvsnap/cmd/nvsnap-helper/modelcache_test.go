@@ -313,10 +313,17 @@ func TestModelCacheDownloadPlanDownloadsAtOnce(t *testing.T) {
 // first. The helper checks the agent read the tree it downloaded.
 func TestModelCacheDownloadPlanHoldsTheExitUntilTheFinalManifest(t *testing.T) {
 	t.Setenv(modelcache.PodUIDEnv, testUID)
-	cache, to := t.TempDir(), t.TempDir()
+	cache, to, sig := t.TempDir(), t.TempDir(), t.TempDir()
 	writePlan(t, cache, modelcache.PlanDownload)
 	go func() {
-		time.Sleep(1500 * time.Millisecond)
+		// The agent waits for the helper's signal, then reads the tree.
+		for i := 0; i < 100; i++ {
+			if b, err := os.ReadFile(filepath.Join(sig, modelcache.SignalFile)); err == nil && len(b) > 0 {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		time.Sleep(time.Second)
 		ents, err := modelcache.Scan(to, 0)
 		if err != nil {
 			return
@@ -324,14 +331,19 @@ func TestModelCacheDownloadPlanHoldsTheExitUntilTheFinalManifest(t *testing.T) {
 		atomicWrite(t, cache, modelcache.FinalFile(testUID), modelcache.Fingerprint(ents)+"\n")
 	}()
 	start := time.Now()
-	if code, err := modelCacheCmd(planArgs(cache, to, "--final-wait", "30")); code != 0 || err != nil {
+	if code, err := modelCacheCmd(planArgs(cache, to, "--final-wait", "30", "--signal", sig)); code != 0 || err != nil {
 		t.Fatalf("code %d err %v", code, err)
 	}
 	if d := time.Since(start); d < time.Second || d > 6*time.Second {
 		t.Fatalf("exited after %v; want once the final manifest was ready", d)
 	}
-	if msg := read(t, terminationLog); strings.Contains(msg, modelcache.FinalMismatch) {
+	msg := read(t, terminationLog)
+	if strings.Contains(msg, modelcache.FinalMismatch) {
 		t.Fatalf("termination message %q reports a mismatch", msg)
+	}
+	// The signal holds the tree the download left, as the message does.
+	if got := strings.TrimSpace(read(t, filepath.Join(sig, modelcache.SignalFile))); got != modelcache.DownloadedTree(msg) {
+		t.Fatalf("signal %q, want the reported tree %q", got, modelcache.DownloadedTree(msg))
 	}
 }
 

@@ -431,8 +431,35 @@ func TestNodeModelCacheSingleFlightGivesTheHelperItsPodUID(t *testing.T) {
 	if uid == nil || uid.ValueFrom == nil || uid.ValueFrom.FieldRef == nil || uid.ValueFrom.FieldRef.FieldPath != "metadata.uid" {
 		t.Fatalf("init env = %+v; want %s from metadata.uid", init.Env, PodUIDEnv)
 	}
-	if !strings.Contains(strings.Join(init.Command, " "), "--plan-wait 60 --") {
-		t.Fatalf("init command = %q; want --plan-wait 60", init.Command)
+	if !strings.Contains(strings.Join(init.Command, " "), "--plan-wait 60 --signal "+ModelCacheSignalMount+" --") {
+		t.Fatalf("init command = %q; want --plan-wait 60 --signal", init.Command)
+	}
+	// The signal volume: in memory, tiny, and the init's alone.
+	var sig *corev1.Volume
+	for i := range out.Spec.Volumes {
+		if out.Spec.Volumes[i].Name == ModelCacheSignalVolume {
+			sig = &out.Spec.Volumes[i]
+		}
+	}
+	if sig == nil || sig.EmptyDir == nil || sig.EmptyDir.Medium != corev1.StorageMediumMemory || sig.EmptyDir.SizeLimit == nil {
+		t.Fatalf("signal volume = %+v", sig)
+	}
+	var mounted bool
+	for _, vm := range init.VolumeMounts {
+		mounted = mounted || (vm.Name == ModelCacheSignalVolume && vm.MountPath == ModelCacheSignalMount && !vm.ReadOnly)
+	}
+	if !mounted {
+		t.Fatalf("init mounts = %+v; want the signal volume", init.VolumeMounts)
+	}
+	for _, c := range append(append([]corev1.Container{}, out.Spec.Containers...), out.Spec.InitContainers...) {
+		if c.Name == init.Name {
+			continue
+		}
+		for _, vm := range c.VolumeMounts {
+			if vm.Name == ModelCacheSignalVolume {
+				t.Fatalf("container %s mounts the signal volume", c.Name)
+			}
+		}
 	}
 	after, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, out, 0)
 	if !ok || after.Key != before.Key {
@@ -450,8 +477,13 @@ func TestNodeModelCacheWithoutSingleFlightAddsNoPlanWait(t *testing.T) {
 			t.Fatalf("env %s added with single flight off", PodUIDEnv)
 		}
 	}
-	if strings.Contains(strings.Join(init.Command, " "), "--plan-wait") {
+	if strings.Contains(strings.Join(init.Command, " "), "--plan-wait") || strings.Contains(strings.Join(init.Command, " "), "--signal") {
 		t.Fatalf("init command = %q", init.Command)
+	}
+	for _, v := range out.Spec.Volumes {
+		if v.Name == ModelCacheSignalVolume {
+			t.Fatal("signal volume added with single flight off")
+		}
 	}
 }
 

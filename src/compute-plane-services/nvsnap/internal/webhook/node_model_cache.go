@@ -13,6 +13,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/election"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache"
@@ -34,6 +35,11 @@ const (
 	ModelCacheVolume = "nvsnap-model-cache"
 	// ModelCacheMount is where the download init sees it.
 	ModelCacheMount = "/nvsnap-model-cache"
+	// ModelCacheSignalVolume, with single flight, is an in-memory emptyDir
+	// only the wrapped init mounts, at ModelCacheSignalMount: the helper
+	// tells the agent there that its download is over.
+	ModelCacheSignalVolume = "nvsnap-model-cache-signal"
+	ModelCacheSignalMount  = "/nvsnap-model-cache-signal"
 	// ModelCacheKeyLabel carries the download's cache key, for the agent
 	// on the pod's node (harvest, peer fetch, eviction pins).
 	ModelCacheKeyLabel = "nvsnap.io/model-cache-key"
@@ -116,7 +122,7 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 				return nil
 			}
 		}
-		argv = append(argv, "--plan-wait", strconv.Itoa(c.PlanWait))
+		argv = append(argv, "--plan-wait", strconv.Itoa(c.PlanWait), "--signal", ModelCacheSignalMount)
 	}
 	argv = append(append(argv, "--"), containerArgv(init)...)
 	base := fmt.Sprintf("/spec/initContainers/%d", idx)
@@ -124,7 +130,7 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 	if init.Args != nil {
 		patches = append(patches, PatchOp{Op: "remove", Path: base + "/args"})
 	}
-	mounts, ok := cacheMounts(pod, init)
+	mounts, ok := cacheMounts(pod, init, c.PlanWait > 0)
 	if !ok {
 		log.WithField("init", init.Name).Info("node model cache: not wrapping; the init already uses a path or volume name the cache needs")
 		return nil
@@ -145,8 +151,14 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 		}
 	}
 	dir := corev1.HostPathDirectoryOrCreate
-	patches = append(patches, addVolumes(pod, []corev1.Volume{{Name: ModelCacheVolume, VolumeSource: corev1.VolumeSource{
-		HostPath: &corev1.HostPathVolumeSource{Path: path.Join(c.Root, key), Type: &dir}}}})...)
+	vols := []corev1.Volume{{Name: ModelCacheVolume, VolumeSource: corev1.VolumeSource{
+		HostPath: &corev1.HostPathVolumeSource{Path: path.Join(c.Root, key), Type: &dir}}}}
+	if c.PlanWait > 0 {
+		limit := resource.MustParse("1Mi")
+		vols = append(vols, corev1.Volume{Name: ModelCacheSignalVolume, VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: &limit}}})
+	}
+	patches = append(patches, addVolumes(pod, vols)...)
 	patches = m.withHelperVolume(pod, patches)
 	mp := newMetaPatcher(pod)
 	patches = append(patches, mp.label(ModelCacheKeyLabel, key)...)
@@ -249,7 +261,7 @@ func unwrapModelCache(pod *corev1.Pod) (*corev1.Pod, bool, bool) {
 		oc.Command, oc.Args = append([]string{}, argv[dash+1:]...), nil
 		var mounts []corev1.VolumeMount
 		for _, vm := range oc.VolumeMounts {
-			if vm.Name != ModelCacheVolume && vm.Name != helperVolumeName {
+			if vm.Name != ModelCacheVolume && vm.Name != helperVolumeName && vm.Name != ModelCacheSignalVolume {
 				mounts = append(mounts, vm)
 			}
 		}
@@ -399,17 +411,21 @@ func valueFromRef(v *corev1.EnvVarSource) string {
 // either path, or the pod already has a volume of the cache's name: a
 // second mount at one path is a pod Kubernetes rejects, and another
 // volume under the cache's name would be mounted in its place.
-func cacheMounts(pod *corev1.Pod, init *corev1.Container) (mounts []corev1.VolumeMount, ok bool) {
-	if podHasVolume(pod, ModelCacheVolume) {
+func cacheMounts(pod *corev1.Pod, init *corev1.Container, signal bool) (mounts []corev1.VolumeMount, ok bool) {
+	if podHasVolume(pod, ModelCacheVolume) || (signal && podHasVolume(pod, ModelCacheSignalVolume)) {
 		return nil, false
 	}
-	for _, want := range []corev1.VolumeMount{{Name: ModelCacheVolume, MountPath: ModelCacheMount, ReadOnly: true}, helperMount()} {
+	wants := []corev1.VolumeMount{{Name: ModelCacheVolume, MountPath: ModelCacheMount, ReadOnly: true}, helperMount()}
+	if signal {
+		wants = append(wants, corev1.VolumeMount{Name: ModelCacheSignalVolume, MountPath: ModelCacheSignalMount})
+	}
+	for _, want := range wants {
 		have := false
 		for _, vm := range init.VolumeMounts {
 			if path.Clean(vm.MountPath) != path.Clean(want.MountPath) {
 				continue
 			}
-			if vm.Name != want.Name || want.Name == ModelCacheVolume {
+			if vm.Name != want.Name || want.Name == ModelCacheVolume || want.Name == ModelCacheSignalVolume {
 				return nil, false
 			}
 			have = true

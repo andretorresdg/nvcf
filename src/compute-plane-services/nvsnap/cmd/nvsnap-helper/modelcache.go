@@ -36,6 +36,7 @@ func modelCacheCmd(args []string) (int, error) {
 	maxEntries := fs.Int("max-entries", 500000, "most entries a tree may have to be reported for caching")
 	planWait := fs.Int("plan-wait", 0, "single flight: most seconds to wait for the agent's plan for this pod (0: no plans)")
 	maxWait := fs.Int("max-wait", 6*3600, "single flight: most seconds a pod told to wait waits in all")
+	signal := fs.String("signal", "", "single flight: the signal volume where the helper tells the agent its download is over")
 	finalWait := fs.Int("final-wait", 120, "single flight: most seconds the downloading pod's init stays open for the agent's final manifest")
 	var watch tryFlags
 	fs.Var(&watch, "watch", "another writable volume a later container reads: if the download changes it, the download is not cached (repeatable)")
@@ -73,6 +74,12 @@ func modelCacheCmd(args []string) (int, error) {
 			tree := modelcache.Fingerprint(ents)
 			msg += " " + modelcache.TreeField + tree
 			if w.uid != "" && modelcache.ReadPlan(*cache, w.uid) == modelcache.PlanDownload {
+				if *signal != "" {
+					// The agent reads the volume once this is there.
+					if err := os.WriteFile(filepath.Join(*signal, modelcache.SignalFile), []byte(tree+"\n"), 0o644); err != nil {
+						fmt.Println("nvsnap: model cache: cannot signal the agent:", err)
+					}
+				}
 				if !holdForFinal(*cache, w.uid, tree, time.Duration(*finalWait)*time.Second, w.poll) {
 					msg += " " + modelcache.FinalMismatch
 				}

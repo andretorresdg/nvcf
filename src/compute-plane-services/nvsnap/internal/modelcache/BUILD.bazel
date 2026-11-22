@@ -4,6 +4,7 @@ go_library(
     name = "modelcache",
     srcs = [
         "modelcache.go",
+        "live.go",
         "plan.go",
         "walk.go",
     ],
@@ -14,7 +15,10 @@ go_library(
 
 go_test(
     name = "modelcache_test",
-    srcs = ["modelcache_test.go"],
+    srcs = [
+        "live_test.go",
+        "modelcache_test.go",
+    ],
     embed = [":modelcache"],
     deps = ["@org_golang_x_sys//unix"],
 )

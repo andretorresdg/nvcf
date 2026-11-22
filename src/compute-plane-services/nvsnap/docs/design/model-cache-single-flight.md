@@ -80,7 +80,7 @@ The agent writes each pod's plan into the key's directory, which the init mounts
 
 | Plan | The helper |
 |---|---|
-| `download` | Runs the download. When it exits 0, the helper does not exit yet: it waits for `<key>/.final-<pod uid>` (3.4), at most `--final-wait` (120 s), then exits as today. |
+| `download` | Runs the download. When it exits 0, the helper writes the tree's fingerprint to the signal volume (below) and does not exit yet: it waits for `<key>/.final-<pod uid>` (3.4), at most `--final-wait` (120 s), then exits as today. |
 | `wait` | Waits while `<key>/.streaming` is fresh. When `<key>/.done-<pod uid>` appears, the agent has filled the pod's volume and checked it: the helper exits `seeded`. |
 | (none yet) | Waits for a plan for at most `--plan-wait` (60 s), then behaves as without single flight. |
 
@@ -93,6 +93,12 @@ volume and no plan, it writes none, so it never streams into a volume a download
 The helper knows its pod's uid from `NVSNAP_POD_UID`, a downward-API env var admission adds last to the wrapped init.
 Resolving the key strips exactly that entry, as it strips the wrapper's command and mounts. Admission does not wrap an
 init that sets that variable itself.
+
+The helper cannot write the key's directory (read-only), and must not write into the model volume: any file there
+changes a directory's times, which are part of the tree. So admission adds a signal volume, an in-memory `emptyDir`
+of 1 MiB mounted only into the wrapped init (`--signal`). The helper writes `downloaded` there, holding the tree's
+fingerprint, once its download exits 0. The agent reads it from the host, and knows the download is over while the
+init is still running. Resolving the key strips that mount as well.
 
 The streaming heartbeat is `.streaming`, not today's `.incoming`. A helper from before single flight waits on
 `.incoming` for at most `--wait` (600 s), and must not be held by a 30-minute stream.
@@ -136,8 +142,8 @@ node's source fails, it picks another.
 The holder's download has exited 0, and its helper is still running and holding the init open, so nothing else
 writes the volume.
 
-1. The holder's agent scans the volume. Nothing else writes it while the init is held, so this is the download's
-   tree.
+1. When the signal appears, the holder's agent scans the volume. Nothing else writes it while the init is held, so
+   this is the download's tree, and its fingerprint must equal the signal's.
 2. It builds the final manifest from the hashes it made as files settled, hashing only the rest. Each hash is reused
    only while the file's device, inode, size, mtime and change time are those it was made for.
 3. It serves the manifest in `live` as state `done`, and writes the tree's fingerprint to `<key>/.final-<pod uid>`.
