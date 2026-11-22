@@ -36,6 +36,7 @@ Run: python3 -I tests/gpushare/host/test_rdma_nccl.py
 """
 
 import os
+import selectors
 import shutil
 import subprocess
 import sys
@@ -334,7 +335,12 @@ class RdmaNCCL(unittest.TestCase):
         self.addCleanup(p.stdout.close)
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
-        line = p.stdout.readline().strip()
+        # Bounded: a worker stuck before "ready" fails the test, and the
+        # cleanups above kill and reap it.
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+        line = p.stdout.readline().strip() if sel.select(30) else "<nothing in 30 s>"
+        sel.close()
         if line != "ready":
             self.fail("worker did not start: %r" % line)
         return p.pid

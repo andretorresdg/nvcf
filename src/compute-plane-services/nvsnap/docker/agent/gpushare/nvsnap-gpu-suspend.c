@@ -37,7 +37,8 @@ SPDX-License-Identifier: Apache-2.0
  *                 weights to peers and drops its NIXL/RDMA state, which CRIU
  *                 cannot dump. Each reply counts the RDMA device files the
  *                 pid still has open or mapped; mx-pause fails while any
- *                 are left (RDMA outside ModelExpress, too). Needs
+ *                 are left (RDMA outside ModelExpress, too), but NCCL's
+ *                 through libnvsnap_ibv, which suspend releases. Needs
  *                 ModelExpress >= 0.7: with an earlier one, mx-pause fails
  *                 (the load context is gone, nothing to pause); upgrade it.
  *                 When it fails, every pid is mx-resumed.
@@ -50,8 +51,9 @@ SPDX-License-Identifier: Apache-2.0
  *                 connector (disaggregated prefill/decode) in each pid stops:
  *                 the engine takes no new requests, waits for KV transfers in
  *                 flight, and drops its NIXL agent and RDMA state. Fails, as
- *                 mx-pause does, while any RDMA device file is left (NCCL
- *                 over RDMA, say), or when the process's UCX is not 1.22
+ *                 mx-pause does, while any RDMA device file is left other
+ *                 than NCCL's through libnvsnap_ibv (which suspend
+ *                 releases), or when the process's UCX is not 1.22
  *                 (restored into another pod, it would keep the old pod's
  *                 routes); then every pid is resumed. The reply names the
  *                 UCX ("..., UCX 1.22.0").
@@ -684,8 +686,8 @@ static void thaw_all(struct frozen *fz, int n)
 /* Send cmd to pid's control thread; its reply goes to rep (if not NULL),
  * and is printed unless quiet. Returns 1 if pid has none (it shares no GPU
  * memory), 0 on "ok", -2 on "busy" (retry), -3 if its library predates
- * cmd, -1 on error. */
-static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet)
+ * cmd, -4 if no reply came within ms (0: cmd's own limit), -1 on error. */
+static int ctl_rep_ms(int pid, const char *cmd, char *out, size_t outlen, int quiet, int ms)
 {
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     int n = snprintf(a.sun_path + 1, sizeof(a.sun_path) - 1, GPUSHARE_SOCK_FMT, pid);
@@ -698,6 +700,7 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
      * also bounds connect(), which waits while pid's accept queue is full. */
     int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
     struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
+    if (ms > 0) tv.tv_sec = ms / 1000, tv.tv_usec = ms % 1000 * 1000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(s, (struct sockaddr *)&a, len) != 0) {
@@ -705,7 +708,7 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
         close(s);
         if (e != EAGAIN) return 1;  /* no control socket */
         printf("pid=%d %s: err control socket not accepting (%s)\n", pid, cmd, strerror(e));
-        return -1;
+        return ms > 0 ? -4 : -1;
     }
     /* An abstract name can be bound by anyone in the network namespace:
      * talk only to pid itself (so this tool must run in its pid namespace). */
@@ -718,18 +721,29 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
         return -1;
     }
     char rep[GPUSHARE_REPLY_MAX] = "err no reply (timeout)";
-    if (send(s, cmd, strlen(cmd) + 1, MSG_NOSIGNAL) < 0) snprintf(rep, sizeof(rep), "err send: %s", strerror(errno));
-    else {
+    int timed_out = 0;
+    if (send(s, cmd, strlen(cmd) + 1, MSG_NOSIGNAL) < 0) {
+        timed_out = errno == EAGAIN || errno == EWOULDBLOCK;
+        snprintf(rep, sizeof(rep), "err send: %s", strerror(errno));
+    } else {
         ssize_t r = recv(s, rep, sizeof(rep) - 1, 0);
         if (r > 0) rep[r] = 0;
-        else snprintf(rep, sizeof(rep), "err no reply (%s)", r < 0 ? strerror(errno) : "closed");
+        else timed_out = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+             snprintf(rep, sizeof(rep), "err no reply (%s)", r < 0 ? strerror(errno) : "closed");
     }
     close(s);
     if (!quiet || strncmp(rep, "ok", 2)) printf("pid=%d %s: %s\n", pid, cmd, rep);
     if (out) snprintf(out, outlen, "%s", rep);
+    if (timed_out) return -4;
     if (!strncmp(rep, "err busy", 8)) return -2;
     if (!strcmp(rep, "err unknown command")) return -3;
     return strncmp(rep, "ok", 2) ? -1 : 0;
+}
+
+static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet)
+{
+    int r = ctl_rep_ms(pid, cmd, out, outlen, quiet, 0);
+    return r == -4 ? -1 : r;
 }
 
 static int ctl(int pid, const char *cmd) { return ctl_rep(pid, cmd, NULL, 0, 0); }
@@ -865,7 +879,7 @@ static int remap_all(const int *pids, int n)
         char p[64];
         snprintf(p, sizeof(p), "%s/out", local_dir);
         unlink(p);
-        rmdir(local_dir);
+        if (rmdir(local_dir) != 0) fprintf(stderr, "%s: %s (left behind)\n", local_dir, strerror(errno));
         local_dir[0] = 0;
     }
     if (r >= 0 && hold_gate) r = resume_held(pids, n);
@@ -968,7 +982,13 @@ static int fabric_exchange(const int *pids, int n, char *remap, size_t len)
         snprintf(name, sizeof(name), "out.%d", pids[i]);
         snprintf(part, sizeof(part), "%s/%s", fabric_dir, name);
         snprintf(cmd, sizeof(cmd), "fabmap %s", part);
-        if (ctl(pids[i], cmd) < 0) { fclose(o); close(dfd); return -1; }
+        if (ctl(pids[i], cmd) < 0) {
+            fclose(o);
+            unlinkat(dfd, name, 0);
+            unlinkat(dfd, "out.tmp", 0);
+            close(dfd);
+            return -1;
+        }
         int pfd = openat(dfd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         FILE *f = pfd < 0 ? NULL : fdopen(pfd, "r");
         if (!f && pfd >= 0) close(pfd);
@@ -977,7 +997,7 @@ static int fabric_exchange(const int *pids, int n, char *remap, size_t len)
         unlinkat(dfd, name, 0);
     }
     int r = fclose(o) != 0 || renameat(dfd, "out.tmp", dfd, "out") != 0 ? -1 : 0;
-    if (r < 0) fprintf(stderr, "%s: %s\n", out, strerror(errno));
+    if (r < 0) fprintf(stderr, "%s: %s\n", out, strerror(errno)), unlinkat(dfd, "out.tmp", 0);
     close(dfd);
     if (r < 0) return -1;
     if (fabric_dir == local_dir) {  /* local_exchange: every peer is here */
@@ -1273,7 +1293,11 @@ static double now_ms(void)
  * ranks had all drained but another node's had not (they wait for these):
  * let one launch through on each first. Returns what ctl_all returns for
  * "quiesce", -2 if they did not all drain (a busy rank waits for another
- * node, or for work the gate does not hold), -1 on error. */
+ * node, or for work the gate does not hold), -1 on error. Its polls and
+ * steps share its 10 s: a rank that stops answering ends it as busy then,
+ * so that the other ranks are not held past the vote while one request
+ * waits out its own limit. The final "quiesce" keeps its own. */
+#define CATCH_UP_MS 10000
 static int catch_up(const int *pids, int n, int nudge)
 {
     char rep[GPUSHARE_REPLY_MAX];
@@ -1283,11 +1307,13 @@ static int catch_up(const int *pids, int n, int nudge)
     for (;;) {
         int busy = 0, err = 0;
         for (int i = 0; i < n && !err; i++) {
-            int c = ctl_rep(pids[i], "poll", rep, sizeof(rep), 1);
+            int left = (int)(t0 + CATCH_UP_MS - now_ms());
+            int c = left <= 0 ? -4 : ctl_rep_ms(pids[i], "poll", rep, sizeof(rep), 1, left);
             if (c == 1) st[i] = -1;
             else if (c < 0) err = c;
             else if (sscanf(rep, "ok idle %d", &st[i]) != 1) st[i] = -2, busy++;
         }
+        if (err == -4) break;  /* out of time: busy */
         if (err) { r = err; break; }
         /* One at a time: a quiescing process asks its peers' control
          * threads about imports it has not matched yet ("whose"). */
@@ -1295,17 +1321,19 @@ static int catch_up(const int *pids, int n, int nudge)
         int stepped = 0;
         for (int i = 0; i < n && !err; i++) {
             if (st[i] <= 0) continue;
-            int c = ctl_rep(pids[i], "step", rep, sizeof(rep), 1);
+            int left = (int)(t0 + CATCH_UP_MS - now_ms());
+            int c = left <= 0 ? -4 : ctl_rep_ms(pids[i], "step", rep, sizeof(rep), 1, left);
             if (c < 0) err = c;
             else stepped += !strcmp(rep, "ok stepped");
         }
+        if (err == -4) break;
         if (err) { r = err; break; }
         nudge = 0;
         double t = now_ms();
         if (stepped) steps += stepped, last = t;
         else if (t - last > 2000) break;  /* stuck */
         else usleep(1000);
-        if (t - t0 > 10000) break;
+        if (t - t0 > CATCH_UP_MS) break;
     }
     printf("catch-up: %d launch(es) let through in %.0f ms: %s\n", steps, now_ms() - t0,
            r >= 0 ? "quiesced" : r == -2 ? "busy" : "failed");

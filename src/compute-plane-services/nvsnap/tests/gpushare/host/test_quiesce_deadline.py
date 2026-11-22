@@ -16,7 +16,10 @@ traffic ("quiesce: err busy (GPU work did not drain)", after waiting up to
   * with a library that has "hold", the tool lets a drained rank (behind)
     launch one held call at a time until a busy rank (ahead, its collective
     waiting for the one behind) drains, then quiesces both, and resumes
-    them when the suspend fails later.
+    them when the suspend fails later;
+  * a held rank that stops answering "poll" ends the catch-up within its
+    10 s, not after the 120 s a single request may take;
+  * a verbs exchange that fails leaves no directory behind.
 
 Run: python3 -I tests/gpushare/host/test_quiesce_deadline.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -69,6 +72,7 @@ def build(tmp):
 
 WORKLOAD = r"""
 import os, socket, sys, time
+log = sys.argv[2] if len(sys.argv) > 2 else None
 s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 s.bind("\0nvsnap-gpushare.%d" % os.getpid())
 s.listen(16)
@@ -79,6 +83,9 @@ while True:
     if cmd == "quiesce":
         time.sleep(float(sys.argv[1]))
         rep = "err busy (GPU work did not drain)"
+        if log:
+            with open(log, "a") as f:
+                f.write("busy\n")
     elif cmd.startswith("resume"):
         rep = "ok resumed"
     else:
@@ -105,12 +112,20 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 s.bind("\0nvsnap-gpushare.%d" % os.getpid())
 s.listen(16)
 print("ready", flush=True)
+unanswered = []
 while True:
     c, _ = s.accept()
     cmd = c.recv(4096).rstrip(b"\0").decode()
     log.write(cmd + "\n"); log.flush()
-    idle = role == "behind" or stepped() >= steps
+    idle = role in ("behind", "ibvbroken") or stepped() >= steps
+    if role == "silent" and cmd in ("poll", "step"):
+        unanswered.append(c)  # held, and stopped answering
+        continue
     if role == "broken":
+        rep = "err broken"
+    elif role == "ibvbroken" and cmd == "ibv":
+        rep = "ok ibv 1"
+    elif role == "ibvbroken" and cmd.startswith("fabmap "):
         rep = "err broken"
     elif cmd == "hold":
         rep = "ok held"
@@ -146,9 +161,11 @@ def rank(role, state, steps):
     return p
 
 
-def busy_workload():
-    """A process whose control socket always answers quiesce busy."""
-    p = subprocess.Popen([sys.executable, "-I", "-c", WORKLOAD, str(BUSY_REPLY_S)], stdout=subprocess.PIPE, text=True)
+def busy_workload(log=None):
+    """A process whose control socket always answers quiesce busy (each
+    reply logged to LOG)."""
+    p = subprocess.Popen([sys.executable, "-I", "-c", WORKLOAD, str(BUSY_REPLY_S), *([log] if log else [])],
+                         stdout=subprocess.PIPE, text=True)
     if p.stdout.readline().strip() != "ready":
         p.kill()
         raise RuntimeError("fake workload did not start")
@@ -169,7 +186,8 @@ class QuiesceDeadline(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        w = busy_workload()
+        self.busy_log = os.path.join(tempfile.mkdtemp(dir=self.tmp), "busy")
+        w = busy_workload(self.busy_log)
         self.addCleanup(w.stdout.close)
         self.addCleanup(w.wait)
         self.addCleanup(w.kill)
@@ -282,6 +300,58 @@ class PartialHold(CatchUp):
     test_drained_rank_catches_up_then_both_quiesce = None
 
 
+class SilentRank(CatchUp):
+    """A held rank stops answering "poll" (and "step"); the other is ahead
+    and busy. The catch-up ends within its own 10 s, and the rollback
+    resumes both."""
+
+    def setUp(self):
+        self.state = os.path.join(tempfile.mkdtemp(dir=self.tmp), "stepped")
+        self.ranks = []
+        for role in ("ahead", "silent"):
+            w = rank(role, self.state, 5)
+            self.addCleanup(w.stdout.close)
+            self.addCleanup(w.wait)
+            self.addCleanup(w.kill)
+            self.ranks.append(w.pid)
+
+    def test_catch_up_keeps_its_budget(self):
+        try:
+            p, took = self.run_tool("--timeout-ms", "5000", "suspend", *map(str, self.ranks), timeout=90)
+        except subprocess.TimeoutExpired as e:
+            self.fail("the catch-up waited on a silent rank past 90 s: %s" % e.stdout)
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("catch-up:", p.stdout, p.stdout + p.stderr)
+        self.assertLess(took, 40, p.stdout + p.stderr)
+        for role in ("ahead", "silent"):
+            self.assertTrue(any(c.startswith("resume") for c in self.commands(role)), role)
+
+    test_drained_rank_catches_up_then_both_quiesce = None
+
+
+class FailedVerbsExchange(CatchUp):
+    """A rank with NCCL's verbs whose "fabmap" fails, during the rollback of
+    a suspend that failed after release: the exchange directory goes."""
+
+    def setUp(self):
+        self.state = os.path.join(tempfile.mkdtemp(dir=self.tmp), "stepped")
+        w = rank("ibvbroken", self.state, 0)
+        self.addCleanup(w.stdout.close)
+        self.addCleanup(w.wait)
+        self.addCleanup(w.kill)
+        self.ranks = [w.pid]
+
+    def test_no_directory_left(self):
+        import glob
+        before = set(glob.glob("/tmp/nvsnap-ibv-*"))
+        p, _ = self.run_tool("--timeout-ms", "10000", "suspend", *map(str, self.ranks))
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(any(c.startswith("fabmap ") for c in self.commands("ibvbroken")), p.stdout + p.stderr)
+        self.assertEqual(set(glob.glob("/tmp/nvsnap-ibv-*")) - before, set(), p.stdout + p.stderr)
+
+    test_drained_rank_catches_up_then_both_quiesce = None
+
+
 class Deadlines(QuiesceDeadline):
     def test_vote_wait_ends_at_the_deadline(self):
         # No driver answers: the node gives up at its own deadline
@@ -304,6 +374,9 @@ class Deadlines(QuiesceDeadline):
         p.kill()
         out = p.communicate()[0]
         self.assertTrue(alive, "gave up with --timeout-ms 0:\n" + out)
+        # Alive because it tries again, not because its first try hangs.
+        with open(self.busy_log) as f:
+            self.assertGreaterEqual(len(f.read().split()), 2, "fewer than two busy attempts in 4 s:\n" + out)
 
     def test_fabric_refuses_timeout_zero(self):
         # Across nodes every node needs its own deadline: with none it holds
