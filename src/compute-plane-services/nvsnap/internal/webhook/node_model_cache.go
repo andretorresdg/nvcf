@@ -309,7 +309,10 @@ func readsLabelsOrAnnotations(pod *corev1.Pod, init *corev1.Container) bool {
 		return f != nil && (strings.HasPrefix(f.FieldPath, "metadata.labels") || strings.HasPrefix(f.FieldPath, "metadata.annotations"))
 	}
 	for _, e := range init.Env {
-		if e.ValueFrom != nil && mutable(e.ValueFrom.FieldRef) {
+		// The platform's per-instance metadata (orchestrationEnv) reads
+		// labels and annotations in every function's init; it does not
+		// steer the download, as the key already holds.
+		if e.ValueFrom != nil && mutable(e.ValueFrom.FieldRef) && !hasAnyPrefix(e.Name, orchestrationEnv) {
 			return true
 		}
 	}

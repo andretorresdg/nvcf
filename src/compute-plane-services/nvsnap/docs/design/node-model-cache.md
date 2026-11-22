@@ -72,7 +72,9 @@ A Secret or ConfigMap whose content changes under the same name is the same reci
 
 A download init that can read a label or an annotation of its pod, by an env field reference or through a
 downward-API volume it mounts (plain or projected), is not cached (`readsLabelsOrAnnotations`): their values can
-differ between pods of one recipe and change after admission, and the key could not tell the trees apart.
+differ between pods of one recipe and change after admission, and the key could not tell the trees apart. The
+platform's per-instance variables (the `GROVE_*`, `NVCF_*` and other names the key leaves out) are exempt: every
+function's download init reads its labels and annotations through them, and they do not steer what it writes.
 
 Admission and the agent both compute the key from the pod spec and the namespace (`ResolveModelCacheDownload`). The
 agent never takes it from the label admission sets: a pod that labels itself with another key is ignored.

@@ -677,3 +677,30 @@ func TestNodeModelCacheLeavesADownloadVolumeASidecarWrites(t *testing.T) {
 		t.Fatal("a download after an ordinary init that wrote its volume was left alone")
 	}
 }
+
+// The platform's per-instance variables (Grove and NVCF metadata) read
+// labels and annotations by field reference in every function's download
+// init. They are left out of the key because they do not steer what a
+// download writes; they must not turn the cache off either. A user's own
+// variable that reads a label still does.
+func TestNodeModelCacheWrapsAnInitThatReadsPlatformLabels(t *testing.T) {
+	m := nodeCacheMutator(t)
+	pod := ngcFunctionPod()
+	c := initByName(pod, "download-ngc-model")
+	ref := func(name, path string) corev1.EnvVar {
+		return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}}
+	}
+	c.Env = append(c.Env,
+		ref("GROVE_PCSG_INDEX", "metadata.labels['grove.io/podcliquescalinggroup-replica-index']"),
+		ref("NVCF_FUNCTION_ID", "metadata.labels['function-id']"),
+		ref("NVCF_REGION", "metadata.annotations['nvcf.nvidia.io/region']"))
+	if p := m.nodeModelCachePatches(context.Background(), pod, true); p == nil {
+		t.Fatal("an init that reads only the platform's labels is not wrapped")
+	}
+	user := ngcFunctionPod()
+	u := initByName(user, "download-ngc-model")
+	u.Env = append(u.Env, ref("MODEL_VARIANT", "metadata.labels['variant']"))
+	if p := m.nodeModelCachePatches(context.Background(), user, true); p != nil {
+		t.Fatal("an init whose own variable reads a label is wrapped")
+	}
+}
