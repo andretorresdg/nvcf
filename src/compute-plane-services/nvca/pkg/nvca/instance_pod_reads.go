@@ -106,7 +106,7 @@ func isTaskCreationAction(action common.MessageAction) bool {
 func (c K8sComputeBackend) readInstancePod(ctx context.Context, st nvcav2beta1.InstanceStatus,
 	req *nvcav2beta1.ICMSRequest,
 ) (*corev1.Pod, instancePodDecision, bool, error) {
-	if c.bk8s.podSpecLister == nil || !c.bk8s.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.InstancePodCacheReads) {
+	if !c.instancePodCacheReadsEnabled() {
 		p, err := c.getInstancePodLive(ctx, st.ID)
 		if err != nil {
 			return nil, instancePodDecision{}, true, err
@@ -174,6 +174,79 @@ func (c K8sComputeBackend) readInstancePod(ctx context.Context, st nvcav2beta1.I
 		}
 	}
 	return live, liveDecision, true, err
+}
+
+func (c K8sComputeBackend) instancePodCacheReadsEnabled() bool {
+	return c.bk8s.podSpecLister != nil && c.bk8s.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.InstancePodCacheReads)
+}
+
+// instancePodPurgeAttempts bounds how many times one pass of the instance status loop deletes a Pod
+// it purges, when the Pod changes between the read just before a delete and the delete.
+const instancePodPurgeAttempts = 3
+
+// deleteInstancePodForPurge deletes the Pod of instance id, which the status loop decided to purge
+// from the Pod p in state, and reports whether the instance can be reported terminated. Just before
+// each delete it reads the Pod live and decides again, so that a write to the Pod while its events
+// and logs were collected, such as another controller's annotation or a kubelet status update,
+// does not fail the delete. The delete is conditioned on the UID and resourceVersion of that read,
+// so it removes neither a replacement Pod with the same name nor a Pod that no longer needs a purge.
+// When the Pod changes between that read and the delete, it is read and deleted again, up to
+// instancePodPurgeAttempts times, before it is left to the next pass. A Pod that is gone or being
+// deleted can be reported terminated, and so can one whose delete fails otherwise, which a later
+// pass retries.
+func (c K8sComputeBackend) deleteInstancePodForPurge(ctx context.Context, id string, p *corev1.Pod,
+	req *nvcav2beta1.ICMSRequest, state types.ICMSInstanceState,
+) bool {
+	log := core.GetLogger(ctx).WithFields(logrus.Fields{"pod": id, "podState": state})
+	for attempt := 1; attempt <= instancePodPurgeAttempts; attempt++ {
+		cur, d, err := c.readInstancePodForPurge(ctx, id, req)
+		switch {
+		case apierrors.IsNotFound(err):
+			return true
+		case err != nil:
+			log.WithError(err).Warn("Failed to read the pod before purging it, re-evaluating it on the next pass")
+			return false
+		case cur.UID != p.UID:
+			log.Warn("Pod was replaced after it was found in this state, not purging it and re-evaluating it on the next pass")
+			return false
+		case cur.DeletionTimestamp != nil:
+			return true
+		case !d.needsPurge:
+			log.WithField("liveState", d.is).
+				Info("Pod no longer needs a purge after it was found in this state, re-evaluating it on the next pass")
+			return false
+		}
+		uid, resourceVersion := cur.UID, cur.ResourceVersion
+		err = c.clients.K8s.CoreV1().Pods(c.bk8s.podInstanceNamespace).Delete(ctx, id, metav1.DeleteOptions{
+			GracePeriodSeconds: d.gracePeriodSeconds,
+			Preconditions:      &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+		})
+		if apierrors.IsConflict(err) {
+			log.WithError(err).WithField("attempt", attempt).Debug("Pod changed between its read and its delete")
+			continue
+		}
+		if err != nil && !apierrors.IsNotFound(err) {
+			log.WithError(err).Error("Failed to delete the pod being purged, status will still be reported to ICMS")
+		}
+		return true
+	}
+	log.WithField("attempts", instancePodPurgeAttempts).
+		Warn("Pod changed before every delete of its purge, not purging it and re-evaluating it on the next pass")
+	return false
+}
+
+// readInstancePodForPurge reads the Pod live just before a purge deletes it, and decides from it.
+func (c K8sComputeBackend) readInstancePodForPurge(ctx context.Context, id string, req *nvcav2beta1.ICMSRequest,
+) (*corev1.Pod, instancePodDecision, error) {
+	if c.instancePodCacheReadsEnabled() {
+		return c.readInstancePodLive(ctx, id, req, nvcametrics.InstancePodReadSourcePurge)
+	}
+	p, err := c.getInstancePodLive(ctx, id)
+	if err != nil {
+		return nil, instancePodDecision{}, err
+	}
+	d, err := c.decideInstancePod(ctx, p, req)
+	return p, d, err
 }
 
 // readInstancePodLive reads the Pod from the API server for the given read source, and decides from

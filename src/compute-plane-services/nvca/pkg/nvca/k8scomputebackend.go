@@ -1785,7 +1785,7 @@ func (c K8sComputeBackend) GetICMSRequestUpdatesForCreatePodRequest(ctx context.
 		return types.ICMSRequestUpdateInfo{}, nil
 	}
 
-	needsPurge, gracePeriodSeconds := decision.needsPurge, decision.gracePeriodSeconds
+	needsPurge := decision.needsPurge
 	is, dReason, isBadState := decision.is, decision.reason, decision.isBadState
 	if isBadState && !isTaskCreationAction(req.Spec.Action) {
 		if needsPurge {
@@ -1834,21 +1834,11 @@ func (c K8sComputeBackend) GetICMSRequestUpdatesForCreatePodRequest(ctx context.
 				fPL += "\n---\nContainer/init logs:\n" + podLogs
 			}
 		}
-		// Delete only the Pod this decision was taken from, unchanged since it was read: not a
-		// replacement with the same name, and not the Pod after it changed, for example by recovering.
-		uid, resourceVersion := p.UID, p.ResourceVersion
-		err := c.clients.K8s.CoreV1().Pods(c.bk8s.podInstanceNamespace).Delete(ctx, id, metav1.DeleteOptions{
-			GracePeriodSeconds: gracePeriodSeconds,
-			Preconditions:      &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
-		})
-		if apierrors.IsConflict(err) {
-			log.WithError(err).WithField("pod", id).
-				Warnf("pod changed after it was found in state %v, not purging it and re-evaluating it on the next pass", tc)
+		// Delete only the Pod this decision was taken from, as read again just before the delete: not a
+		// replacement with the same name, and not a Pod that no longer needs a purge, for example
+		// because it recovered.
+		if !c.deleteInstancePodForPurge(ctx, id, p, req, tc) {
 			return types.ICMSRequestUpdateInfo{}, nil
-		}
-		if err != nil && !apierrors.IsNotFound(err) {
-			log.WithError(err).WithField("pod", id).
-				Errorf("failed to delete pod stuck due to %v, status will still be reported to ICMS", tc)
 		}
 
 		// Only set error source if terminating a task.

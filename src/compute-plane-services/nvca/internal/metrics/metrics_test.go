@@ -310,6 +310,7 @@ func TestRecordInstancePodRead(t *testing.T) {
 	metrics.RecordInstancePodRead(InstancePodReadSourceConfirm, errors.New("connection refused"))
 	metrics.RecordInstancePodRead(InstancePodReadSourceHeartbeat, nil)
 	metrics.RecordInstancePodRead(InstancePodReadSourceRefresh, nil)
+	metrics.RecordInstancePodRead(InstancePodReadSourcePurge, k8serrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "p"))
 	metrics.RecordInstancePodRead("unknown", nil)
 
 	assert.Equal(t, float64(2), value(InstancePodReadSourceCache, InstancePodReadResultFound))
@@ -317,6 +318,7 @@ func TestRecordInstancePodRead(t *testing.T) {
 	assert.Equal(t, float64(1), value(InstancePodReadSourceConfirm, InstancePodReadResultError))
 	assert.Equal(t, float64(1), value(InstancePodReadSourceHeartbeat, InstancePodReadResultFound))
 	assert.Equal(t, float64(1), value(InstancePodReadSourceRefresh, InstancePodReadResultFound))
+	assert.Equal(t, float64(1), value(InstancePodReadSourcePurge, InstancePodReadResultNotFound))
 	assert.Equal(t, float64(0), value(InstancePodReadSourceMiss, InstancePodReadResultFound))
 
 	families, err := reg.Gather()

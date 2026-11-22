@@ -1075,6 +1075,105 @@ func TestInstancePodReads_PurgeRetryIsConfirmedLive(t *testing.T) {
 	assert.Equal(t, float64(1), podReads(ctx, nvcametrics.InstancePodReadSourceConfirm, nvcametrics.InstancePodReadResultFound))
 }
 
+// podReadsCreateContainerErrorPod cannot create its container, so the status loop purges it, and
+// lists its events for the report first.
+func podReadsCreateContainerErrorPod(name, uid, resourceVersion string) *corev1.Pod {
+	p := podReadsStartingPod(name, uid, resourceVersion)
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "inference",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CreateContainerError"}},
+	}}
+	return p
+}
+
+// A write to a Pod the status loop is purging, such as another controller's annotation or a kubelet
+// status update, does not stop the purge, whether or not Pods are read from the informer cache. A
+// write while the loop collects the Pod's events and logs is seen by the read just before the
+// delete. A write that lands between that read and the delete fails the delete's preconditions, and
+// the loop reads the Pod and deletes it again, up to a few times, before it leaves the Pod to the
+// next pass without reporting it.
+func TestInstancePodReads_PurgeOutlastsUnrelatedPodWrites(t *testing.T) {
+	const name = "0-sr-purge-writes"
+	podsGVR := corev1.SchemeGroupVersion.WithResource("pods")
+	// touch writes an annotation to the stored Pod, which gives it a new resourceVersion.
+	touch := func(t *testing.T, tracker ktesting.ObjectTracker) {
+		obj, err := tracker.Get(podsGVR, RequestsNamespace, name)
+		require.NoError(t, err)
+		p := obj.(*corev1.Pod).DeepCopy()
+		var rv int
+		_, err = fmt.Sscan(p.ResourceVersion, &rv)
+		require.NoError(t, err)
+		p.ResourceVersion = fmt.Sprint(rv + 1)
+		p.Annotations = map[string]string{"example.com/touched": p.ResourceVersion}
+		require.NoError(t, tracker.Update(podsGVR, p, RequestsNamespace))
+	}
+	for _, cacheReads := range []bool{true, false} {
+		var flags []*featureflag.FeatureFlag
+		if cacheReads {
+			flags = append(flags, featureflag.InstancePodCacheReads)
+		}
+		t.Run(fmt.Sprintf("cache reads %v, written while its events are collected", cacheReads), func(t *testing.T) {
+			ctx := newTestContext()
+			pod := podReadsCreateContainerErrorPod(name, "uid-1", "100")
+			clients, client := podReadsAPIServer(pod)
+			enforceDeletePreconditions(client, nil)
+			client.PrependReactor("list", "events", func(ktesting.Action) (bool, runtime.Object, error) {
+				touch(t, client.Tracker())
+				return false, nil, nil
+			})
+			kb, _ := newPodReadsBackend(clients, podReadsCache(t, pod), flags...)
+			reportedAt := metav1.Now()
+			req := podReadsRequest(podReadsInstance(name, types.ICMSInstanceStarted, &reportedAt))
+
+			updates := runPodReadsPass(ctx, kb, req)
+
+			_, exists := livePodExists(t, client, name)
+			assert.False(t, exists, "the Pod is purged in the pass that decided it")
+			assert.Equal(t, types.ICMSInstanceTerminated, updates[name].Payload.InstanceState)
+			assert.Equal(t, types.ICMSInstanceFailedCreateContainerError, updates[name].Payload.TerminationCause)
+			deletes := podDeletes(client)
+			require.Len(t, deletes, 1)
+			assert.Equal(t, "101", *deletes[0].GetDeleteOptions().Preconditions.ResourceVersion,
+				"the delete carries the resourceVersion of the read just before it")
+		})
+		t.Run(fmt.Sprintf("cache reads %v, written before the first delete", cacheReads), func(t *testing.T) {
+			ctx := newTestContext()
+			pod := podReadsPullBackOffPod(name, "uid-1", "100")
+			clients, client := podReadsAPIServer(pod)
+			var once sync.Once
+			enforceDeletePreconditions(client, func(tracker ktesting.ObjectTracker) {
+				once.Do(func() { touch(t, tracker) })
+			})
+			kb, _ := newPodReadsBackend(clients, podReadsCache(t, pod), flags...)
+			reportedAt := metav1.Now()
+			req := podReadsRequest(podReadsInstance(name, types.ICMSInstanceStarted, &reportedAt))
+
+			updates := runPodReadsPass(ctx, kb, req)
+
+			_, exists := livePodExists(t, client, name)
+			assert.False(t, exists, "the Pod is purged in the pass that decided it")
+			assert.Equal(t, types.ICMSInstanceTerminated, updates[name].Payload.InstanceState)
+			assert.Len(t, podDeletes(client), 2, "the delete is retried once after the conflict")
+		})
+		t.Run(fmt.Sprintf("cache reads %v, written before every delete", cacheReads), func(t *testing.T) {
+			ctx := newTestContext()
+			pod := podReadsPullBackOffPod(name, "uid-1", "100")
+			clients, client := podReadsAPIServer(pod)
+			enforceDeletePreconditions(client, func(tracker ktesting.ObjectTracker) { touch(t, tracker) })
+			kb, _ := newPodReadsBackend(clients, podReadsCache(t, pod), flags...)
+			reportedAt := metav1.Now()
+			req := podReadsRequest(podReadsInstance(name, types.ICMSInstanceStarted, &reportedAt))
+
+			updates := runPodReadsPass(ctx, kb, req)
+
+			_, exists := livePodExists(t, client, name)
+			assert.True(t, exists, "a Pod that changes before every delete is left to the next pass")
+			assert.Empty(t, updates, "nothing is reported for a Pod that was not purged")
+			assert.Len(t, podDeletes(client), instancePodPurgeAttempts, "the delete is tried a bounded number of times")
+		})
+	}
+}
+
 // A degraded function Pod is purged only when degraded workers are purged automatically, whether or
 // not Pods are read from the informer cache and whether or not its degraded state was reported.
 func TestInstancePodReads_DegradedWorkerFollowsAutoPurge(t *testing.T) {
@@ -1729,6 +1828,18 @@ func TestInstancePodReads_Envtest(t *testing.T) {
 				_, err = admin.CoreV1().Pods(RequestsNamespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
 				require.NoError(t, err)
 			},
+		},
+		{
+			// The API server rejects the delete for the resourceVersion it no longer has, and the
+			// purge reads the Pod again and deletes it as annotated.
+			name: "a Pod annotated after it was read is purged",
+			change: func(t *testing.T, name string) {
+				patch := []byte(`{"metadata":{"annotations":{"example.com/touched":"true"}}}`)
+				_, err := admin.CoreV1().Pods(RequestsNamespace).Patch(ctx, name, apitypes.MergePatchType, patch,
+					metav1.PatchOptions{})
+				require.NoError(t, err)
+			},
+			wantPurged: true,
 		},
 	}
 	for i, tc := range purgeCases {

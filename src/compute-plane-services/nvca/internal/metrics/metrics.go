@@ -209,6 +209,8 @@ const (
 	InstancePodReadSourceHeartbeat = "heartbeat"
 	// InstancePodReadSourceRefresh is the periodic live read of a Pod otherwise served from the cache.
 	InstancePodReadSourceRefresh = "refresh"
+	// InstancePodReadSourcePurge is a live read just before a Pod the status loop purges is deleted.
+	InstancePodReadSourcePurge = "purge"
 
 	InstancePodReadResultFound    = "found"
 	InstancePodReadResultNotFound = "notfound"
@@ -224,6 +226,7 @@ var (
 		InstancePodReadSourceConfirm,
 		InstancePodReadSourceHeartbeat,
 		InstancePodReadSourceRefresh,
+		InstancePodReadSourcePurge,
 	}
 	AllInstancePodReadResults = []string{
 		InstancePodReadResultFound,
