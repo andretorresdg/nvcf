@@ -487,3 +487,24 @@ func SetBuildInfo(version string) {
 	BuildInfo.Reset()
 	BuildInfo.WithLabelValues(version).Set(1)
 }
+
+// CountModelCacheInit counts how a wrapped download init filled its
+// volume (seeded, downloaded, failed), held on first sight.
+func CountModelCacheInit(result string) {
+	count("model_cache_inits", ModelCacheInits, result)
+}
+
+// CountModelCacheOp counts a node model cache operation (harvest, fetch,
+// evict) by result, held on first sight.
+func CountModelCacheOp(op, result string) {
+	count("model_cache_operations", ModelCacheOps, op, result)
+}
+
+// AddModelCacheBytes adds the n bytes op wrote, held on first sight.
+func AddModelCacheBytes(op string, n int64) {
+	if n <= 0 {
+		return
+	}
+	sight.observe("model_cache_bytes", []string{op}, func() { ModelCacheBytes.WithLabelValues(op) },
+		func() { ModelCacheBytes.WithLabelValues(op).Add(float64(n)) })
+}

@@ -218,9 +218,17 @@ func TestModelCacheFetchesFromAPeerForAWaitingPod(t *testing.T) {
 	b.c.tick(context.Background())
 	mcEventually(t, "fetch on b", func() bool { return b.has(keyOf(cold)) })
 	mcEventually(t, "b registered", func() bool { return sourcesOf(t, kube, keyOf(cold))["b"] != "" })
-	if _, err := os.Stat(filepath.Join(b.c.store.KeyDir(keyOf(cold)), modelcache.IncomingFile)); !os.IsNotExist(err) {
-		t.Fatal("the fetch heartbeat outlived the fetch")
-	}
+	// The heartbeat goes in fill's deferred cleanup, after the
+	// registration: wait for the fill to end, then for the heartbeat.
+	mcEventually(t, "the fill ended", func() bool {
+		b.c.mu.Lock()
+		defer b.c.mu.Unlock()
+		return b.c.busy[keyOf(cold)] == 0
+	})
+	mcEventually(t, "the fetch heartbeat went with the fetch", func() bool {
+		_, err := os.Stat(filepath.Join(b.c.store.KeyDir(keyOf(cold)), modelcache.IncomingFile))
+		return os.IsNotExist(err)
+	})
 	gen, m, _ := b.c.store.Latest(keyOf(cold))
 	dst := t.TempDir()
 	if err := modelcache.Seed(gen, m, dst); err != nil {
@@ -237,6 +245,9 @@ func TestModelCacheRefusesAPeerThatServesOtherBytes(t *testing.T) {
 	a.downloaded(t, src, map[string]string{"model/w.bin": "weights"})
 	a.c.tick(context.Background())
 	mcEventually(t, "harvest on a", func() bool { return a.has(keyOf(src)) })
+	// b finds a only once a is registered; without a source its fill
+	// would end before trying a, and record no failure.
+	mcEventually(t, "a registered", func() bool { return sourcesOf(t, kube, keyOf(src))["a"] != "" })
 	// Corrupt a's copy after publication, same size.
 	gen, _, _ := a.c.store.Latest(keyOf(src))
 	if err := os.WriteFile(filepath.Join(gen, modelcache.TreeDir, "model/w.bin"), []byte("WEIGHTS"), 0o644); err != nil {

@@ -22,6 +22,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +33,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelcache"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -105,6 +108,7 @@ type nodeModelCache struct {
 
 	mu        sync.Mutex
 	busy      map[string]int       // key -> fills, harvests and transfers in flight
+	evicting  map[string]bool      // keys an eviction holds: nothing new begins on them
 	failed    map[string]time.Time // key -> last fill that found no usable peer
 	harvested map[types.UID]bool   // pods whose volume was looked at
 	counted   map[types.UID]bool   // pods whose init outcome was counted
@@ -135,7 +139,7 @@ func newNodeModelCache(cfg NodeModelCacheConfig, kube kubernetes.Interface, node
 		store: &modelcache.Store{Root: cfg.Root}, kube: kube, node: node, ns: ns,
 		podsRoot: cachedirPodsRoot, tenants: tenants, main: main, peerURL: peerURL,
 		client: peerHTTPClient, maxPercent: pct, fetchTimeout: to, log: log, statfs: statfsBytes,
-		busy: map[string]int{}, failed: map[string]time.Time{}, harvested: map[types.UID]bool{}, counted: map[types.UID]bool{}, inUse: map[string]bool{},
+		busy: map[string]int{}, evicting: map[string]bool{}, failed: map[string]time.Time{}, harvested: map[types.UID]bool{}, counted: map[types.UID]bool{}, inUse: map[string]bool{},
 		singleFlight: cfg.SingleFlight, podsWrite: cfg.PodsRoot, followMax: 5 * time.Hour,
 		timing: defaultStreamTiming, leaseDuration: 30 * time.Second,
 		flights: map[types.UID]*flight{}, liveSources: map[string]*liveSource{}, leaseSeen: map[string]leaseObs{},
@@ -180,15 +184,24 @@ func (c *nodeModelCache) run(ctx context.Context) {
 	}
 }
 
-// begin marks key busy unless it already is; end undoes it.
+// begin marks key busy unless it already is; end undoes it. Nothing
+// begins on a key being evicted, not even a reader: its files are going.
 func (c *nodeModelCache) begin(key string, exclusive bool) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if exclusive && c.busy[key] > 0 {
+	if c.evicting[key] || (exclusive && c.busy[key] > 0) {
 		return false
 	}
 	c.busy[key]++
 	return true
+}
+
+// endEvict ends evict's hold on key.
+func (c *nodeModelCache) endEvict(key string) {
+	c.mu.Lock()
+	delete(c.evicting, key)
+	c.mu.Unlock()
+	c.end(key)
 }
 
 func (c *nodeModelCache) end(key string) {
@@ -333,7 +346,7 @@ func (c *nodeModelCache) countInit(uid types.UID, t *corev1.ContainerStateTermin
 	default:
 		result = "downloaded"
 	}
-	metrics.ModelCacheInits.WithLabelValues(result).Inc()
+	metrics.CountModelCacheInit(result)
 }
 
 // heartbeat keeps the key's fetch heartbeat fresh until stop is closed,
@@ -377,8 +390,15 @@ func sourcesName(key string) string { return modelCacheSourcesPrefix + key }
 
 // sources lists the other nodes that have key, in random order.
 func (c *nodeModelCache) sources(ctx context.Context, key string) []string {
+	ctx, span := tracing.Tracer().Start(ctx, "model_cache.sources")
+	defer span.End()
+	span.SetAttributes(attribute.String("nvsnap.model_cache.key", key))
 	cm, err := c.kube.CoreV1().ConfigMaps(c.ns).Get(ctx, sourcesName(key), metav1.GetOptions{})
 	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
 		return nil
 	}
 	var out []string
@@ -509,20 +529,31 @@ func (c *nodeModelCache) fill(ctx context.Context, key string) {
 		secs := time.Since(start).Seconds()
 		log.WithFields(logrus.Fields{"peer": node, "bytes": bytes, "seconds": fmt.Sprintf("%.1f", secs),
 			"MBps": fmt.Sprintf("%.0f", float64(bytes)/1e6/secs)}).Info("model cache: fetched from peer")
-		metrics.ModelCacheOps.WithLabelValues("fetch", "ok").Inc()
-		metrics.ModelCacheBytes.WithLabelValues("fetch").Add(float64(bytes))
+		metrics.CountModelCacheOp("fetch", "ok")
+		metrics.AddModelCacheBytes("fetch", bytes)
 		if err := c.register(ctx, key, filepath.Base(gen)); err != nil {
 			log.WithError(err).Warn("model cache: registering the fetched key failed")
 		}
 		return
 	}
-	metrics.ModelCacheOps.WithLabelValues("fetch", "error").Inc()
+	metrics.CountModelCacheOp("fetch", "error")
 	c.mu.Lock()
 	c.failed[key] = time.Now()
 	c.mu.Unlock()
 }
 
-func (c *nodeModelCache) fillFrom(ctx context.Context, key, node string) (string, int64, error) {
+func (c *nodeModelCache) fillFrom(ctx context.Context, key, node string) (gen string, bytes int64, err error) {
+	ctx, span := tracing.Tracer().Start(ctx, "model_cache.peer_fetch")
+	span.SetAttributes(attribute.String("nvsnap.model_cache.key", key), attribute.String("nvsnap.peer", node))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetAttributes(attribute.Int64("nvsnap.bytes", bytes))
+		}
+		span.End()
+	}()
 	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
 	defer cancel()
 	base, err := c.peerURL(ctx, node)
@@ -550,6 +581,7 @@ func (c *nodeModelCache) fillFrom(ctx context.Context, key, node string) (string
 		if err != nil {
 			return nil, err
 		}
+		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 		resp, err := c.client.Do(req)
 		if err != nil {
 			return nil, err
@@ -560,7 +592,7 @@ func (c *nodeModelCache) fillFrom(ctx context.Context, key, node string) (string
 		}
 		return resp.Body, nil
 	}
-	gen, err := c.store.Fetch(key, pm.Manifest, open, modelcache.Limits{MaxBytes: pm.Manifest.Bytes, MaxEntries: modelCacheMaxEntries})
+	gen, err = c.store.Fetch(key, pm.Manifest, open, modelcache.Limits{MaxBytes: pm.Manifest.Bytes, MaxEntries: modelCacheMaxEntries})
 	return gen, pm.Manifest.Bytes, err
 }
 
@@ -600,7 +632,7 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 	if finishedAt.IsZero() || fingerprint == "" {
 		// Without the download's own record of its tree, what the engine
 		// changed since cannot be told apart.
-		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+		metrics.CountModelCacheOp("harvest", "skipped")
 		return
 	}
 	src, err := c.emptyDirPath(pod, d.Landing.VolumeName)
@@ -611,7 +643,7 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 	ents, err := modelcache.Scan(src, modelCacheMaxEntries)
 	if errors.Is(err, modelcache.ErrTooLarge) {
 		log.Info("model cache: not harvesting a tree of that many entries")
-		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+		metrics.CountModelCacheOp("harvest", "skipped")
 		return
 	}
 	if err != nil {
@@ -628,7 +660,7 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 	release, err := c.reserve(ctx, modelcache.AllocEstimate(ents))
 	if err != nil {
 		log.WithError(err).WithField("bytes", size).Info("model cache: not harvesting")
-		metrics.ModelCacheOps.WithLabelValues("harvest", "skipped").Inc()
+		metrics.CountModelCacheOp("harvest", "skipped")
 		return
 	}
 	defer release()
@@ -639,11 +671,11 @@ func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook
 		NotAfter: finishedAt.Add(time.Second), Fingerprint: fingerprint})
 	if err != nil {
 		log.WithError(err).Warn("model cache: harvest failed; the next cold pod downloads")
-		metrics.ModelCacheOps.WithLabelValues("harvest", "error").Inc()
+		metrics.CountModelCacheOp("harvest", "error")
 		return
 	}
-	metrics.ModelCacheOps.WithLabelValues("harvest", "ok").Inc()
-	metrics.ModelCacheBytes.WithLabelValues("harvest").Add(float64(size))
+	metrics.CountModelCacheOp("harvest", "ok")
+	metrics.AddModelCacheBytes("harvest", size)
 	log.WithFields(logrus.Fields{"bytes": size, "seconds": fmt.Sprintf("%.1f", time.Since(start).Seconds())}).Info("model cache: harvested the download")
 	if err := c.register(ctx, d.Key, filepath.Base(gen)); err != nil {
 		log.WithError(err).Warn("model cache: registering the harvested key failed")
@@ -765,23 +797,25 @@ func (c *nodeModelCache) evict(ctx context.Context, want int64) {
 			c.mu.Unlock()
 			return
 		}
-		// Held busy while it goes: no fill, harvest or transfer starts on
-		// it, and peers stop being sent here before the files go.
+		// Held while it goes: no fill, harvest or transfer starts on it,
+		// no peer request is served from it (begin), and peers stop being
+		// sent here before the files go.
 		c.busy[victim]++
+		c.evicting[victim] = true
 		c.mu.Unlock()
 		if err := c.deregister(ctx, victim); err != nil {
 			c.log.WithError(err).WithField("key", victim).Warn("model cache: deregistering before eviction failed; keeping the key")
-			c.end(victim)
+			c.endEvict(victim)
 			return
 		}
 		if err := c.store.EvictKey(victim); err != nil {
 			c.log.WithError(err).WithField("key", victim).Warn("model cache: eviction failed")
-			c.end(victim)
+			c.endEvict(victim)
 			return
 		}
 		c.log.WithField("key", victim).Info("model cache: evicted the least recently used key")
-		metrics.ModelCacheOps.WithLabelValues("evict", "ok").Inc()
-		c.end(victim)
+		metrics.CountModelCacheOp("evict", "ok")
+		c.endEvict(victim)
 	}
 }
 
@@ -792,6 +826,14 @@ func (c *nodeModelCache) manifestHandler(w http.ResponseWriter, r *http.Request)
 	key := mux.Vars(r)["key"]
 	if !modelcache.ValidKey(key) {
 		http.Error(w, "bad key", http.StatusBadRequest)
+		return
+	}
+	// A key being evicted is not offered: its files are going.
+	c.mu.Lock()
+	evicting := c.evicting[key]
+	c.mu.Unlock()
+	if evicting {
+		http.NotFound(w, r)
 		return
 	}
 	gen, m, ok := c.store.Latest(key)
@@ -811,7 +853,11 @@ func (c *nodeModelCache) fileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Busy while it streams: the key is not evicted under the transfer.
-	c.begin(key, false)
+	// A key being evicted is not served.
+	if !c.begin(key, false) {
+		http.NotFound(w, r)
+		return
+	}
 	defer c.end(key)
 	dir := filepath.Join(c.store.KeyDir(key), gen)
 	if _, err := os.Stat(filepath.Join(dir, modelcache.CompleteFile)); err != nil {
@@ -897,6 +943,9 @@ func (a *Agent) startNodeModelCache(ctx context.Context, router *mux.Router) {
 			return
 		}
 	}
+	// The tenant resolver on this client, before the controller or
+	// admission looks up a tenant (bindTenants).
+	a.bindTenants(kube)
 	// Main container 0, as the webhook's Mutator resolves it.
 	c := newNodeModelCache(cfg, kube, a.config.NodeName, a.modelCacheNamespace(), agentTenants{a}, 0, a.peerAgentURL, log)
 	router.HandleFunc("/v1/model-cache/{key}", c.manifestHandler).Methods("GET")
