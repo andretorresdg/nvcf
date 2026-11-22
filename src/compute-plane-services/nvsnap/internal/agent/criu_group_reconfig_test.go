@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -52,8 +53,8 @@ func reconfigRecord(members []*corev1.Pod, ranks int, companionContainers map[st
 }
 
 func TestProcessConfigChangedNamesTheChangedMember(t *testing.T) {
-	r0 := stsRank("kimi-0", "0", "2", "sts-c", true)
-	r1 := stsRank("kimi-1", "1", "2", "sts-c", true)
+	r0 := stsRank("eng-0", "0", "2", "sts-c", true)
+	r1 := stsRank("eng-1", "1", "2", "sts-c", true)
 	suffix := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: v} }
 	old := []*corev1.Pod{stamped(r0, "", suffix("a1")), stamped(r1, "", suffix("a1"))}
 	data := reconfigRecord(old, 2, nil)
@@ -76,7 +77,7 @@ func TestProcessConfigChangedNamesTheChangedMember(t *testing.T) {
 }
 
 func TestProcessConfigChangedComparesACompanionByItsContainer(t *testing.T) {
-	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	r0 := stsRank("eng-0", "0", "1", "sts-c", true)
 	etcd := stsRank("etcd-0", "0", "1", "sts-e", false)
 	etcd.Name = "etcd-0"
 	cc := map[string]string{"etcd-0": etcd.Spec.Containers[0].Name}
@@ -91,7 +92,7 @@ func TestProcessConfigChangedComparesACompanionByItsContainer(t *testing.T) {
 func TestClaimGroupRecord_ReplacesARecordOfAnotherConfiguration(t *testing.T) {
 	c, kc, _ := groupFixture(t)
 	ctx := context.Background()
-	p := stsRank("kimi-0", "0", "2", "sts-c", true)
+	p := stsRank("eng-0", "0", "2", "sts-c", true)
 	changed := func(map[string]string) bool { return true }
 	same := func(map[string]string) bool { return false }
 
@@ -140,7 +141,7 @@ func TestReplaceableRecordWaitsOutTheCooldown(t *testing.T) {
 // any companion slot. Which of its containers the capture checkpointed may
 // differ from instance to instance; an unchanged companion is not changed.
 func TestProcessConfigChangedMatchesACompanionAgainstAnySlot(t *testing.T) {
-	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	r0 := stsRank("eng-0", "0", "1", "sts-c", true)
 	nats := stsRank("nats-0", "0", "1", "sts-n", false)
 	nats.Name = "nats-0"
 	etcd := stsRank("etcd-0", "0", "1", "sts-e", false)
@@ -164,7 +165,7 @@ func TestCRIUFallbackSkipsARecordOfAnotherConfiguration(t *testing.T) {
 	a, _ := fallbackAgent(t)
 	own := fnKey(t, a)
 	old := time.Now().Add(-2 * recordReplaceCooldown).UTC().Format(time.RFC3339)
-	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	r0 := stsRank("eng-0", "0", "1", "sts-c", true)
 	was := stamped(r0, "", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "a1"})
 	now := stamped(r0, "", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "b7"})
 	data := reconfigRecord([]*corev1.Pod{was}, 1, nil)
@@ -193,11 +194,89 @@ func TestCRIUFallbackSkipsARecordOfAnotherConfiguration(t *testing.T) {
 // The members' configurations written at the claim survive a capture that
 // then fails: the record the failure persists is built from the same data.
 func TestMemberConfigsAreInTheRecordSnapshot(t *testing.T) {
-	r0 := stsRank("kimi-0", "0", "1", "sts-c", true)
+	r0 := stsRank("eng-0", "0", "1", "sts-c", true)
 	m := stamped(r0, "", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "b7"})
 	snapshot := map[string]string{"state": criuGroupStateCapturing}
 	recordMemberConfigs(snapshot, []*corev1.Pod{m}, 1, nil)
 	if snapshot["processConfig.0"] == "" {
 		t.Fatal("the local record snapshot lacks the member's configuration")
+	}
+}
+
+// reconfigFallbackRecord creates the failed (out of attempts, past the
+// cooldown) record of fnKey with state and the configurations of members.
+func reconfigFallbackRecord(t *testing.T, a *Agent, state string, members ...*corev1.Pod) {
+	t.Helper()
+	data := reconfigRecord(members, len(members), nil)
+	old := time.Now().Add(-2 * recordReplaceCooldown).UTC().Format(time.RFC3339)
+	data["state"], data["captures"], data["startedAt"], data[groupAgentBundleKey] = state, "3", old, fbBundle
+	data["size"] = strconv.Itoa(len(members))
+	r := record(criuGroupConfigMapName(fnKey(t, a)), data)
+	if _, err := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace()).Create(context.Background(), &r, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A redeploy that changes only a worker's process configuration: the
+// leader's slot still matches. Once a member of another configuration was
+// admitted, the leader does not fall back either, or the instance (whose
+// capture the leader leads) would never capture again and the
+// configuration would start cold for good.
+func TestCRIUFallbackLeaderFollowsAReconfiguredWorker(t *testing.T) {
+	a, _ := fallbackAgent(t)
+	ctx := context.Background()
+	suffix := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: v} }
+	r0 := stamped(stsRank("eng-0", "0", "2", "sts-c", true), "", suffix("a1"))
+	r1 := stamped(stsRank("eng-1", "1", "2", "sts-c", true), "", suffix("a1"))
+	r1b := stamped(stsRank("eng-1", "1", "2", "sts-c", true), "", suffix("b7"))
+	reconfigFallbackRecord(t, a, criuGroupStateFailed, r0, r1)
+
+	if _, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(r0)); !ok {
+		t.Fatal("the failed configuration's leader does not fall back")
+	}
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 1, webhook.ProcessConfig(r1b)); ok {
+		t.Fatalf("a reconfigured worker falls back: %+v", fb)
+	}
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(r0)); ok {
+		t.Fatalf("after a reconfigured worker, the unchanged leader still falls back: %+v; the instance can never capture again", fb)
+	}
+	// And the capture the leader then leads replaces the record.
+	if changed := processConfigChanged(getRecord(t, a, criuGroupConfigMapName(fnKey(t, a))), []*corev1.Pod{r0, r1b}, 2, nil); len(changed) == 0 {
+		t.Fatal("the capture does not see the reconfigured worker")
+	}
+}
+
+// A pod of another configuration that fails under the library replaces the
+// record's configuration with its own: its replacement falls back without
+// the library rather than fail under it again and again. A third
+// configuration still reaches its capture.
+func TestGPUShareFailureRecordsTheFailingConfiguration(t *testing.T) {
+	a, _ := fallbackAgent(t)
+	c := a.criuRestorer()
+	ctx := context.Background()
+	suffix := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: v} }
+	r0 := stsRank("eng-0", "0", "2", "sts-c", true)
+	r1 := stsRank("eng-1", "1", "2", "sts-c", true)
+	reconfigFallbackRecord(t, a, criuGroupStateGPUShareFailed, stamped(r0, "", suffix("a1")), stamped(r1, "", suffix("a1")))
+	key := fnKey(t, a)
+
+	b0, b1 := stamped(r0, "", suffix("b7")), stamped(r1, "", suffix("b7"))
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(b0)); ok {
+		t.Fatalf("another configuration falls back: %+v", fb)
+	}
+	// It fails under the library, again on the same bundle.
+	for i := 0; i < 2; i++ {
+		if marked, err := c.markGPUShareFailed(ctx, key, fbBundle, "exit 1", "", b0, 0); err != nil || !marked {
+			t.Fatalf("mark = %v, %v", marked, err)
+		}
+	}
+	for ord, p := range []*corev1.Pod{b0, b1} {
+		if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", ord, webhook.ProcessConfig(p)); !ok || fb.Reason != webhook.FallbackGPUShareFailed {
+			t.Fatalf("rank %d of the configuration that failed under the library: fallback %+v, %v; want %s", ord, fb, ok, webhook.FallbackGPUShareFailed)
+		}
+	}
+	c0 := stamped(r0, "", suffix("c3"))
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(c0)); ok {
+		t.Fatalf("a third configuration falls back: %+v", fb)
 	}
 }

@@ -68,6 +68,14 @@ capture per cooldown. The members' configurations are written at the claim, so a
 which configuration failed. The replaced capture's checkpoints are retired by the checkpoint reaper, which removes an
 instance capture no complete record names.
 
+A failed record does not send a pod of another process configuration to the fallback: the pod's rank slot differs
+(`otherConfiguration`, `internal/agent/criu_fallback.go`), and its instance's capture replaces the record. That pod's
+admission also marks the record `reconfiguredAt` (`markReconfigured`), after which no pod falls back on it, so a leader
+whose own slot still matches, when a redeploy changed only the workers, does not keep its instance from capturing. A
+failure under the library marks the record with the failing pod's process configuration (`markFailedConfiguration`):
+unless the pod's slot already holds it, every slot is dropped and the pod's written, and the `reconfiguredAt` mark
+goes, so the configuration's next pods fall back without the library instead of failing under it again.
+
 For a GPU pod of a configuration that falls back, the webhook, in place of the CRIU-only decoration:
 
 1. does not inject the gpushare library when the reason is `gpushare-failed`; otherwise keeps it, as a later CRIU

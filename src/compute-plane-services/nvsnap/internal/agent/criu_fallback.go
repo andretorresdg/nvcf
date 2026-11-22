@@ -52,6 +52,12 @@ const (
 	groupGPUShareFailureKey      = "gpushareFailure"
 	groupGPUSharePreviousKey     = "gpusharePreviousState"
 	groupGPUShareClearedKey      = "gpushareCleared"
+	// groupReconfiguredKey is set on a failed record, when a pod of another
+	// process configuration than a slot's was admitted, to when it was:
+	// the configuration changed, and no pod of the record's falls back
+	// until a capture replaces the record or a failure under the library
+	// marks it again (criuFallbackFor, markFailedConfiguration).
+	groupReconfiguredKey = "reconfiguredAt"
 	// gpushareFailedStarts is how many failed starts of a GPU container,
 	// its pod never Ready, mark the configuration.
 	gpushareFailedStarts = 2
@@ -109,7 +115,10 @@ func criuFallbackReason(d map[string]string, now time.Time, bundle string) strin
 // for the pod's ordinal holds another process configuration, and that a
 // capture may replace (replaceableRecord), is not this configuration's
 // failure: the pod does not fall back, and its instance's capture replaces
-// the record.
+// the record. The record is marked reconfigured (groupReconfiguredKey), so
+// a rank whose own slot still matches, such as a leader when a redeploy
+// changed only the workers, does not fall back either: a fallback leader
+// would keep its instance from ever capturing again.
 func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int, processConfig string) (webhook.CRIUFallback, bool) {
 	scope, err := a.criuGroupScope(ctx, ns)
 	if err != nil {
@@ -135,6 +144,13 @@ func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int
 			a.log.WithFields(logrus.Fields{"criuGroup": key, "state": data["state"]}).
 				Info("CRIU fallback: the record is of another process configuration; the pod's instance captures again")
 			reason = ""
+			if data[groupReconfiguredKey] == "" {
+				a.markReconfigured(ctx, key)
+			}
+		} else if reason != "" && data[groupReconfiguredKey] != "" && replaceableRecord(data, time.Now()) {
+			a.log.WithFields(logrus.Fields{"criuGroup": key, "state": data["state"], "reconfiguredAt": data[groupReconfiguredKey]}).
+				Info("CRIU fallback: a pod of another process configuration was admitted for the record; the pod's instance captures again")
+			reason = ""
 		}
 	}
 	if reason == "" {
@@ -157,6 +173,61 @@ func otherConfiguration(data map[string]string, ordinal int, processConfig strin
 		return false
 	}
 	return len(webhook.ProcessConfigChanges(slot, processConfig)) > 0
+}
+
+// markReconfigured marks the failed group record of key (its instance's
+// through an alias) reconfigured. A failure to is logged: the pods that
+// see the record unmarked fall back as before.
+func (a *Agent) markReconfigured(ctx context.Context, key string) {
+	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cm, err := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{})
+		if err == nil && cm.Data["state"] == criuGroupStateAlias {
+			cm, err = cms.Get(ctx, criuGroupConfigMapName(cm.Data["alias"]), metav1.GetOptions{})
+		}
+		if err != nil {
+			return err
+		}
+		switch cm.Data["state"] {
+		case criuGroupStateFailed, criuGroupStateRestoreFailed, criuGroupStateGPUShareFailed:
+		default:
+			return nil // taken over meanwhile
+		}
+		if cm.Data[groupReconfiguredKey] != "" {
+			return nil
+		}
+		cm.Data[groupReconfiguredKey] = time.Now().UTC().Format(time.RFC3339)
+		_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		a.log.WithError(err).WithField("criuGroup", key).Warn("CRIU fallback: cannot mark the record reconfigured; its other ranks may still fall back")
+	}
+}
+
+// markFailedConfiguration makes record data d, which a failure under the
+// library of pod, rank ordinal, just marked, name the pod's process
+// configuration as the one that failed: unless its slot already holds it,
+// every slot is dropped (they may be of a configuration that no longer
+// runs; an empty slot is not compared) and the pod's written, so the configuration's next pods fall back
+// instead of failing under the library again. The reconfigured mark goes:
+// the record is now of the configuration that runs.
+func markFailedConfiguration(d map[string]string, pod *corev1.Pod, ordinal int) {
+	delete(d, groupReconfiguredKey)
+	if pod == nil || pod.Annotations[webhook.ProcessConfigAnnotation] == "" {
+		return
+	}
+	slot := d[fmt.Sprintf("processConfig.%d", ordinal)]
+	if slot != "" && len(webhook.ProcessConfigChanges(slot, pod.Annotations[webhook.ProcessConfigAnnotation])) == 0 {
+		return
+	}
+	for k := range d {
+		if strings.HasPrefix(k, "processConfig.") {
+			delete(d, k)
+		}
+	}
+	size, _ := strconv.Atoi(d["size"])
+	recordProcessConfig(d, ordinal, pod, gpuContainer(pod), max(size, ordinal+1))
 }
 
 // groupRecordData returns the group record of key, through its alias when
@@ -382,7 +453,7 @@ func (c *criuAutoRestorer) considerGPUShareFailure(ctx context.Context, pod *cor
 		}
 	}
 	log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "failure": failure})
-	key, _, err := c.a.podFallbackKey(ctx, pod)
+	key, ordinal, err := c.a.podFallbackKey(ctx, pod)
 	if err != nil {
 		log.WithError(err).Info("gpushare: a pod failed to start; its configuration cannot be named, so it is not marked")
 		return
@@ -414,7 +485,7 @@ func (c *criuAutoRestorer) considerGPUShareFailure(ctx context.Context, pod *cor
 		return
 	}
 	evidence := c.a.gpushareFailureEvidence(ctx, pod, log)
-	marked, err := c.markGPUShareFailed(ctx, key, bundle, failure, evidence)
+	marked, err := c.markGPUShareFailed(ctx, key, bundle, failure, evidence, pod, ordinal)
 	if err != nil {
 		retryLater()
 		log.WithError(err).Warn("gpushare: cannot mark the configuration; the pod is left as it is")
@@ -488,8 +559,9 @@ func clearGPUShare(d map[string]string, bundle, failure string) bool {
 
 // markGPUShareFailed marks the group record of key (its instance's
 // through an alias), creating it when there is none, and keeps the failed
-// pod's evidence (gpushare_evidence.go) with the mark.
-func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, failure, evidence string) (bool, error) {
+// pod's evidence (gpushare_evidence.go) and process configuration
+// (markFailedConfiguration; pod is rank ordinal) with the mark.
+func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, failure, evidence string, pod *corev1.Pod, ordinal int) (bool, error) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	target := key
 	if cm, err := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); err == nil && cm.Data["state"] == criuGroupStateAlias {
@@ -498,6 +570,7 @@ func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, 
 		d := map[string]string{}
 		markGPUShare(d, bundle, failure, time.Now())
 		keepEvidence(d, evidence)
+		markFailedConfiguration(d, pod, ordinal)
 		_, err := cms.Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName(key), Labels: map[string]string{"app.kubernetes.io/managed-by": "nvsnap"}},
 			Data:       d,
@@ -516,6 +589,7 @@ func (c *criuAutoRestorer) markGPUShareFailed(ctx context.Context, key, bundle, 
 		marked = markGPUShare(d, bundle, failure, time.Now())
 		if marked {
 			keepEvidence(d, evidence)
+			markFailedConfiguration(d, pod, ordinal)
 		}
 		return marked
 	})
