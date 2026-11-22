@@ -223,6 +223,9 @@ func ResolveModelCacheDownload(ctx context.Context, tenants TenantScoper, pod *c
 	if len(init.Command) == 0 || init.Command[0] == HelperBin {
 		return d, false
 	}
+	if readsLabelsOrAnnotations(pod, &init) {
+		return d, false
+	}
 	watch, ok := seedable(pod, idx, land.VolumeName)
 	if !ok {
 		return d, false
@@ -285,6 +288,53 @@ func unwrapModelCache(pod *corev1.Pod) (*corev1.Pod, bool, bool) {
 	return pod, false, true
 }
 
+// readsLabelsOrAnnotations reports whether the init can read a label or
+// an annotation of its pod: by an env field reference, or through a
+// downward-API volume (plain or projected) it mounts. Their values can
+// differ between pods of one recipe and can change after admission, and
+// the key names a field reference only by its path; a download steered
+// by one could write another tree under the same key, so it is not
+// cached. The pod's own identity (name, namespace, uid, node, addresses)
+// stays keyed by its path: a download that wrote a different tree per pod
+// could not be shared at all.
+func readsLabelsOrAnnotations(pod *corev1.Pod, init *corev1.Container) bool {
+	mutable := func(f *corev1.ObjectFieldSelector) bool {
+		return f != nil && (strings.HasPrefix(f.FieldPath, "metadata.labels") || strings.HasPrefix(f.FieldPath, "metadata.annotations"))
+	}
+	for _, e := range init.Env {
+		if e.ValueFrom != nil && mutable(e.ValueFrom.FieldRef) {
+			return true
+		}
+	}
+	items := func(files []corev1.DownwardAPIVolumeFile) bool {
+		for _, f := range files {
+			if mutable(f.FieldRef) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, vm := range init.VolumeMounts {
+		for i := range pod.Spec.Volumes {
+			v := &pod.Spec.Volumes[i]
+			if v.Name != vm.Name {
+				continue
+			}
+			if v.DownwardAPI != nil && items(v.DownwardAPI.Items) {
+				return true
+			}
+			if v.Projected != nil {
+				for _, src := range v.Projected.Sources {
+					if src.DownwardAPI != nil && items(src.DownwardAPI.Items) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 func isPodUIDEnv(e corev1.EnvVar) bool {
 	return e.Name == PodUIDEnv && e.Value == "" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil &&
 		e.ValueFrom.FieldRef.FieldPath == "metadata.uid"
@@ -342,7 +392,9 @@ func seedable(pod *corev1.Pod, idx int, vol string) ([]string, bool) {
 // last wins); its volume mounts with each volume's full source; and the
 // pod's and the init's security contexts (the owners and group a download
 // leaves). Values from a Secret, ConfigMap or field are named, not read;
-// a Secret or ConfigMap changed under the same name is the same recipe.
+// a Secret or ConfigMap changed under the same name is the same recipe. A
+// download that reads a label or annotation is not cached at all
+// (readsLabelsOrAnnotations).
 func downloadRecipe(pod *corev1.Pod, c *corev1.Container) string {
 	var b strings.Builder
 	line := func(kind, s string) { fmt.Fprintf(&b, "%s %d:%s\n", kind, len(s), s) }

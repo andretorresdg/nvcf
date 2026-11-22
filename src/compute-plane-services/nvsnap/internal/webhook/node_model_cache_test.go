@@ -472,6 +472,11 @@ func TestNodeModelCacheWithoutSingleFlightAddsNoPlanWait(t *testing.T) {
 	pod := ngcFunctionPod()
 	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
 	init := initByName(out, "download-ngc-model")
+	// The cache still wraps the init: what follows checks the wrapper,
+	// not an init admission left alone.
+	if len(init.Command) < 2 || init.Command[0] != HelperBin || init.Command[1] != "model-cache" {
+		t.Fatalf("init command = %q; want the cache's wrapper", init.Command)
+	}
 	for _, e := range init.Env {
 		if e.Name == PodUIDEnv {
 			t.Fatalf("env %s added with single flight off", PodUIDEnv)
@@ -524,8 +529,63 @@ func TestModelCacheKeyKeepsAUserPodUIDEnvWithoutSingleFlight(t *testing.T) {
 	c.Env = append(c.Env, corev1.EnvVar{Name: PodUIDEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}})
 	before, _ := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, pod, 0)
 	out := applyPatches(t, pod, m.nodeModelCachePatches(context.Background(), pod, true))
+	if init := initByName(out, "download-ngc-model"); len(init.Command) < 2 || init.Command[0] != HelperBin || init.Command[1] != "model-cache" {
+		t.Fatalf("init command = %q; want the cache's wrapper", init.Command)
+	}
 	after, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, out, 0)
-	if !ok || after.Key != before.Key {
-		t.Fatalf("key after wrapping %q, want %q", after.Key, before.Key)
+	if !ok || !after.Wrapped || after.Key != before.Key {
+		t.Fatalf("after wrapping: key %q wrapped=%v ok=%v; want the wrapped init with key %q", after.Key, after.Wrapped, ok, before.Key)
+	}
+}
+
+// A label or annotation can differ between pods of one recipe, and can
+// change after admission; a download that reads one (an env field
+// reference, or a downward-API volume) would write another tree under the
+// same key. Such a download is not cached. A per-pod value of the pod's
+// own identity (its name) is keyed by its path, as before.
+func TestModelCacheLeavesADownloadThatReadsALabelOrAnnotation(t *testing.T) {
+	m := nodeCacheMutator(t)
+	field := func(path string) *corev1.EnvVarSource {
+		return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}
+	}
+	items := func(path string) []corev1.DownwardAPIVolumeFile {
+		return []corev1.DownwardAPIVolumeFile{{Path: "v", FieldRef: &corev1.ObjectFieldSelector{FieldPath: path}}}
+	}
+	for name, edit := range map[string]func(*corev1.Pod){
+		"env label": func(p *corev1.Pod) {
+			c := initByName(p, "download-ngc-model")
+			c.Env = append(c.Env, corev1.EnvVar{Name: "MODEL_REVISION", ValueFrom: field("metadata.labels['revision']")})
+		},
+		"env annotation": func(p *corev1.Pod) {
+			c := initByName(p, "download-ngc-model")
+			c.Env = append(c.Env, corev1.EnvVar{Name: "MODEL_REVISION", ValueFrom: field("metadata.annotations['revision']")})
+		},
+		"downward API volume": func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "podinfo", VolumeSource: corev1.VolumeSource{
+				DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: items("metadata.labels")}}})
+			c := initByName(p, "download-ngc-model")
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "podinfo", MountPath: "/etc/podinfo", ReadOnly: true})
+		},
+		"projected downward API volume": func(p *corev1.Pod) {
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "podinfo", VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{DownwardAPI: &corev1.DownwardAPIProjection{Items: items("metadata.annotations['revision']")}}}}}})
+			c := initByName(p, "download-ngc-model")
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: "podinfo", MountPath: "/etc/podinfo", ReadOnly: true})
+		},
+	} {
+		pod := ngcFunctionPod()
+		edit(pod)
+		if _, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, pod, 0); ok {
+			t.Errorf("%s: resolved a download that reads a label or annotation", name)
+		}
+		if p := m.nodeModelCachePatches(context.Background(), pod, true); p != nil {
+			t.Errorf("%s: wrapped a download that reads a label or annotation", name)
+		}
+	}
+	pod := ngcFunctionPod()
+	c := initByName(pod, "download-ngc-model")
+	c.Env = append(c.Env, corev1.EnvVar{Name: "POD_NAME", ValueFrom: field("metadata.name")})
+	if _, ok := ResolveModelCacheDownload(context.Background(), m.NodeModelCache.Tenants, pod, 0); !ok {
+		t.Fatal("a download with its pod's name by field reference is no longer cached")
 	}
 }

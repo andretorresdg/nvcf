@@ -61,13 +61,18 @@ Without single flight, the first instance's pods still each download. With it (`
 - the download init's image;
 - its command and arguments;
 - its env in declared order, except the platform's per-instance metadata (`GROVE_*`, `NVCF_*`, `KUBERNETES_*`,
-  `HOSTNAME`, `OTEL_*`), which would split every redeploy's key. A value from a field reference (the pod's own
-  name, labels, node) is keyed by its path, so it does not split the key;
+  `HOSTNAME`, `OTEL_*`), which would split every redeploy's key. A field reference to the pod's own identity (its
+  name, namespace, uid, node or addresses) is keyed by its path, so it does not split the key: a download whose tree
+  depended on it could not be shared at all;
 - its `envFrom` sources in order (the last one wins);
 - its volume mounts, each with its volume's full source;
 - the pod's and the init's security contexts (`fsGroup` and the users decide the owners a download leaves).
 
 A Secret or ConfigMap whose content changes under the same name is the same recipe.
+
+A download init that can read a label or an annotation of its pod, by an env field reference or through a
+downward-API volume it mounts (plain or projected), is not cached (`readsLabelsOrAnnotations`): their values can
+differ between pods of one recipe and change after admission, and the key could not tell the trees apart.
 
 Admission and the agent both compute the key from the pod spec and the namespace (`ResolveModelCacheDownload`). The
 agent never takes it from the label admission sets: a pod that labels itself with another key is ignored.
