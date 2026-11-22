@@ -93,10 +93,15 @@ so no directory anyone has mounted is replaced.
 `<root>/<key>` read-only into that init only, and labels and annotates the pod with the key, the volume and the init.
 It wraps an init only when all of these hold:
 
-- The pod is a cold pod: the restore and election branches of admission did not take it.
+- The pod is a cold pod: the restore and election branches of admission did not take it. A pod stamped with
+  `nvsnap.io/restore-from` whose hash restores nothing (no capture yet, or a CRIU capture not restored) is a cold
+  pod too.
 - The pod already uses the node's nvsnap bundle, because the gpushare library is placed. The helper comes from the
-  same bundle, so a pod that did not depend on the bundle does not start to.
+  same bundle, so a pod that did not depend on the bundle does not start to. A volume the pod declares under the
+  helper's name counts only if it is a `hostPath` to the bundle; from anything else, the init is left unwrapped.
 - The init mounts its download volume whole, with no `subPath`.
+- No restartable sidecar (an earlier init with `restartPolicy: Always`) mounts the download volume read-write. Such
+  a sidecar runs beside the download and the engine, so the volume would not hold only the download's tree.
 
 Any other volume the init can write and a later container reads might be an output that a seed would not produce.
 Admission cannot tell, so it passes each one to the helper with `--watch`. The helper fingerprints these volumes

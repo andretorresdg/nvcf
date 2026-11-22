@@ -98,6 +98,13 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 	if c == nil || c.Root == "" || m.ModelVolume != nil || !bundled || gpuRequest(pod) == 0 {
 		return nil
 	}
+	// The pod's own volume under the helper's name would be mounted where
+	// the helper runs from, and the helper is not in it.
+	if declared, bundle := m.bundleHelperVolume(pod); declared && !bundle {
+		m.logger().WithField("pod", election.PodIdentity(pod)).
+			Info("node model cache: not wrapping; the pod declares " + helperVolumeName + " from outside the node bundle")
+		return nil
+	}
 	d, ok := ResolveModelCacheDownload(ctx, c.Tenants, pod, m.MainContainer)
 	if !ok || d.Wrapped {
 		// A wrapped init is a pod admitted twice; leave it as it is.
@@ -362,6 +369,20 @@ func seedable(pod *corev1.Pod, idx int, vol string) ([]string, bool) {
 			}
 		}
 		return false
+	}
+	// A restartable sidecar started before the download runs beside it
+	// and the engine: if it can write vol, the tree is not only the
+	// download's.
+	for j := 0; j < idx; j++ {
+		sc := &pod.Spec.InitContainers[j]
+		if sc.RestartPolicy == nil || *sc.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			continue
+		}
+		for _, vm := range sc.VolumeMounts {
+			if vm.Name == vol && !vm.ReadOnly {
+				return nil, false
+			}
+		}
 	}
 	var watch []string
 	for _, vm := range init.VolumeMounts {

@@ -589,3 +589,91 @@ func TestModelCacheLeavesADownloadThatReadsALabelOrAnnotation(t *testing.T) {
 		t.Fatal("a download with its pod's name by field reference is no longer cached")
 	}
 }
+
+func wrappedByCache(c *corev1.Container) bool {
+	return c != nil && len(c.Command) > 1 && c.Command[0] == HelperBin && c.Command[1] == "model-cache"
+}
+
+// A pod the platform stamped with restore-from, whose hash has no capture
+// yet, is a cold start: its download seeds from the node's copy like any
+// other cold pod's.
+func TestMutateAppliesTheNodeModelCacheToAStampedColdStart(t *testing.T) {
+	m := nodeCacheMutator(t)
+	m.HostBundleRoot = "/bundle"
+	pod := ngcFunctionPod()
+	pod.Annotations = map[string]string{GPUShareAnnotation: "true", RestoreFromAnnotation: "deadbeef"}
+	ops, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := initByName(applyPatches(t, pod, ops), "download-ngc-model"); !wrappedByCache(c) {
+		t.Fatalf("a stamped cold start's download was not wrapped: %q", c.Command)
+	}
+}
+
+// A volume the pod declares under the helper's name, from anything but
+// the node bundle, is not the bundle: the helper is not in it.
+func TestMutateDoesNotTakeAPodsOwnVolumeForTheBundle(t *testing.T) {
+	m := nodeCacheMutator(t)
+	m.HostBundleRoot = "/bundle"
+	own := corev1.Volume{Name: helperVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}
+	for name, annotations := range map[string]map[string]string{
+		"without gpushare": nil,
+		"with gpushare":    {GPUShareAnnotation: "true"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pod := ngcFunctionPod()
+			pod.Annotations = annotations
+			pod.Spec.Volumes = append(pod.Spec.Volumes, own)
+			ops, err := m.Mutate(context.Background(), pod)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c := initByName(applyPatches(t, pod, ops), "download-ngc-model"); wrappedByCache(c) {
+				t.Fatalf("the download was wrapped to run a helper from the pod's own %s emptyDir: %q", helperVolumeName, c.Command)
+			}
+		})
+	}
+	// The bundle's own volume, from an earlier admission of this or
+	// another bundle version, still counts.
+	for _, p := range []string{m.bundleDir(""), m.bundleDir("v2")} {
+		pod := ngcFunctionPod()
+		dir := corev1.HostPathDirectory
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: helperVolumeName,
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: p, Type: &dir}}})
+		ops, err := m.Mutate(context.Background(), pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c := initByName(applyPatches(t, pod, ops), "download-ngc-model"); !wrappedByCache(c) {
+			t.Fatalf("a pod with the bundle at %s was not wrapped: %q", p, c.Command)
+		}
+	}
+}
+
+// A restartable sidecar started before the download keeps running beside
+// it and the engine: if it can write the download volume, what the volume
+// holds is not only the download's.
+func TestNodeModelCacheLeavesADownloadVolumeASidecarWrites(t *testing.T) {
+	m := nodeCacheMutator(t)
+	always := corev1.ContainerRestartPolicyAlways
+	sidecar := func(readOnly bool) *corev1.Pod {
+		p := ngcFunctionPod()
+		vm := corev1.VolumeMount{Name: "ngc-models", MountPath: "/models", ReadOnly: readOnly}
+		p.Spec.InitContainers = append([]corev1.Container{{Name: "sync", Image: "x", Command: []string{"sync"},
+			RestartPolicy: &always, VolumeMounts: []corev1.VolumeMount{vm}}}, p.Spec.InitContainers...)
+		return p
+	}
+	if ops := m.nodeModelCachePatches(context.Background(), sidecar(false), true); ops != nil {
+		t.Fatal("a download whose volume an earlier sidecar can write was wrapped")
+	}
+	if ops := m.nodeModelCachePatches(context.Background(), sidecar(true), true); ops == nil {
+		t.Fatal("a download whose volume an earlier sidecar only reads was left alone")
+	}
+	// An earlier init that is not a sidecar has ended before the download.
+	p := sidecar(false)
+	p.Spec.InitContainers[0].RestartPolicy = nil
+	if ops := m.nodeModelCachePatches(context.Background(), p, true); ops == nil {
+		t.Fatal("a download after an ordinary init that wrote its volume was left alone")
+	}
+}

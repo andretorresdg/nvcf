@@ -649,7 +649,8 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	bundled := false
 	if !isFallback || (fallback.Reason != FallbackGPUShareFailed && fallback.Reason != FallbackDriver) {
 		gp := m.gpusharePatches(ctx, pod)
-		bundled = len(gp) > 0 || podHasVolume(pod, gpushareLibVolume) || podHasVolume(pod, helperVolumeName)
+		_, helperBundle := m.bundleHelperVolume(pod)
+		bundled = len(gp) > 0 || podHasVolume(pod, gpushareLibVolume) || helperBundle
 		injectPatches = append(injectPatches, gp...)
 		injectPatches = append(injectPatches, m.captureHoldPatches(ctx, pod, len(gp) > 0)...)
 	}
@@ -723,6 +724,17 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	span.SetAttributes(attribute.String("nvsnap.hash", hash))
 
+	// coldStart admits a stamped pod that restores nothing: it keeps the
+	// placement every cold pod gets, its model download seeding from the
+	// node's copy among it.
+	coldStart := func() ([]PatchOp, error) {
+		patches := append(injectPatches, m.nodeModelCachePatches(ctx, pod, bundled)...)
+		if len(patches) == 0 {
+			return nil, nil
+		}
+		return mergePatchPlan(patches), nil
+	}
+
 	// A CRIU capture: the pod becomes the placeholder the agent restores
 	// the captured process into.
 	plog := m.logger().WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "hash": checkpointstore.ShortHash(hash)})
@@ -730,7 +742,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		cp, err := m.criuRestorePatches(pod, id, cman)
 		if err != nil {
 			plog.WithError(err).Warn("CRIU restore: cannot prepare the pod; cold start")
-			return mergePatchPlan(injectPatches), nil
+			return coldStart()
 		}
 		plog.WithField("checkpoint", id).Info("CRIU restore: pod admitted as the restore placeholder")
 		cp = append(cp, m.processConfigPatches(pod)...)
@@ -763,10 +775,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	// node never schedules (the platform kills it as "no capacity").
 	if haveManifest && criuCheckpointID(manifest) != "" {
 		plog.Info("CRIU capture not restored; cold start")
-		if len(injectPatches) == 0 {
-			return nil, nil
-		}
-		return mergePatchPlan(injectPatches), nil
+		return coldStart()
 	}
 	// Dispatch on the AUTHORITATIVE capture method stamped at capture
 	// time (v0.0.56). Fall back to the shape heuristic only for
@@ -837,10 +846,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		// be taken from it.
 		m.logger().WithField("hash", checkpointstore.ShortHash(hash)).
 			Info("no capture for hash; cold start")
-		if len(injectPatches) == 0 {
-			return nil, nil
-		}
-		return mergePatchPlan(injectPatches), nil
+		return coldStart()
 	}
 
 	// Note: we do NOT peer-fetch the capture bytes here. The webhook
