@@ -21,8 +21,8 @@ an error: it runs normally and starts cold, and the agent logs why. Each row giv
 |---|---|---|---|
 | A namespace with 2 or more Grove scaling group replicas (multi-replica Dynamo; prefill and decode groups count) | Captures and restores none of them: the replicas share their etcd, NATS and frontend, and a group capture or restore of one would stop or restore what the others use | `CRIU group capture: skipped; the instance starts from the caches` with `reason="the namespace runs N Grove scaling group replicas, which share their companions ..."` | `sharedCompanionsReason`, `internal/agent/grove_replicas.go` |
 | A worker whose configuration names its own instance, such as Dynamo's Kubernetes discovery (`GROVE_HEADLESS_SERVICE`) with the TCP request plane | Does not capture it: a restored process keeps that configuration and would run as the old instance | `CRIU group capture: skipped; the pod names its own instance in its configuration ...` or `... a rank names its own instance in its configuration` | `identityBlocksCapture`, called from `considerGroupCapture` and `captureGroup` in `internal/agent/criu_group.go` |
-| A worker that holds RDMA devices: NCCL over InfiniBand, ModelExpress (NIXL/UCX weight transfer), NIXL KV transfer | The capture preflight refuses it: a checkpoint cannot save RDMA state | `holds RDMA devices /dev/infiniband/uverbsN: a checkpoint cannot save RDMA state (checkpoint-restore/criu#267)` | `rdmaFindings`, `internal/agent/capture_preflight.go` |
-| Prefill/decode disaggregation | Refused by both rows above (several groups, and NIXL's RDMA) | as above | as above |
+| A worker that holds RDMA devices: NCCL over InfiniBand, ModelExpress (NIXL/UCX weight transfer), NIXL KV transfer | The capture preflight refuses it when its host checks find the devices: a checkpoint cannot save RDMA state. If a member's host checks cannot run, the preflight records a warning (`host checks did not run: ...`) that does not block the capture, and the dump then fails on the devices | `CRIU group capture preflight: process <pid> (<comm>) holds RDMA devices <devices>: a checkpoint cannot save RDMA state (checkpoint-restore/criu#267) ...` (search for `holds RDMA devices`), then `CRIU group capture: skipped; the preflight found what would fail it` | `rdmaFindings`, `processFindings` and `capturePreflight` (host-check warning), `internal/agent/capture_preflight.go` |
+| Prefill/decode disaggregation | Refused by both rows above (several groups, and NIXL's RDMA). The shared-companions check runs first (`sharedCompanionsBlockCapture`, before `capturePreflight` in `captureGroup`), so only its refusal is logged | the shared-companions line above; not the RDMA one | `captureGroup`, `internal/agent/criu_group.go` |
 | A Dynamo rank connected to no etcd or NATS in its namespace | Does not capture it: there is nothing to capture with it | `CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it` | `captureGroup`, `internal/agent/criu_group.go` |
 
 Releasing RDMA around a capture is in review: an RDMA verbs library that releases and re-creates NCCL's RDMA state
@@ -33,14 +33,20 @@ stay unsupported: each pause trips on the other's RDMA.
 ## Restores that are refused
 
 A restore is refused, and the pod starts cold, when the new pod's process configuration (command, args, env) differs
-from the checkpoint's: the restored process would keep the old one. The webhook logs `CRIU group restore: the pod's
-process configuration differs from its checkpoint's, which the restored process would keep; cold start` with the first
-difference, for example `changed="main: env DYN_NAMESPACE_WORKER_SUFFIX"`. The configuration is recorded by
-`ProcessConfig` and compared by `ProcessConfigChanges` (`internal/webhook/process_config.go`), in
-`criuGroupRestorePatches` (`internal/webhook/criu_group.go`) for a group and in `internal/webhook/criu_restore.go`
-for a single pod.
+from the checkpoint's: the restored process would keep the old one. The webhook logs the first difference, for example
+`changed="main: env DYN_NAMESPACE_WORKER_SUFFIX"`, with one of these lines:
+
+- a group member: `CRIU group restore: the pod's process configuration differs from its checkpoint's, which the
+  restored process would keep; cold start` (`criuGroupRestorePatches`, `internal/webhook/criu_group.go`)
+- a single pod: `CRIU restore: the pod's process configuration differs from its checkpoint's, which the restored
+  process would keep; cold start` (`internal/webhook/criu_restore.go`)
+
+The configuration is recorded by `ProcessConfig` and compared by `ProcessConfigChanges`
+(`internal/webhook/process_config.go`). A checkpoint taken before the configuration was recorded has no record to
+compare: `ProcessConfigChanges` returns no difference for an empty record, so such a checkpoint is restored even when
+the pod's command, args or env changed.
 
 Known gap: the instance that starts cold after such a refusal is not captured again, because the configuration's
 record already says `complete` (`CRIU group capture: skipped; the configuration's record says it is captured, being
-captured, or out of attempts`; `captureGroup` and `groupRecaptures` in `internal/agent/criu_group.go`). A function that NVCF redeploys with a new `DYN_NAMESPACE_WORKER_SUFFIX` therefore stops
-restoring until that record is removed.
+captured, or out of attempts`; `captureGroup` and `groupRecaptures` in `internal/agent/criu_group.go`). A function that NVCF redeploys with a new
+`DYN_NAMESPACE_WORKER_SUFFIX` therefore stops restoring until that record is removed.
