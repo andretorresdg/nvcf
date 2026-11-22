@@ -251,7 +251,8 @@ a copy on the node.
   `downloaded`. A wrapped init logs `nvsnap: model cache: seeded <bytes> ...` or `... downloading`. The agent logs
   `model cache: harvested`, `fetched from peer` and `evicted` with the key.
 - **Which nodes have a model?** `kubectl -n nvsnap-system get cm -l app.kubernetes.io/component=model-cache -o yaml`:
-  one ConfigMap per key, one entry per node.
+  one ConfigMap per key, one entry per node. `nvsnap-system` is the default; the ConfigMaps are in the agent's
+  `--rootfs-cm-namespace`, so use that namespace if it is set.
 - **A pod seeded a bad model.** Every copy is checked against its manifest, so a bad tree was bad when it was
   downloaded, and every node that has the key may serve it to its peers. Remove it everywhere, and keep it from being
   kept again:

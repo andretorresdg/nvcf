@@ -135,7 +135,9 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
 - **Fill.** For a pod whose init has not finished and a key the node does not have, it fetches the key from a peer
   listed in the ConfigMap `nvsnap-model-cache-<key>`, over the agent HTTP API, while refreshing the heartbeat. Every
   file is checked against the peer's manifest. The copy is published and the node listed as a source only after all
-  files pass.
+  files pass. A peer is dialed at its node's `InternalIP` on the agent port (`peerAgentURL`), as every agent-to-agent
+  feature does. With `agent.hostNetwork=false` nothing listens there (no `hostPort`), so peer fetches fail and pods
+  download; this is a limit of the shared peer resolver, not of the cache.
 - **Harvest.** For a pod whose init exited 0 and a key the node does not have, it copies the pod's `emptyDir` from
   the host into a new generation, hashing as it copies. It publishes the copy only if its fingerprint is the one the
   init reported, so a file the engine removed, added or rewrote after starting is never cached. A download that
