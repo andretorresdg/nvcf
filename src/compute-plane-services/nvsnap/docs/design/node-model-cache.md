@@ -25,8 +25,8 @@ Status: built, behind `agent.nodeModelCache.enabled` (default off). Scope: `inte
 
 Without a shared model volume ([helm-shared-model-volume.md](helm-shared-model-volume.md)), every cold pod
 downloads its model into a fresh `emptyDir` that is deleted with the pod. On a 4-pod multi-node instance on GB300
-(November 2026), each pod downloaded 1.56 TB, and the download inits ran 30 to 32 minutes (their start and end
-times). A restore is not affected: it skips the download (section 3).
+(November 2026, nvsnap build not recorded, [results/NODE-MODEL-CACHE-2026-11.md](../results/NODE-MODEL-CACHE-2026-11.md)), each pod downloaded 1.56 TB, and the download inits
+ran 30 to 32 minutes (their start and end times). A restore is not affected: it skips the download (section 3).
 Every first cold start of a function version, and every redeploy, pays the download again, for every pod.
 
 ## 2. What it does
@@ -139,8 +139,9 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
     descriptors. After each copy the file's size, mtime and change time must still be those the walk saw, so a
     shard rewritten in place, even with its mtime set back, is refused. Unlinking a file changes it too, so a pod
     torn down mid-harvest (as the originals are once a capture's restore replaces them) leaves nothing kept; the
-    next cold start downloads and harvests again. A harvest normally ends long before that: on a 1.56 TB model it
-    took about 5.5 minutes, and the engine took about 13 more to load.
+    next cold start downloads and harvests again. A harvest normally ends long before that: on a 1.56 TB model on GB300 it
+    took about 5.5 minutes, and the engine took about 13 more to load (November 2026, nvsnap build not recorded,
+    [results/NODE-MODEL-CACHE-2026-11.md](../results/NODE-MODEL-CACHE-2026-11.md)).
   - The walk never follows a symlink anywhere in a path. Each entry is opened through its parent's descriptor and
     checked to be the entry examined, so a workload that swaps a directory for a symlink mid-walk cannot lead the
     agent out of the volume. A FIFO or device is refused without blocking.
@@ -175,7 +176,8 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
 ## 7. Sizing
 
 Put `root` on the node's largest local filesystem, ideally the one the kubelet keeps pods' `emptyDir` volumes on.
-The first production-sized model measured was 1.56 TB per pod (a 4-pod GB300 instance, November 2026). Its download
+The first production-sized model measured was 1.56 TB per pod (a 4-pod GB300 instance, November 2026, nvsnap
+build not recorded, [results/NODE-MODEL-CACHE-2026-11.md](../results/NODE-MODEL-CACHE-2026-11.md)). Its download
 ran at about 870 MB/s per pod, so a copy only beats it if it runs at several GB/s. The default 30% of a 4 TB image
 disk is too small for such a model; the agent then keeps nothing and says why (`not harvesting ... no room within the
 budget`).

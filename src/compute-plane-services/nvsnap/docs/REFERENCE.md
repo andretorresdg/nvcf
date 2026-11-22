@@ -74,6 +74,7 @@ where the files column says.
 | `nvsnap.io/election-id` | `ElectionIDAnnotation` (internal/election/election.go) | On the leader pod is the id the webhook minted at admission and used as the Lease holder. |
 | `nvsnap.io/fallback-capture` | `FallbackCaptureAnnotation` (internal/webhook/criu_fallback.go) | Names the cachedir capture a fallback pod is seeded from; the agent on its node fetches it. |
 | `nvsnap.io/fallback-reason` | `FallbackReasonAnnotation` (internal/webhook/criu_fallback.go) | Is the group record state that made the pod fall back; the agent captures the cachedir of a pod that carries it. |
+| `nvsnap.io/feeds` | `feedsAnnotation` (internal/agent/model_cache_flight.go) | FeedsAnnotation, on the Lease, maps each streaming pod's identity to the identity it streams from, so no source feeds more than maxFeeds. |
 | `nvsnap.io/function-id` | `LabelFunction` (internal/fnstatus/fnstatus.go) |  |
 | `nvsnap.io/function-version-id` | `FunctionVersionIDAnnotation` (internal/podtimings/podtimings.go)<br>`LabelFunctionVersion` (internal/fnstatus/fnstatus.go) | Is the annotation key NVCA's Hook A stamps with the function-version id so downstream tools can group + summarize without re-deriving from labels. |
 | `nvsnap.io/gated` | `GatedLabel` (internal/election/election.go) | Is "true" while a follower holds the scheduling gate. |
@@ -177,7 +178,7 @@ binary.
 | `NVSNAP_PIDNS_FDS` |  | cmd/agent/pidns_exec.go |
 | `NVSNAP_PIDNS_UNIX_LISTENERS` |  | cmd/agent/pidns_exec.go |
 | `NVSNAP_POD_CACHE_DIR` |  | cmd/agent/main.go |
-| `NVSNAP_POD_UID` |  | cmd/nvsnap-mount-prep/main.go |
+| `NVSNAP_POD_UID` |  | cmd/nvsnap-helper/modelcache.go, cmd/nvsnap-mount-prep/main.go |
 | `NVSNAP_POLL_INTERVAL` |  | cmd/nvsnap-l2-wait/main.go |
 | `NVSNAP_PREP_DEADLINE` |  | cmd/nvsnap-mount-prep/main.go |
 | `NVSNAP_PREP_MOUNTS` |  | cmd/nvsnap-mount-prep/main.go |

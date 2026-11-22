@@ -256,9 +256,17 @@ a copy on the node.
   downloaded, and every node that has the key may serve it to its peers. Remove it everywhere, and keep it from being
   kept again:
   1. Turn the cache off (below), so no init waits on a fetch and no download is kept while you clean up.
-  2. On every node listed in `nvsnap-model-cache-<key>`, delete `<root>/<key>`. Then delete the ConfigMap.
-  3. Fix what made the download bad (the model version, the init's inputs) before turning the cache back on. A
+  2. Turning it off does not change pods already admitted: their init still mounts the cache and can seed from the
+     bad copy. List them with `kubectl get pods -A -l nvsnap.io/model-cache-key=<key>`, and scale their workloads
+     to zero (or delete those pods and keep them from being replaced) until step 5.
+  3. Delete `<root>/<key>` on every node of the cluster that could hold it, not only the nodes listed in
+     `nvsnap-model-cache-<key>`: a node can keep a copy whose registration failed. For example, for each node,
+     `kubectl debug node/<node> -it --image=busybox -- rm -rf /host<root>/<key>`. A node you cannot reach now
+     (cordoned, down) must be cleaned before it runs pods again, or before the cache is turned back on. Then delete
+     the ConfigMap.
+  4. Fix what made the download bad (the model version, the init's inputs) before turning the cache back on. A
      download with the same inputs has the same key, and the first cold start after that keeps a copy of it again.
+  5. Only then turn the cache back on and scale the workloads back up.
 - **Turn it off.** Set `agent.nodeModelCache.enabled=false` and upgrade. New pods are admitted unwrapped. The files
   under `root` stay until removed by hand.
 

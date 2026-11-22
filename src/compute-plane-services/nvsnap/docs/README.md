@@ -98,6 +98,7 @@ the column below is that status, corrected where the code disagrees.
 | [PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows | Empty until the next run |
 | [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | How long a Kimi-K3 group restore over 2 GB300 nodes took, step by step: fetch over rails, CRIU, GPU load, clock wait | Record |
 | [HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) | The election (one downloader per hash) on H100 with NVMesh, and the cache-set refresh's one run on GB300 | Record |
+| [NODE-MODEL-CACHE-2026-11.md](results/NODE-MODEL-CACHE-2026-11.md) | How long a 1.56 TB model took to download, harvest into the node model cache and load, on GB300 | Record |
 
 ## Using the API
 
