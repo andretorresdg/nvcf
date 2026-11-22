@@ -158,10 +158,19 @@ func (a *Agent) groveInstanceCount(ctx context.Context, ns string, pods []corev1
 // A Dynamo rank of no scaling group (a single-node prefill or decode
 // worker, say) fails closed too: any other Dynamo GPU worker of another
 // controller in pods shares the namespace's etcd, NATS and frontend with
-// it, whatever labels Grove gave them.
+// it, whatever labels Grove gave them. With no pods given (a check again
+// just before a hold, or before a restore) the namespace's pods are listed
+// now, so a worker that started since an earlier list is seen.
 func (a *Agent) sharedCompanionsReason(ctx context.Context, pod *corev1.Pod, pods []corev1.Pod) (string, error) {
 	if groveInstance(pod) == "" {
 		if webhook.DynamoComponent(pod) {
+			if pods == nil {
+				list, err := a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					return "", fmt.Errorf("list the namespace's pods: %w", err)
+				}
+				pods = list.Items
+			}
 			if other := otherDynamoWorker(pod, pods); other != "" {
 				return fmt.Sprintf("the namespace also runs Dynamo worker %s of another instance, which shares the companions (etcd, NATS, frontend); a group capture or restore of one would stop or restore what the other uses", other), nil
 			}

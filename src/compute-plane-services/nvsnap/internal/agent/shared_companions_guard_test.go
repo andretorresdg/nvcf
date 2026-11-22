@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 )
@@ -63,15 +64,15 @@ func TestSharedCompanionsReasonWithoutGroveLabels(t *testing.T) {
 // controllers but one group key: one instance, not two.
 func TestSharedCompanionsReasonKeepsAnLWSInstanceTogether(t *testing.T) {
 	a := &Agent{}
-	leader := dynamoWorker("kimi-0", "sts-leader")
-	worker := dynamoWorker("kimi-0-1", "sts-worker")
+	leader := dynamoWorker("eng-0", "sts-leader")
+	worker := dynamoWorker("eng-0-1", "sts-worker")
 	for _, p := range []*corev1.Pod{&leader, &worker} {
 		p.Labels = map[string]string{lwsGroupKeyLabel: "g1"}
 	}
 	if why, _ := a.sharedCompanionsReason(context.Background(), &leader, []corev1.Pod{leader, worker}); why != "" {
 		t.Fatalf("one LWS instance refused: %q", why)
 	}
-	other := dynamoWorker("kimi-1", "sts-leader")
+	other := dynamoWorker("eng-1", "sts-leader")
 	other.Labels = map[string]string{lwsGroupKeyLabel: "g2"}
 	if why, _ := a.sharedCompanionsReason(context.Background(), &leader, []corev1.Pod{leader, worker, other}); why == "" {
 		t.Fatal("a second LWS group in the namespace is not refused")
@@ -89,5 +90,23 @@ func TestSharedCompanionsReasonSeparatesDeploymentReplicas(t *testing.T) {
 	}
 	if why, _ := a.sharedCompanionsReason(context.Background(), &r1, []corev1.Pod{r1, r2}); why == "" {
 		t.Fatal("two single-pod replicas sharing companions are not refused")
+	}
+}
+
+// The checks that pass no pod list (the one just before the instance is
+// held, the one before a group restore) read the namespace's pods: a
+// Dynamo worker of another instance that started after the capture's first
+// list still refuses it.
+func TestSharedCompanionsReasonListsPodsWhenGivenNone(t *testing.T) {
+	prefill := dynamoWorker("prefill-0", "sts-prefill")
+	decode := dynamoWorker("decode-0", "sts-decode")
+	a := &Agent{kubeClient: fake.NewSimpleClientset(&prefill, &decode)}
+	why, err := a.sharedCompanionsReason(context.Background(), &prefill, nil)
+	if err != nil || !strings.Contains(why, "decode-0") {
+		t.Fatalf("no pods given, a decode worker in the namespace: why %q err %v; want refused, naming it", why, err)
+	}
+	alone := &Agent{kubeClient: fake.NewSimpleClientset(&prefill)}
+	if why, err := alone.sharedCompanionsReason(context.Background(), &prefill, nil); err != nil || why != "" {
+		t.Fatalf("no pods given, alone in its namespace: why %q err %v", why, err)
 	}
 }
