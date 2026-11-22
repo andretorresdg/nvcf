@@ -87,9 +87,9 @@ var (
 	// InstancePodCacheReads lets the instance status loop read Pod instances from the informer cache. A Pod is
 	// still read live when the cache misses it, before a change or a periodic status is reported or the Pod is
 	// purged, and about every 2 minutes. When the cache does not have the Pod of an instance already reported
-	// terminated, it is read live only before its periodic status and about every 2 minutes. When disabled,
-	// every Pod instance is read live on every pass.
-	InstancePodCacheReads = newFeatureFlag("InstancePodCacheReads", newBool(true))
+	// terminated, it is read live only before its periodic status and about every 2 minutes. When disabled, the
+	// default, every Pod instance is read live on every pass. The agent reads the flag when it starts.
+	InstancePodCacheReads = newFeatureFlag("InstancePodCacheReads", newBool(false))
 
 	// AllowWorkloadKubernetesAPIAccess allows workload pods to access the Kubernetes API.
 	// Required for First Class Operator (FCO) support.

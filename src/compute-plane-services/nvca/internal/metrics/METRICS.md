@@ -563,7 +563,7 @@ rate(nvca_k8s_api_failure_total[5m]) > 0.1
 
 Type: Counter
 
-Description: Total number of Pod instance reads by the instance status loop. With the `InstancePodCacheReads` feature flag enabled (the default), the loop reads each Pod instance from the informer cache. It reads the Pod live from the API server only when the cache does not have it, before it reports a changed state or a periodic status or purges the Pod, again just before it deletes a Pod it purges, and about every 2 minutes. The Pod of an instance already reported terminated is expected to be gone, so when the cache does not have it, the loop reads it live only before a periodic status and about every 2 minutes. Live reads also count in `nvca_k8s_api_success_total` and `nvca_k8s_api_failure_total` with `resource="pod"`. With the flag disabled, every read is live and this counter stays at zero.
+Description: Total number of Pod instance reads by the instance status loop. With the `InstancePodCacheReads` feature flag enabled (it is disabled by default), the loop reads each Pod instance from the informer cache. It reads the Pod live from the API server only when the cache does not have it, before it reports a changed state or a periodic status or purges the Pod, again just before it deletes a Pod it purges, and about every 2 minutes. The Pod of an instance already reported terminated is expected to be gone, so when the cache does not have it, the loop reads it live only before a periodic status and about every 2 minutes. Live reads also count in `nvca_k8s_api_success_total` and `nvca_k8s_api_failure_total` with `resource="pod"`. With the flag disabled, every read is live and this counter stays at zero.
 
 Labels:
 

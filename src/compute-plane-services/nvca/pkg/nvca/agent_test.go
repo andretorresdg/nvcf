@@ -3517,7 +3517,7 @@ func newInstanceStatusLoop(t *testing.T, icmsClient ICMSClientInterface, req *nv
 	srIndexer := newIndexer()
 	require.NoError(t, srIndexer.Add(req.DeepCopy()))
 
-	// Pod instances are read from the informer cache, as they are by default.
+	// Pod instances are read from the informer cache, as they are with InstancePodCacheReads enabled.
 	ff := &featureflagmock.Fetcher{EnabledFFs: []*featureflag.FeatureFlag{featureflag.InstancePodCacheReads}}
 	bc := &BackendK8sCache{
 		clients:                              clients,
