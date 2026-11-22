@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -410,10 +411,13 @@ func (s *Store) Harvest(key, src string, lim Limits) (string, error) {
 }
 
 // copyIn copies the tree at src to dst, building the manifest. It walks
-// without following any symlink (walkNoFollow), opens every file through
-// its parent's descriptor and checks it is the regular file it examined,
-// and refuses a file that changed during its copy, or anything changed
-// after lim.NotAfter.
+// without following any symlink (walkNoFollow), and opens every file
+// through its parent's descriptor, checking it is the regular file it
+// examined, before copying any. The tree is then checked against its
+// fingerprint and the bounds, and the files copied Parallel at a time from
+// those descriptors: a pod torn down mid-harvest takes its volume's names
+// away, not the open files. A file that changed during its copy, or
+// anything changed after lim.NotAfter, is refused.
 func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	m := Manifest{Version: ManifestVersion}
 	root, err := rootEntry(src)
@@ -424,6 +428,19 @@ func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	if !lim.NotAfter.IsZero() && time.Unix(0, root.Mtime).After(lim.NotAfter) {
 		return m, fmt.Errorf("%w: the volume root", ErrWrittenAfter)
 	}
+	type pending struct {
+		i   int // index in m.Entries
+		in  *os.File
+		st  unix.Stat_t
+		out string
+	}
+	var files []pending
+	defer func() {
+		for _, f := range files {
+			f.in.Close()
+		}
+	}()
+	bounded := lim.MaxBytes > 0 || lim.ExactBytes
 	err = walkNoFollow(src, lim.MaxEntries, func(n node) error {
 		if !lim.NotAfter.IsZero() && time.Unix(0, n.st.Mtim.Nano()).After(lim.NotAfter) {
 			return fmt.Errorf("%w: %s", ErrWrittenAfter, n.rel)
@@ -454,16 +471,20 @@ func copyIn(src, dst string, lim Limits) (Manifest, error) {
 				return err
 			}
 		case TypeFile:
-			budget := int64(-1)
-			if lim.MaxBytes > 0 || lim.ExactBytes {
-				budget = lim.MaxBytes - m.Bytes
+			if m.Bytes += e.Size; bounded && m.Bytes > lim.MaxBytes {
+				return fmt.Errorf("%w: over %d bytes", ErrTooLarge, lim.MaxBytes)
 			}
-			sum, err := copyFile(n, out, budget)
+			if len(files) >= maxOpenFiles {
+				return fmt.Errorf("%w: over %d files", ErrTooLarge, maxOpenFiles)
+			}
+			fd, err := openSame(n.dirfd, n.name, &n.st, 0)
 			if err != nil {
 				return fmt.Errorf("%s: %w", n.rel, err)
 			}
-			e.SHA256 = sum
-			m.Bytes += e.Size
+			// Opened non-blocking so a FIFO swapped in could not hang the
+			// open; a regular file reads the same either way.
+			_ = unix.SetNonblock(fd, false)
+			files = append(files, pending{i: len(m.Entries), in: os.NewFile(uintptr(fd), n.rel), st: n.st, out: out})
 		}
 		m.Entries = append(m.Entries, e)
 		return nil
@@ -474,45 +495,73 @@ func copyIn(src, dst string, lim Limits) (Manifest, error) {
 	if lim.Fingerprint != "" && Fingerprint(append([]Entry{root}, m.Entries...)) != lim.Fingerprint {
 		return m, fmt.Errorf("%w: the tree is not the one the download finished with", ErrChanged)
 	}
-	return m, nil
+	if afterOpen != nil {
+		afterOpen()
+	}
+	work := make(chan pending)
+	var mu sync.Mutex
+	var first error
+	var wg sync.WaitGroup
+	for w := 0; w < max(Parallel, 1); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range work {
+				sum, err := copyFrom(f.in, f.st, f.out)
+				mu.Lock()
+				if err != nil && first == nil {
+					first = fmt.Errorf("%s: %w", m.Entries[f.i].Path, err)
+				}
+				m.Entries[f.i].SHA256 = sum
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, f := range files {
+		mu.Lock()
+		stop := first != nil
+		mu.Unlock()
+		if stop {
+			break
+		}
+		work <- f
+	}
+	close(work)
+	wg.Wait()
+	return m, first
 }
 
-// copyFile copies the regular file n, hashing it, refusing to go past
-// budget bytes (negative: no limit), and checking it did not change.
-func copyFile(n node, dst string, budget int64) (string, error) {
-	fd, err := openSame(n.dirfd, n.name, &n.st, 0)
-	if err != nil {
-		return "", err
-	}
-	in := os.NewFile(uintptr(fd), n.rel)
-	defer in.Close()
-	// The descriptor was opened non-blocking so a FIFO swapped in could
-	// not hang the open; a regular file reads the same either way.
-	_ = unix.SetNonblock(fd, false)
+// maxOpenFiles bounds the files a harvest holds open at once: a tree of
+// more is not cached.
+const maxOpenFiles = 65536
+
+// afterOpen, in tests, runs once every file is open and before any copy.
+var afterOpen func()
+
+// copyFrom copies the open regular file in, whose status at the walk was
+// st, to dst: never more than its size, hashing it, and checking its size
+// and mtime did not change.
+func copyFrom(in *os.File, st unix.Stat_t, dst string) (string, error) {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return "", err
 	}
 	h := sha256.New()
-	var r io.Reader = in
-	if budget >= 0 {
-		r = io.LimitReader(in, budget+1)
-	}
-	k, err := io.Copy(io.MultiWriter(out, h), r)
+	k, err := io.Copy(io.MultiWriter(out, h), io.LimitReader(in, st.Size+1))
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		return "", err
 	}
-	if budget >= 0 && k > budget {
+	if k > st.Size {
 		return "", ErrTooLarge
 	}
 	var after unix.Stat_t
-	if err := unix.Fstat(fd, &after); err != nil {
+	if err := unix.Fstat(int(in.Fd()), &after); err != nil {
 		return "", err
 	}
-	if k != n.st.Size || after.Size != n.st.Size || after.Mtim != n.st.Mtim {
+	if k != st.Size || after.Size != st.Size || after.Mtim != st.Mtim {
 		return "", ErrChanged
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -533,11 +582,9 @@ func (s *Store) Fetch(key string, m Manifest, open func(rel string) (ReadCloser,
 		return "", err
 	}
 	tree := filepath.Join(a.dir, TreeDir)
-	for _, e := range m.Entries {
-		if err := materialize(tree, e, func() (ReadCloser, error) { return open(e.Path) }); err != nil {
-			a.abort()
-			return "", fmt.Errorf("%s: %w", e.Path, err)
-		}
+	if err := materializeAll(tree, m.Entries, func(e Entry) (ReadCloser, error) { return open(e.Path) }); err != nil {
+		a.abort()
+		return "", err
 	}
 	gen, err := a.publish(m)
 	if err != nil {
@@ -574,13 +621,10 @@ func Seed(gen string, m Manifest, dst string) error {
 		}
 	}
 	tree := filepath.Join(gen, TreeDir)
-	for _, e := range m.Entries {
-		src := filepath.Join(tree, filepath.FromSlash(e.Path))
-		if err := materialize(dst, e, func() (ReadCloser, error) {
-			return os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-		}); err != nil {
-			return fmt.Errorf("%s: %w", e.Path, err)
-		}
+	if err := materializeAll(dst, m.Entries, func(e Entry) (ReadCloser, error) {
+		return os.OpenFile(filepath.Join(tree, filepath.FromSlash(e.Path)), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	}); err != nil {
+		return err
 	}
 	for i := len(m.Entries) - 1; i >= 0; i-- {
 		e := m.Entries[i]
@@ -636,6 +680,63 @@ func Seed(gen string, m Manifest, dst string) error {
 		_ = unix.UtimesNanoAt(unix.AT_FDCWD, dst, ts, 0)
 	}
 	return nil
+}
+
+// Parallel is how many files a seed or a fetch copies at once: a model of
+// a terabyte and more in shards of gigabytes copies at disk or network
+// speed only with several streams.
+var Parallel = 8
+
+// materializeAll creates entries under root: directories and symlinks in
+// order (parents first), then the files, Parallel at a time. It returns
+// the first error, after the copies in flight have stopped.
+func materializeAll(root string, entries []Entry, open func(Entry) (ReadCloser, error)) error {
+	var files []Entry
+	for _, e := range entries {
+		if e.Type == TypeFile {
+			files = append(files, e)
+			continue
+		}
+		if err := materialize(root, e, nil); err != nil {
+			return fmt.Errorf("%s: %w", e.Path, err)
+		}
+	}
+	n := Parallel
+	if n < 1 {
+		n = 1
+	}
+	work := make(chan Entry)
+	var mu sync.Mutex
+	var first error
+	failed := func() bool { mu.Lock(); defer mu.Unlock(); return first != nil }
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range work {
+				if failed() {
+					continue
+				}
+				if err := materialize(root, e, func() (ReadCloser, error) { return open(e) }); err != nil {
+					mu.Lock()
+					if first == nil {
+						first = fmt.Errorf("%s: %w", e.Path, err)
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, e := range files {
+		if failed() {
+			break
+		}
+		work <- e
+	}
+	close(work)
+	wg.Wait()
+	return first
 }
 
 // materialize creates entry e under root, reading a file's bytes from

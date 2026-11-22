@@ -472,3 +472,48 @@ func TestScanStopsAtItsBound(t *testing.T) {
 		t.Fatalf("%d entries, %v; want the root and 10", len(ents), err)
 	}
 }
+
+func TestParallelSeedCopiesEveryShardAndCatchesOneBadOne(t *testing.T) {
+	src := t.TempDir()
+	for i := 0; i < 40; i++ {
+		must(t, os.WriteFile(filepath.Join(src, fmt.Sprintf("shard-%02d", i)), bytes.Repeat([]byte{byte(i)}, 64<<10), 0o644))
+	}
+	s := &Store{Root: t.TempDir()}
+	harvest(t, s, "k1", src)
+	gen, m, _ := s.Latest("k1")
+	dst := t.TempDir()
+	must(t, Seed(gen, m, dst))
+	for i := 0; i < 40; i++ {
+		b, err := os.ReadFile(filepath.Join(dst, fmt.Sprintf("shard-%02d", i)))
+		if err != nil || !bytes.Equal(b, bytes.Repeat([]byte{byte(i)}, 64<<10)) {
+			t.Fatalf("shard %d wrong after a parallel seed: %v", i, err)
+		}
+	}
+	f, err := os.OpenFile(filepath.Join(gen, TreeDir, "shard-27"), os.O_WRONLY, 0)
+	must(t, err)
+	_, err = f.WriteAt([]byte{0xff}, 100)
+	must(t, err)
+	must(t, f.Close())
+	if err := Seed(gen, m, t.TempDir()); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+}
+
+// The pod whose volume is harvested may be torn down mid-harvest: the files
+// are open by then, and the copy completes.
+func TestHarvestCompletesWhenTheVolumeGoesAwayMidHarvest(t *testing.T) {
+	src := modelTree(t)
+	afterOpen = func() { must(t, os.RemoveAll(src)) }
+	defer func() { afterOpen = nil }()
+	s := &Store{Root: t.TempDir()}
+	harvest(t, s, "k1", src)
+	gen, m, ok := s.Latest("k1")
+	if !ok {
+		t.Fatal("nothing published")
+	}
+	dst := t.TempDir()
+	must(t, Seed(gen, m, dst))
+	if fi, err := os.Stat(filepath.Join(dst, "m/weights/w-0001.safetensors")); err != nil || fi.Size() != 3<<20 {
+		t.Fatalf("weights after a mid-harvest teardown: %v, %v", fi, err)
+	}
+}

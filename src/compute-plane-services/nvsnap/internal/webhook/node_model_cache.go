@@ -305,6 +305,10 @@ func downloadRecipe(pod *corev1.Pod, c *corev1.Container) string {
 				src = jsonOf(pod.Spec.Volumes[i].VolumeSource)
 			}
 		}
+		// The volume's name is the pod's own label for it (a service
+		// account token volume's is random per pod); where it is mounted
+		// and what it is decide the download.
+		vm.Name = ""
 		line("mount", jsonOf(vm)+" <- "+src)
 	}
 	line("podSecurity", jsonOf(pod.Spec.SecurityContext))

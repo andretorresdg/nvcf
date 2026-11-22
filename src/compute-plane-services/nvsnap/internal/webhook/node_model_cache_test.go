@@ -327,3 +327,23 @@ func TestMutateTreatsAnAlreadyPlacedBundleAsPlaced(t *testing.T) {
 		t.Fatalf("a pod already on the bundle was not wrapped: %q", c.Command)
 	}
 }
+
+// Pods of one instance differ in the names of their service account token
+// volumes; that must not give each its own key (ct4, rc22c run 1).
+func TestModelCacheKeyIgnoresPodLocalVolumeNames(t *testing.T) {
+	key := func(tokenVol string) string {
+		p := ngcFunctionPod()
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: tokenVol, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"}}}}}}})
+		c := initByName(p, "download-ngc-model")
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: tokenVol, MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true})
+		d, ok := ResolveModelCacheDownload(context.Background(), nil, p, 0)
+		if !ok {
+			t.Fatal("not a cache download")
+		}
+		return d.Key
+	}
+	if key("kube-api-access-mh6zm") != key("kube-api-access-sbg6z") {
+		t.Fatal("a pod-local volume name changed the key")
+	}
+}

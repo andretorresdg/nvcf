@@ -17,15 +17,16 @@ Status: built, behind `agent.nodeModelCache.enabled` (default off). Scope: `inte
 - [4. Design](#4-design)
 - [5. Failure handling](#5-failure-handling)
 - [6. Security](#6-security)
-- [7. Not built](#7-not-built)
+- [7. Sizing](#7-sizing)
+- [8. Not built](#8-not-built)
 <!-- /toc -->
 
 ## 1. Problem
 
 Without a shared model volume ([helm-shared-model-volume.md](helm-shared-model-volume.md)), every cold pod
 downloads its model into a fresh `emptyDir` that is deleted with the pod. On a 4-pod multi-node instance on GB300
-(October 2026), each pod downloaded 19.3 GB, and the download init ran about 31 minutes. That time is read from the
-pod's init status, not measured inside the download. A restore is not affected: it skips the download (section 3).
+(November 2026), each pod downloaded 1.56 TB, and the download inits ran 30 to 32 minutes (their start and end
+times). A restore is not affected: it skips the download (section 3).
 Every first cold start of a function version, and every redeploy, pays the download again, for every pod.
 
 ## 2. What it does
@@ -41,7 +42,7 @@ do not change, and any problem with the cache falls back to the pod's own downlo
 | No copy anywhere, a corrupt copy, a failed fetch, no room | The pod's own download, unchanged; the agent then keeps a copy |
 
 The first instance's pods still each download, as without the cache. Deduplicating that first download across the
-cluster would need an elected writer and a wait on it; it is not built (section 7).
+cluster would need an elected writer and a wait on it; it is not built (section 8).
 
 ## 3. Why restores do not change
 
@@ -96,6 +97,8 @@ before and after the download; a download that changed one is not cached.
 
 **The helper**, in the init:
 1. If the volume already has content, a restarted init, it runs the download, which knows how to continue.
+   Copies run 8 files at a time: a model of a terabyte and more, in shards of gigabytes, copies at disk or network
+   speed only with several streams. The same holds for a peer fetch.
 2. If a complete generation exists, it copies it in, checking each file's size and sha256 as it copies. On any
    mismatch it empties the volume and runs the download.
 3. It waits only while the agent's fetch heartbeat (`<key>/.incoming`) is fresh, and never past `wait` seconds.
@@ -123,6 +126,9 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
   the host into a new generation, hashing as it copies. It publishes the copy only if its fingerprint is the one the
   init reported, so a file the engine removed, added or rewrote after starting is never cached. A download that
   reported no fingerprint is not kept.
+  - The walk opens every file before copying any, then copies `Parallel` (8) files at a time from those
+    descriptors. A pod torn down mid-harvest, as the originals are once a capture's restore replaces them, takes
+    away its volume's names but not the open files, so the harvest completes.
   - The walk never follows a symlink anywhere in a path. Each entry is opened through its parent's descriptor and
     checked to be the entry examined, so a workload that swaps a directory for a symlink mid-walk cannot lead the
     agent out of the volume. A FIFO or device is refused without blocking.
@@ -153,7 +159,15 @@ otherwise it refuses before writing and the pod downloads. The cache's own copie
 - File requests are confined to the generation's tree.
 - Keys are tenant-scoped and computed by the agent, as above.
 
-## 7. Not built
+## 7. Sizing
+
+Put `root` on the node's largest local filesystem, ideally the one the kubelet keeps pods' `emptyDir` volumes on.
+The first production-sized model measured was 1.56 TB per pod (a 4-pod GB300 instance, November 2026). Its download
+ran at about 870 MB/s per pod, so a copy only beats it if it runs at several GB/s. The default 30% of a 4 TB image
+disk is too small for such a model; the agent then keeps nothing and says why (`not harvesting ... no room within the
+budget`).
+
+## 8. Not built
 
 - **Cross-node deduplication of the first download.** The first instance's pods each download.
 - **RDMA transfer.** The fetch uses the agent HTTP API, one stream per file.
