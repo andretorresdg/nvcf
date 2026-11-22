@@ -47,6 +47,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -2087,13 +2088,28 @@ func getPostedInstanceStatus(ctx context.Context, isu types.ICMSRequestUpdateInf
 }
 
 // getUpdatedInstanceStatusMap returns a copy of currentStatus in which each instance posted to ICMS
-// records the posted state. Instances that were not posted are kept as they are, and posted
-// instances that are no longer in currentStatus are not added back.
-func getUpdatedInstanceStatusMap(currentStatus, postedStatus map[string]nvcav2beta1.InstanceStatus) map[string]nvcav2beta1.InstanceStatus {
+// records the posted state. A posted state is recorded only on an instance that is still as in
+// listedStatus, from which the status loop decided the post: an instance another writer changed
+// since then keeps the newer entry, for the next pass to decide from. Instances that were not
+// posted are kept as they are, and posted instances that are no longer in currentStatus are not
+// added back.
+func getUpdatedInstanceStatusMap(ctx context.Context,
+	currentStatus, listedStatus, postedStatus map[string]nvcav2beta1.InstanceStatus,
+) map[string]nvcav2beta1.InstanceStatus {
 	updatedStatus := maps.Clone(currentStatus)
 	for id, pis := range postedStatus {
 		cis, ok := updatedStatus[id]
 		if !ok {
+			continue
+		}
+		if lis := listedStatus[id]; !apiequality.Semantic.DeepEqual(cis, lis) {
+			core.GetLogger(ctx).WithFields(logrus.Fields{
+				"instanceID":           id,
+				"postedStatus":         pis.LastReportedStatus,
+				"listedStatus":         lis.Status,
+				"latestStatus":         cis.Status,
+				"latestReportedStatus": cis.LastReportedStatus,
+			}).Debug("Instance changed since the status loop listed it, keeping the newer entry")
 			continue
 		}
 		cis.Status = pis.LastReportedStatus
@@ -2224,8 +2240,9 @@ func (a *Agent) PostICMSInstanceRequestStatusUpdates(ctx context.Context) error 
 				// Apply the posted statuses to the latest instances, which may have changed since req was listed.
 				// Change the request status only while it is still the listed one: a status another writer
 				// stored since then, such as Failed, is kept for the next pass to list and handle.
-				modify := func(_ context.Context, sr *nvcav2beta1.ICMSRequest) {
-					sr.Status.Instances = getUpdatedInstanceStatusMap(sr.Status.Instances, postedInstanceStatus)
+				modify := func(ctx context.Context, sr *nvcav2beta1.ICMSRequest) {
+					sr.Status.Instances = getUpdatedInstanceStatusMap(ctx, sr.Status.Instances, req.Status.Instances,
+						postedInstanceStatus)
 					if sr.Status.RequestStatus == crs {
 						sr.Status.RequestStatus = nrs
 					}
