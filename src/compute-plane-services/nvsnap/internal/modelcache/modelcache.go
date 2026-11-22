@@ -635,6 +635,15 @@ func Seed(gen string, m Manifest, dst string) error {
 	}); err != nil {
 		return err
 	}
+	return ApplyMeta(dst, m)
+}
+
+// ApplyMeta gives every entry of m under dst, and dst itself, its recorded
+// owner, mode and mtime, children before their directory. Running as
+// root it sets any owner; otherwise it keeps the caller's user and sets
+// the group (Seed checked the entries are the caller's).
+func ApplyMeta(dst string, m Manifest) error {
+	root := os.Geteuid() == 0
 	for i := len(m.Entries) - 1; i >= 0; i-- {
 		e := m.Entries[i]
 		p := filepath.Join(dst, filepath.FromSlash(e.Path))

@@ -191,8 +191,9 @@ func seedFromCache(cache, to string, w waitRules) outcome {
 				fmt.Printf("nvsnap: model cache: no copy after %s; downloading\n", w.maxWait)
 				return streamStopped
 			}
-		case w.uid != "" && time.Since(start) < w.planWait:
-			// The agent has not planned this pod yet.
+		case w.uid != "" && time.Since(start) < w.planWait && !hasCopy(cache):
+			// The agent has not planned this pod yet. A node with a copy
+			// gets no plan: the default rule seeds from it at once.
 		default:
 			if gen, m, ok := modelcache.LatestIn(cache); ok {
 				began := time.Now()
@@ -231,6 +232,11 @@ func treesOf(paths []string, max int) string {
 		fmt.Fprintf(&b, "%s:%s;", p, modelcache.Fingerprint(ents))
 	}
 	return b.String()
+}
+
+func hasCopy(cache string) bool {
+	_, _, ok := modelcache.LatestIn(cache)
+	return ok
 }
 
 func heartbeatFresh(p string, stale time.Duration) bool {

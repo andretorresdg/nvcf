@@ -519,3 +519,20 @@ func TestModelCacheWithoutAPodUIDIgnoresPlans(t *testing.T) {
 		t.Fatalf("waited %v with no uid", d)
 	}
 }
+
+// A node with a complete copy needs no plan: the helper seeds at once
+// rather than wait out --plan-wait.
+func TestModelCacheSeedsAtOnceWithACopyAndNoPlan(t *testing.T) {
+	t.Setenv(modelcache.PodUIDEnv, testUID)
+	cache, to := cachedModel(t), t.TempDir()
+	start := time.Now()
+	if code, err := modelCacheCmd(append([]string{"--cache", cache, "--to", to, "--plan-wait", "30", "--"}, download(to)...)); code != 0 || err != nil {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("seeded after %v; want at once", d)
+	}
+	if got := read(t, filepath.Join(to, "weights.bin")); got != "cached" {
+		t.Fatalf("weights.bin = %q", got)
+	}
+}
