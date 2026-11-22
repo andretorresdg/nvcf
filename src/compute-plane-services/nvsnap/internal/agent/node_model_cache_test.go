@@ -76,9 +76,10 @@ func initDone(pod *corev1.Pod, code int32) *corev1.Pod {
 func keyOf(pod *corev1.Pod) string { return pod.Labels[webhook.ModelCacheKeyLabel] }
 
 type mcNode struct {
-	c    *nodeModelCache
-	kube *fake.Clientset
-	srv  *httptest.Server
+	c      *nodeModelCache
+	kube   *fake.Clientset
+	srv    *httptest.Server
+	router *mux.Router
 }
 
 // newMCNode is one node's cache controller, with its peer routes served.
@@ -98,7 +99,7 @@ func newMCNode(t *testing.T, kube *fake.Clientset, node string, urls map[string]
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	urls[node] = srv.URL
-	return &mcNode{c: c, kube: kube, srv: srv}
+	return &mcNode{c: c, kube: kube, srv: srv, router: r}
 }
 
 // downloaded writes what the pod's init downloaded into its emptyDir.

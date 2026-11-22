@@ -181,6 +181,10 @@ agent:
     wait: 600
     # Most time one fetch from one peer may take.
     fetchTimeout: 30m
+    # One pod per model downloads from the registry; the other pods stream
+    # its download from its node as the files land, instead of each
+    # downloading (docs/design/model-cache-single-flight.md).
+    singleFlight: false
   modelVolume:
     enabled: false
     # How long a reader waits for the writer's download before it downloads

@@ -163,6 +163,9 @@ spec:
             - --node-model-cache-max-percent={{ .Values.agent.nodeModelCache.maxPercent | default 30 }}
             - --node-model-cache-wait={{ .Values.agent.nodeModelCache.wait | default 600 }}
             - --node-model-cache-fetch-timeout={{ .Values.agent.nodeModelCache.fetchTimeout | default "30m" }}
+            {{- if .Values.agent.nodeModelCache.singleFlight }}
+            - --node-model-cache-single-flight
+            {{- end }}
             {{- end }}
             {{- if and .Values.agent.election .Values.agent.election.enabled }}
             # one-downloader election (values: agent.election)

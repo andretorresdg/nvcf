@@ -261,3 +261,18 @@ a copy on the node.
      download with the same inputs has the same key, and the first cold start after that keeps a copy of it again.
 - **Turn it off.** Set `agent.nodeModelCache.enabled=false` and upgrade. New pods are admitted unwrapped. The files
   under `root` stay until removed by hand.
+
+**Single flight** (`agent.nodeModelCache.singleFlight`, [model-cache-single-flight.md](../design/model-cache-single-flight.md)):
+one pod per model downloads, and the others stream its download.
+
+- **Who downloads?** `kubectl -n nvsnap-system get lease -l app.kubernetes.io/component=model-cache`: one Lease
+  `nvsnap-model-dl-<key>` per model being downloaded. Its holder is `<node>/<pod uid>`. Its `nvsnap.io/feeds`
+  annotation says which pod streams from which.
+- **What was a pod told?** On its node, `<root>/<key>/.plan-<pod uid>` holds `download` or `wait`. The init logs
+  `this pod downloads; other nodes copy from it` or `another node downloads this model; the agent copies it here`,
+  then `copied from another node in ...`. The agent logs `single flight:` lines with the key.
+- **A pod waits too long.** It waits while the agent's `<root>/<key>/.streaming` heartbeat is fresh. The agent
+  stops it after 5 minutes without progress at the source, and the pod then downloads. Deleting the downloading
+  pod moves the download to a waiting pod within about 30 seconds.
+- **Turn it off.** Set `agent.nodeModelCache.singleFlight=false` and upgrade. New pods are admitted without plans,
+  and each downloads or seeds as without single flight. Leases left by a running download expire on their own.

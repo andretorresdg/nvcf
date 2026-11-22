@@ -213,6 +213,25 @@ func (s *liveSource) finalize(fp string) error {
 	return nil
 }
 
+// setDone serves the volume as done with manifest m: a relay whose stream
+// ended, its volume checked against m.
+func (s *liveSource) setDone(m modelcache.Manifest) {
+	ents, err := modelcache.ScanLive(s.root, modelCacheMaxEntries)
+	if err != nil {
+		s.fail()
+		return
+	}
+	at := map[string]modelcache.LiveEntry{}
+	for _, e := range ents {
+		if e.Type == modelcache.TypeFile {
+			at[e.Path] = e
+		}
+	}
+	s.mu.Lock()
+	s.final, s.finalAt, s.state = &m, at, liveDone
+	s.mu.Unlock()
+}
+
 func (s *liveSource) fail() {
 	s.mu.Lock()
 	if s.state == liveDownloading {
@@ -262,8 +281,9 @@ type streamer struct {
 	dst    string
 	timing streamTiming
 
-	have  map[string]copied   // file in dst -> what it was copied from
-	first map[string]observed // file at the source -> its stat, since when
+	have  map[string]copied    // file in dst -> what it was copied from
+	first map[string]observed  // file at the source -> its stat, since when
+	final *modelcache.Manifest // once done: the tree dst holds
 }
 
 type copied struct {
@@ -302,7 +322,11 @@ func (s *streamer) run(ctx context.Context) error {
 		return err
 	}
 	defer root.Close()
-	s.have, s.first = map[string]copied{}, map[string]observed{}
+	// Kept across runs: a stream that moves to another source keeps its
+	// copies, and the final manifest decides which stay.
+	if s.have == nil {
+		s.have, s.first = map[string]copied{}, map[string]observed{}
+	}
 	progress, lastSig := time.Now(), ""
 	for {
 		v, err := s.client.View(ctx)
@@ -313,7 +337,12 @@ func (s *streamer) run(ctx context.Context) error {
 		case v.State == liveFailed:
 			return errSourceFailed
 		case v.State == liveDone && v.Final != nil:
-			return s.finish(ctx, root, *v.Final)
+			if err := s.finish(ctx, root, *v.Final); err != nil {
+				return err
+			}
+			m := *v.Final
+			s.final = &m
+			return nil
 		default:
 			if sig := progressSig(v.Entries); sig != lastSig {
 				progress, lastSig = time.Now(), sig

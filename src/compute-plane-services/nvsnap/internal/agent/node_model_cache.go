@@ -76,6 +76,9 @@ type NodeModelCacheConfig struct {
 	Wait int
 	// FetchTimeout bounds one fetch from one peer, all files included.
 	FetchTimeout time.Duration
+	// SingleFlight: one pod per key downloads, and the others stream its
+	// download (docs/design/model-cache-single-flight.md).
+	SingleFlight bool
 }
 
 // nodeModelCache is the agent's cache controller.
@@ -101,6 +104,14 @@ type nodeModelCache struct {
 	counted   map[types.UID]bool   // pods whose init outcome was counted
 	reserved  int64                // bytes promised to attempts in flight
 	inUse     map[string]bool      // keys a pending or running pod on the node uses
+
+	// Single flight (model_cache_flight.go).
+	singleFlight  bool
+	timing        streamTiming
+	leaseDuration time.Duration
+	flights       map[types.UID]*flight
+	liveSources   map[string]*liveSource // key -> the volume this node serves for it
+	leaseSeen     map[string]leaseObs
 }
 
 func newNodeModelCache(cfg NodeModelCacheConfig, kube kubernetes.Interface, node, ns string, tenants webhook.TenantScoper, main int, peerURL func(context.Context, string) (string, error), log logrus.FieldLogger) *nodeModelCache {
@@ -117,6 +128,8 @@ func newNodeModelCache(cfg NodeModelCacheConfig, kube kubernetes.Interface, node
 		podsRoot: cachedirPodsRoot, tenants: tenants, main: main, peerURL: peerURL,
 		client: peerHTTPClient, maxPercent: pct, fetchTimeout: to, log: log, statfs: statfsBytes,
 		busy: map[string]int{}, failed: map[string]time.Time{}, harvested: map[types.UID]bool{}, counted: map[types.UID]bool{}, inUse: map[string]bool{},
+		singleFlight: cfg.SingleFlight, timing: defaultStreamTiming, leaseDuration: 30 * time.Second,
+		flights: map[types.UID]*flight{}, liveSources: map[string]*liveSource{}, leaseSeen: map[string]leaseObs{},
 	}
 }
 
@@ -189,6 +202,7 @@ func (c *nodeModelCache) tick(ctx context.Context) {
 	}
 	inUse := map[string]bool{}
 	seen := map[types.UID]bool{}
+	live := map[types.UID]bool{}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Spec.NodeName != c.node {
@@ -198,6 +212,7 @@ func (c *nodeModelCache) tick(ctx context.Context) {
 		if pod.Status.Phase != corev1.PodPending && pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
+		live[pod.UID] = true
 		d, ok := webhook.ResolveModelCacheDownload(ctx, c.tenants, pod, c.main)
 		if !ok || !d.Wrapped {
 			continue
@@ -228,6 +243,7 @@ func (c *nodeModelCache) tick(ctx context.Context) {
 			c.store.Touch(k)
 		}
 	}
+	c.endFlights(ctx, live)
 	c.evict(ctx, 0)
 }
 
@@ -245,6 +261,9 @@ func (c *nodeModelCache) handlePod(ctx context.Context, pod *corev1.Pod, d webho
 	}
 	switch {
 	case st == nil || st.State.Terminated == nil:
+		if c.singleFlight && planned(pod, d) && c.flightPod(ctx, pod, d, st, have) {
+			return
+		}
 		// The init is yet to run, or running: bring the key here from a
 		// peer, while it waits.
 		if !have {
@@ -302,7 +321,13 @@ func (c *nodeModelCache) countInit(uid types.UID, t *corev1.ContainerStateTermin
 // heartbeat keeps the key's fetch heartbeat fresh until stop is closed,
 // then removes it.
 func (c *nodeModelCache) heartbeat(key string) (stop func()) {
-	p := filepath.Join(c.store.KeyDir(key), modelcache.IncomingFile)
+	return c.heartbeatFile(key, modelcache.IncomingFile)
+}
+
+// heartbeatFile keeps the key's file name fresh until stop is called,
+// then removes it.
+func (c *nodeModelCache) heartbeatFile(key, name string) (stop func()) {
+	p := filepath.Join(c.store.KeyDir(key), name)
 	_ = os.MkdirAll(c.store.KeyDir(key), 0o755)
 	_ = os.WriteFile(p, nil, 0o644)
 	done := make(chan struct{})
@@ -672,7 +697,8 @@ func (c *nodeModelCache) evict(ctx context.Context, want int64) {
 		var victim string
 		var oldest time.Time
 		for _, k := range c.store.Keys() {
-			if c.inUse[k] || c.busy[k] > 0 {
+			// A key with plans is mounted by a waiting init.
+			if c.inUse[k] || c.busy[k] > 0 || len(modelcache.Plans(c.store.KeyDir(k))) > 0 {
 				continue
 			}
 			if t := c.store.LastUsed(k); victim == "" || t.Before(oldest) {
@@ -756,6 +782,10 @@ func (c *nodeModelCache) fileHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", fi.ModTime(), f)
 }
 
+// singleFlightPlanWait is how long a wrapped init waits for its plan: a
+// few agent ticks.
+const singleFlightPlanWait = 60
+
 // agentTenants scopes keys by the agent's tenant resolver.
 type agentTenants struct{ a *Agent }
 
@@ -773,7 +803,14 @@ func (a *Agent) webhookNodeModelCache() *webhook.NodeModelCache {
 	if !a.nodeModelCacheOn() {
 		return nil
 	}
-	return &webhook.NodeModelCache{Root: a.config.NodeModelCache.Root, Wait: a.config.NodeModelCache.Wait, Tenants: agentTenants{a}}
+	c := &webhook.NodeModelCache{Root: a.config.NodeModelCache.Root, Wait: a.config.NodeModelCache.Wait, Tenants: agentTenants{a}}
+	// The helper must be the one that reads plans: admission mounts it
+	// from its own bundle version, which a webhook without a bundle id
+	// does not name.
+	if a.config.NodeModelCache.SingleFlight && a.currentBundle() != "" {
+		c.PlanWait = singleFlightPlanWait
+	}
+	return c
 }
 
 // startNodeModelCache wires the cache into the agent: its controller and
@@ -808,6 +845,9 @@ func (a *Agent) startNodeModelCache(ctx context.Context, router *mux.Router) {
 	c := newNodeModelCache(cfg, kube, a.config.NodeName, a.modelCacheNamespace(), agentTenants{a}, 0, a.peerAgentURL, log)
 	router.HandleFunc("/v1/model-cache/{key}", c.manifestHandler).Methods("GET")
 	router.HandleFunc("/v1/model-cache/{key}/{gen}/file", c.fileHandler).Methods("GET")
+	if cfg.SingleFlight {
+		c.addLiveRoutes(router)
+	}
 	go c.run(ctx)
 	log.WithField("root", cfg.Root).Info("model cache: on")
 }

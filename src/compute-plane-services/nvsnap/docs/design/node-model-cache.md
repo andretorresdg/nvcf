@@ -41,8 +41,8 @@ do not change, and any problem with the cache falls back to the pod's own downlo
 | A copy on another node | The agent fetches it while the init waits (at most `agent.nodeModelCache.wait`), then as above |
 | No copy anywhere, a corrupt copy, a failed fetch, no room | The pod's own download, unchanged; the agent then keeps a copy |
 
-The first instance's pods still each download, as without the cache. Deduplicating that first download across the
-cluster would need an elected writer and a wait on it; it is not built (section 8).
+Without single flight, the first instance's pods still each download. With it (`agent.nodeModelCache.singleFlight`,
+[model-cache-single-flight.md](model-cache-single-flight.md)), one pod downloads and the others stream its download.
 
 ## 3. Why restores do not change
 
@@ -177,6 +177,7 @@ budget`).
 
 ## 8. Not built
 
-- **Cross-node deduplication of the first download.** The first instance's pods each download.
+- **Cross-node deduplication of the first download** is single flight, a separate design and switch
+  ([model-cache-single-flight.md](model-cache-single-flight.md)).
 - **RDMA transfer.** The fetch uses the agent HTTP API, one stream per file.
 - **Checksums on checkpoint fetches.** Those still check size only; this cache checks sha256 on every copy.

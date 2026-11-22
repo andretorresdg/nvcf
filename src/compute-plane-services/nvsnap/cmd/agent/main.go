@@ -207,6 +207,8 @@ func main() {
 		"Most seconds a download init waits for a peer fetch in progress before downloading itself")
 	flag.DurationVar(&config.NodeModelCache.FetchTimeout, "node-model-cache-fetch-timeout", 30*time.Minute,
 		"Most time one fetch of a model from one peer may take")
+	flag.BoolVar(&config.NodeModelCache.SingleFlight, "node-model-cache-single-flight", false,
+		"One pod per model downloads; the others stream its download from its node (docs/design/model-cache-single-flight.md)")
 	flag.StringVar(&config.ModelVolume.TenantLabel, "model-volume-tenant-label", "",
 		"Namespace label naming the tenant a namespace belongs to; model volumes are shared only between namespaces of one tenant (empty = --tenant-label)")
 	flag.BoolVar(&config.ModelVolume.RefreshDisabled, "cache-set-refresh-disabled", false,
