@@ -36,10 +36,12 @@ IBV_INC = os.environ.get("IBV_INC", "/usr/include")
 CUDA_INC = os.environ.get("CUDA_INC", "/usr/local/cuda/include")
 
 FAKE = r"""
+#include <errno.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Two devices that number their keys and queue pairs alike, as NICs do. */
@@ -54,7 +56,7 @@ struct fwc { struct ibv_wc w; };
 struct fcq { struct ibv_cq c; struct ibv_wc q[256]; int n; int live; };
 struct frecv { uint64_t wr_id; struct ibv_sge sg; };
 struct fqp { struct ibv_qp q; uint32_t dest; union ibv_gid dgid; uint16_t dlid; int global;
-             struct frecv r[64]; int nr; int live; };
+             struct frecv r[64]; int nr; int live; int unacked; };
 static struct fmr *mrs[256]; static int n_mrs;
 static struct fqp *qps[256]; static int n_qps;
 
@@ -66,7 +68,24 @@ static void gid_of(int e, int d, union ibv_gid *g)
 }
 
 int fake_open_contexts(void) { return open_ctxs; }
-void fake_move(void) { epoch++; counter[0] = counter[1] = 0; }
+/* After a move the two NICs number apart: a number looked up under the
+ * wrong device is one the right device rejects. */
+void fake_move(void) { epoch++; counter[0] = 0; counter[1] = 50; }
+
+/* Knobs for the white-box cases (test_ibv.py PROBE). */
+static int port_delay_ms, fail_marker, fail_init, err_opcode, async_calls, live_pds;
+static uint32_t next_lkey;
+static struct fqp *event_qp;
+void fake_port_delay_ms(int ms) { port_delay_ms = ms; }
+void fake_fail_marker(int nth) { fail_marker = nth; }   /* the nth fence write's post fails */
+void fake_fail_init(int n) { fail_init = n; }           /* the next n moves to INIT fail */
+void fake_err_opcode(int on) { err_opcode = on; }       /* failed completions carry a receive's opcode */
+void fake_next_lkey(uint32_t k) { next_lkey = k; }
+void fake_raise_qp_event(struct ibv_qp *q) { event_qp = (struct fqp *)q; }
+int fake_async_calls(void) { return async_calls; }
+int fake_live_pds(void) { return live_pds; }
+int fake_qp_state(struct ibv_qp *q) { return q->state; }
+int fake_qp_receives(struct ibv_qp *q) { return ((struct fqp *)q)->nr; }
 
 static void push(struct fcq *c, struct ibv_wc w) { if (c->n < 256) c->q[c->n++] = w; }
 
@@ -95,6 +114,7 @@ static int post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_
     union ibv_gid me;
     gid_of(epoch, di(qp->context), &me);
     for (; wr; wr = wr->next) {
+        if (wr->wr_id == 0x6e76736e61706962ULL && fail_marker && !--fail_marker) { *bad = wr; return ENOMEM; }
         int status = IBV_WC_SUCCESS;
         struct fqp *d = NULL;
         for (int i = 0; i < n_qps; i++)
@@ -126,7 +146,8 @@ static int post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_
             }
         }
         if (status || (wr->send_flags & IBV_SEND_SIGNALED)) {
-            struct ibv_wc w = { .wr_id = wr->wr_id, .status = status, .opcode = IBV_WC_RDMA_WRITE, .qp_num = s->q.qp_num };
+            struct ibv_wc w = { .wr_id = wr->wr_id, .status = status, .qp_num = s->q.qp_num,
+                                .opcode = status && err_opcode ? IBV_WC_RECV : IBV_WC_RDMA_WRITE };
             push((struct fcq *)s->q.send_cq, w);
         }
         if (status) { *bad = wr; s->q.state = IBV_QPS_ERR; return 0; }
@@ -160,12 +181,25 @@ struct ibv_context *ibv_open_device(struct ibv_device *d)
     return c;
 }
 int ibv_close_device(struct ibv_context *c) { close(c->cmd_fd); close(c->async_fd); free(c); open_ctxs--; return 0; }
-int ibv_get_async_event(struct ibv_context *c, struct ibv_async_event *e) { (void)c; (void)e; return -1; }
-void ibv_ack_async_event(struct ibv_async_event *e) { (void)e; }
+int ibv_get_async_event(struct ibv_context *c, struct ibv_async_event *e)
+{
+    async_calls++;
+    if (!event_qp || event_qp->q.context != c) { errno = EAGAIN; return -1; }
+    e->event_type = IBV_EVENT_QP_FATAL;
+    e->element.qp = &event_qp->q;
+    __atomic_add_fetch(&event_qp->unacked, 1, __ATOMIC_SEQ_CST);
+    event_qp = NULL;
+    return 0;
+}
+void ibv_ack_async_event(struct ibv_async_event *e)
+{
+    if (e->event_type == IBV_EVENT_QP_FATAL) __atomic_sub_fetch(&((struct fqp *)e->element.qp)->unacked, 1, __ATOMIC_SEQ_CST);
+}
 int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) { (void)c; memset(a, 0, sizeof(*a)); return 0; }
 int (ibv_query_port)(struct ibv_context *c, uint8_t p, struct _compat_ibv_port_attr *a)
 {
     (void)c; (void)p;
+    if (port_delay_ms) usleep(port_delay_ms * 1000);
     struct ibv_port_attr *x = (struct ibv_port_attr *)a;
     memset(x, 0, sizeof(*x));
     x->state = IBV_PORT_ACTIVE; x->lid = 1 + epoch; x->link_layer = IBV_LINK_LAYER_ETHERNET;
@@ -181,8 +215,8 @@ int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g)
 int ibv_query_pkey(struct ibv_context *c, uint8_t p, int i, __be16 *k) { (void)c; (void)p; (void)i; *k = 0xffff; return 0; }
 int ibv_query_qp(struct ibv_qp *q, struct ibv_qp_attr *a, int m, struct ibv_qp_init_attr *ia)
 { (void)q; (void)a; (void)m; (void)ia; return 0; }
-struct ibv_pd *ibv_alloc_pd(struct ibv_context *c) { struct ibv_pd *p = calloc(1, sizeof(*p)); p->context = c; return p; }
-int ibv_dealloc_pd(struct ibv_pd *p) { free(p); return 0; }
+struct ibv_pd *ibv_alloc_pd(struct ibv_context *c) { struct ibv_pd *p = calloc(1, sizeof(*p)); p->context = c; live_pds++; return p; }
+int ibv_dealloc_pd(struct ibv_pd *p) { free(p); live_pds--; return 0; }
 struct ibv_mr *(ibv_reg_mr)(struct ibv_pd *pd, void *addr, size_t len, int access)
 {
     (void)access;
@@ -190,6 +224,7 @@ struct ibv_mr *(ibv_reg_mr)(struct ibv_pd *pd, void *addr, size_t len, int acces
     m->m.pd = pd; m->m.context = pd->context; m->m.addr = addr; m->m.length = len;
     int d = di(pd->context);
     m->m.lkey = 5000 + 1000 * epoch + counter[d]; m->m.rkey = 7000 + 1000 * epoch + counter[d]++;
+    if (next_lkey) m->m.lkey = next_lkey, next_lkey = 0;
     m->live = 1;
     mrs[n_mrs++] = m;
     return &m->m;
@@ -215,12 +250,25 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *a)
 int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask)
 {
     struct fqp *q = (struct fqp *)qp;
+    if ((mask & IBV_QP_STATE) && a->qp_state == IBV_QPS_INIT && fail_init) { fail_init--; return EINVAL; }
+    /* The state machine's order: RTR only from INIT, RTS only from RTR. */
+    if ((mask & IBV_QP_STATE) && ((a->qp_state == IBV_QPS_RTR && q->q.state != IBV_QPS_INIT) ||
+                                  (a->qp_state == IBV_QPS_RTS && q->q.state != IBV_QPS_RTR)))
+        return EINVAL;
     if (mask & IBV_QP_DEST_QPN) q->dest = a->dest_qp_num;
     if (mask & IBV_QP_AV) q->dgid = a->ah_attr.grh.dgid, q->dlid = a->ah_attr.dlid, q->global = a->ah_attr.is_global;
     if (mask & IBV_QP_STATE) q->q.state = a->qp_state;
     return 0;
 }
-int ibv_destroy_qp(struct ibv_qp *q) { ((struct fqp *)q)->live = 0; return 0; }
+/* As rdma-core: waits until every event of the queue pair is acknowledged. */
+int ibv_destroy_qp(struct ibv_qp *q)
+{
+    struct fqp *f = (struct fqp *)q;
+    for (int i = 0; i < 3000 && __atomic_load_n(&f->unacked, __ATOMIC_SEQ_CST); i++) usleep(1000);
+    if (__atomic_load_n(&f->unacked, __ATOMIC_SEQ_CST)) return EBUSY;
+    f->live = 0;
+    return 0;
+}
 int ibv_fork_init(void) { return 0; }
 const char *ibv_event_type_str(enum ibv_event_type e) { (void)e; return "event"; }
 """
@@ -235,7 +283,7 @@ IBVERBS_1.1 {
     ibv_create_qp; ibv_modify_qp; ibv_destroy_qp; ibv_fork_init; ibv_event_type_str;
   local: *;
 };
-FAKE_1 { global: fake_open_contexts; fake_move; };
+FAKE_1 { global: fake_*; };
 """
 
 # Uses verbs as NCCL does: dlopen the library NCCL_IBVERBS_LIB names,
@@ -373,6 +421,375 @@ int main(int argc, char **argv)
 }
 """
 
+# White-box cases: the library's source compiled in, over the same fake
+# verbs; each prints key=value words (see the test_ methods below).
+PROBE = r"""
+#define _GNU_SOURCE
+#include <poll.h>
+#include <pthread.h>
+#include <sys/resource.h>
+/* asyncgen: the first poll of an async event wait runs a whole suspend,
+ * restore and resume before it returns that the old descriptor is ready. */
+static int probe_poll(struct pollfd *p, nfds_t n, int t);
+#define poll(p, n, t) probe_poll(p, n, t)
+#include "nvsnap_ibv.c"
+#undef poll
+
+#define FK(ret, name, ...) static ret (*name)(__VA_ARGS__)
+FK(void, fake_move, void); FK(void, fake_port_delay_ms, int); FK(void, fake_fail_marker, int);
+FK(void, fake_fail_init, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
+FK(void, fake_raise_qp_event, struct ibv_qp *); FK(int, fake_async_calls, void); FK(int, fake_live_pds, void);
+FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *);
+static void fakes(void)
+{
+#define G(name) *(void **)&name = dlsym(real_lib, #name); if (!name) { printf("no %s\n", #name); exit(2); }
+    G(fake_move); G(fake_port_delay_ms); G(fake_fail_marker); G(fake_fail_init); G(fake_err_opcode);
+    G(fake_next_lkey); G(fake_raise_qp_event); G(fake_async_calls); G(fake_live_pds); G(fake_qp_state);
+    G(fake_qp_receives);
+#undef G
+}
+
+static char rep[256];
+static struct ibv_context *ctx;
+static struct ibv_pd *pd;
+static struct ibv_cq *cq;
+static struct ibv_qp *qa, *qb;
+static struct ibv_mr *mr;
+static char buf[64];
+
+static void up(int qps)
+{
+    int nd;
+    struct ibv_device **l = ibv_get_device_list(&nd);
+    ctx = ibv_open_device(l[0]);
+    fakes();
+    if (!qps) return;
+    pd = ibv_alloc_pd(ctx);
+    mr = ibv_reg_mr(pd, buf, sizeof(buf), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    cq = ibv_create_cq(ctx, 64, NULL, NULL, 0);
+    struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                   .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+    qa = ibv_create_qp(pd, &ia), qb = ibv_create_qp(pd, &ia);
+    union ibv_gid gid;
+    ibv_query_gid(ctx, 1, 3, &gid);
+    struct ibv_port_attr pa;
+    (ibv_query_port)(ctx, 1, (struct _compat_ibv_port_attr *)&pa);
+    struct ibv_qp *pair[2][2] = { { qa, qb }, { qb, qa } };
+    for (int i = 0; i < 2; i++) {
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(pair[i][0], &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = pair[i][1]->qp_num,
+                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
+        ibv_modify_qp(pair[i][0], &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+        ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
+    }
+}
+
+/* fabmap / remap: this process's own lines, as the tool merges them */
+static int reconnect(void)
+{
+    char path[] = "/tmp/ibvmapXXXXXX";
+    FILE *f = fdopen(mkstemp(path), "w");
+    nvsnap_ibv_map(f);
+    fclose(f);
+    int r = nvsnap_ibv_connect(path, rep, sizeof(rep));
+    unlink(path);
+    if (r) printf("connect: %s\n", rep);
+    return r;
+}
+
+/* suspend, "move to another node", restore, exchange, reconnect, resume */
+static int cycle(void)
+{
+    if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), -1;
+    fake_move();
+    if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), -1;
+    if (reconnect()) return -1;
+    nvsnap_ibv_open();
+    return 0;
+}
+
+static int poll_calls, repolled;
+static int probe_poll(struct pollfd *p, nfds_t n, int t)
+{
+    if (!getenv("ASYNCGEN")) return poll(p, n, t);
+    if (poll_calls++) { repolled = 1; errno = EBADF; return -1; }
+    int r = cycle();
+    p[0].revents = POLLIN, p[1].revents = 0;
+    return r ? -1 : 1;
+}
+
+static void *query_port(void *a)
+{
+    struct ibv_port_attr pa;
+    (void)a;
+    (ibv_query_port)(ctx, 1, (struct _compat_ibv_port_attr *)&pa);
+    return NULL;
+}
+static void *alloc_pd(void *a) { (void)a; return ibv_alloc_pd(ctx); }
+static int sus_rc;
+static void *suspend_t(void *a) { (void)a; sus_rc = nvsnap_ibv_suspend(rep, sizeof(rep)); return NULL; }
+static struct ibv_async_event ev;
+static int got_event;
+static void *event_t(void *a)
+{
+    if (ibv_get_async_event(ctx, &ev)) return NULL;
+    __atomic_store_n(&got_event, 1, __ATOMIC_SEQ_CST);
+    if (!a) return NULL;
+    usleep(300000);
+    ibv_ack_async_event(&ev);
+    return NULL;
+}
+static int sent;
+static void *send_t(void *a)
+{
+    (void)a;
+    struct ibv_sge sg = { (uintptr_t)buf, 4, mr->lkey };
+    struct ibv_send_wr w = { .wr_id = 11, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                             .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)buf + 32, mr->rkey } } }, *b;
+    qa->context->ops.post_send(qa, &w, &b);
+    __atomic_store_n(&sent, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+
+/* maprace: a reader looks up a key that is always there while the table grows. */
+static struct u32map *cur;
+static int stop_reader;
+static long misses, reads;
+static void *reader(void *a)
+{
+    (void)a;
+    while (!__atomic_load_n(&stop_reader, __ATOMIC_SEQ_CST)) {
+        struct u32map *m = __atomic_load_n(&cur, __ATOMIC_SEQ_CST);
+        uint32_t v;
+        if (m) { reads++; if (map_get(m, 1, &v) || v != 1) misses++; }
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    const char *c = argc > 1 ? argv[1] : "";
+    pthread_t t, t2;
+    if (!strcmp(c, "maprace")) {
+        pthread_create(&t, NULL, reader, NULL);
+        for (int it = 0; it < 4000; it++) {
+            struct u32map *m = calloc(1, sizeof(*m));
+            map_put(m, 1, 1);
+            __atomic_store_n(&cur, m, __ATOMIC_SEQ_CST);
+            for (uint32_t k = 2; k < 2000; k++) map_put(m, k, k);
+        }
+        __atomic_store_n(&stop_reader, 1, __ATOMIC_SEQ_CST);
+        pthread_join(t, NULL);
+        printf("misses=%ld reads_ok=%d\n", misses, reads > 0);
+        return 0;
+    }
+    if (!strcmp(c, "portdrain")) {
+        /* A port query in the provider when the suspend starts. */
+        up(0);
+        fake_port_delay_ms(300);
+        pthread_create(&t, NULL, query_port, NULL);
+        usleep(50000);
+        double t0 = now();
+        int r = nvsnap_ibv_fence(rep, sizeof(rep));
+        printf("fence=%d took_ms=%d\n", r, (int)((now() - t0) * 1000));
+        nvsnap_ibv_open();
+        pthread_join(t, NULL);
+        return 0;
+    }
+    if (!strcmp(c, "pdgate")) {
+        /* A protection domain created while its registration waits. */
+        up(0);
+        pthread_mutex_lock(&omu);
+        pthread_create(&t, NULL, alloc_pd, NULL);
+        usleep(200000);
+        printf("inflight_while_registering=%d\n", __atomic_load_n(&inflight, __ATOMIC_SEQ_CST));
+        pthread_create(&t2, NULL, suspend_t, NULL);
+        usleep(100000);
+        pthread_mutex_unlock(&omu);
+        pthread_join(t, NULL);
+        pthread_join(t2, NULL);
+        printf("suspend=%d live_pds=%d\n", sus_rc, fake_live_pds());
+        return 0;
+    }
+    if (!strcmp(c, "markers")) {
+        /* The second fence write cannot be posted: the first one's
+         * completion must not reach NCCL. */
+        up(1);
+        fake_fail_marker(2);
+        int r = nvsnap_ibv_fence(rep, sizeof(rep));
+        struct ibv_wc wc[16];
+        int k = 0, n = cq->context->ops.poll_cq(cq, 16, wc);
+        for (int i = 0; i < n; i++) k += wc[i].wr_id == MARKER;
+        int again = nvsnap_ibv_fence(rep, sizeof(rep));
+        nvsnap_ibv_open();
+        n = cq->context->ops.poll_cq(cq, 16, wc);
+        for (int i = 0; i < n; i++) k += wc[i].wr_id == MARKER;
+        printf("fence=%d fence_again=%d markers_to_nccl=%d\n", r, again, k);
+        return 0;
+    }
+    if (!strcmp(c, "failedwc")) {
+        /* A send fails; its completion's opcode is a receive's, and its
+         * wr_id that of a receive still outstanding on the queue pair. */
+        up(1);
+        fake_err_opcode(1);
+        struct ibv_recv_wr rw = { .wr_id = 7 }, *rb;
+        qa->context->ops.post_recv(qa, &rw, &rb);
+        struct ibv_sge sg = { (uintptr_t)buf, 4, mr->lkey };
+        struct ibv_send_wr w = { .wr_id = 7, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { 1, 12345 } } }, *b;
+        qa->context->ops.post_send(qa, &w, &b);
+        struct ibv_wc wc[4];
+        int n = cq->context->ops.poll_cq(cq, 4, wc);
+        int fr = nvsnap_ibv_fence(rep, sizeof(rep));
+        printf("polled=%d status_failed=%d receives_kept=%d fence=%d\n", n, n == 1 && wc[0].status != 0,
+               ((struct vqp *)qa)->n_recvs, fr);
+        return 0;
+    }
+    if (!strcmp(c, "events") || !strcmp(c, "events_noack")) {
+        /* NCCL holds an event of a queue pair when the suspend starts. */
+        int ack = !strcmp(c, "events");
+        up(1);
+        fake_raise_qp_event(((struct vqp *)qa)->real);
+        pthread_create(&t, NULL, event_t, ack ? (void *)1 : NULL);
+        for (int i = 0; i < 2000 && !__atomic_load_n(&got_event, __ATOMIC_SEQ_CST); i++) usleep(1000);
+        double t0 = now();
+        int r = nvsnap_ibv_suspend(rep, sizeof(rep));
+        printf("event_shadow=%d suspend=%d took_ms=%d qps_destroyed=%d\n", ev.element.qp == qa, r,
+               (int)((now() - t0) * 1000), ((struct vqp *)qa)->real == NULL);
+        if (!ack) printf("reason=%s\n", strstr(rep, "acknowledged") ? "unacked" : "other");
+        pthread_join(t, NULL);
+        return 0;
+    }
+    if (!strcmp(c, "asyncgen")) {
+        /* The wait outlives a suspend, restore and resume between its poll
+         * and its read. */
+        up(0);
+        struct ibv_async_event e;
+        int r = ibv_get_async_event(ctx, &e);
+        printf("get=%d provider_reads=%d repolled=%d\n", r, fake_async_calls(), repolled);
+        return 0;
+    }
+    if (!strcmp(c, "newkey")) {
+        /* After a restore, a new registration's real lkey is the visible
+         * lkey of an older one. */
+        up(1);
+        uint32_t old_visible = mr->lkey;
+        if (cycle()) return 1;
+        fake_next_lkey(old_visible);
+        static char b2[64];
+        struct ibv_mr *m2 = ibv_reg_mr(pd, b2, sizeof(b2), IBV_ACCESS_LOCAL_WRITE);
+        struct vmr *v1 = (struct vmr *)mr, *v2 = (struct vmr *)m2;
+        struct vctx *vc = (struct vctx *)ctx;
+        printf("real_collides=%d old_ok=%d new_ok=%d distinct=%d\n", v2->real->lkey == old_visible,
+               lkey_of(vc, mr->lkey) == v1->real->lkey, lkey_of(vc, m2->lkey) == v2->real->lkey, m2->lkey != mr->lkey);
+        return 0;
+    }
+    if (!strcmp(c, "retry")) {
+        /* The first restore fails moving a queue pair to INIT; the retry
+         * must set it up again. */
+        up(1);
+        struct ibv_recv_wr rw = { .wr_id = 5 }, *rb;
+        qa->context->ops.post_recv(qa, &rw, &rb);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        fake_fail_init(1);  /* the first queue pair's */
+        int r1 = nvsnap_ibv_restore(rep, sizeof(rep));
+        int r2 = nvsnap_ibv_restore(rep, sizeof(rep));
+        struct vqp *b = (struct vqp *)qa;
+        printf("first=%d retry=%d state_init=%d receives=%d\n", r1, r2,
+               b->real && fake_qp_state(b->real) == IBV_QPS_INIT, b->real ? fake_qp_receives(b->real) : -1);
+        return 0;
+    }
+    if (!strcmp(c, "remapretry")) {
+        /* "connect" fails moving a queue pair to RTS; the retry goes on
+         * from RTR instead of asking for RTR again. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *a = (struct vqp *)qa;
+        a->attr[2].qp_state = IBV_QPS_RTR;  /* fails: RTR from RTR */
+        int r1 = reconnect();
+        a->attr[2].qp_state = IBV_QPS_RTS;
+        int r2 = reconnect();
+        printf("first=%d retry=%d state_rts=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTS);
+        return 0;
+    }
+    if (!strcmp(c, "fenceheld")) {
+        /* After the fence, a send waits for the restore instead of going
+         * out on a queue pair "release" destroys. */
+        up(1);
+        if (nvsnap_ibv_fence(rep, sizeof(rep))) return printf("fence: %s\n", rep), 1;
+        pthread_create(&t, NULL, send_t, NULL);
+        usleep(200000);
+        int early = __atomic_load_n(&sent, __ATOMIC_SEQ_CST);
+        if (cycle()) return 1;
+        pthread_join(t, NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS && wc[i].qp_num == qa->qp_num;
+        printf("sent_before_release=%d sent_after_restore=%d completed=%d\n", early, sent, ok);
+        /* A fence, then the process runs on without a release (the vote
+         * said retry). */
+        nvsnap_ibv_fence(rep, sizeof(rep));
+        sent = 0;
+        pthread_create(&t, NULL, send_t, NULL);
+        nvsnap_ibv_open();
+        pthread_join(t, NULL);
+        printf("sent_after_open=%d\n", sent);
+        /* After a release, opening does not let calls reach destroyed objects. */
+        nvsnap_ibv_suspend(rep, sizeof(rep));
+        nvsnap_ibv_open();
+        printf("held_after_release=%d\n", __atomic_load_n(&suspended, __ATOMIC_SEQ_CST));
+        return 0;
+    }
+    if (!strcmp(c, "sge5")) {
+        up(1);
+        struct ibv_sge sg[5] = { { (uintptr_t)buf, 4, mr->lkey } };
+        for (int i = 1; i < 5; i++) sg[i] = sg[0];
+        struct ibv_recv_wr rw = { .wr_id = 9, .sg_list = sg, .num_sge = 5 }, *rb;
+        qb->context->ops.post_recv(qb, &rw, &rb);
+        printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
+        return 0;
+    }
+    if (!strcmp(c, "noslot")) {
+        up(0);
+        pd = ibv_alloc_pd(ctx);
+        cq = ibv_create_cq(ctx, 64, NULL, NULL, 0);
+        n_qslots = 64 * QCHUNK;  /* every slot used */
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC };
+        qa = ibv_create_qp(pd, &ia);
+        printf("created=%d fence=%d\n", qa != NULL, nvsnap_ibv_fence(rep, sizeof(rep)));
+        return 0;
+    }
+    if (!strcmp(c, "noeventfd")) {
+        /* No descriptor left for the wake: the open fails, and leaves no
+         * device open. */
+        int nd;
+        struct ibv_device **l = ibv_get_device_list(&nd);
+        int f = dup(0);
+        close(f);
+        struct rlimit rl;
+        getrlimit(RLIMIT_NOFILE, &rl);
+        rlim_t cur_lim = rl.rlim_cur;
+        rl.rlim_cur = f;
+        setrlimit(RLIMIT_NOFILE, &rl);
+        errno = 0;
+        struct ibv_context *x = ibv_open_device(l[0]);
+        int e = errno;
+        rl.rlim_cur = cur_lim;
+        setrlimit(RLIMIT_NOFILE, &rl);
+        printf("opened=%d errno_set=%d contexts=%d\n", x != NULL, e != 0, nvsnap_ibv_count());
+        return 0;
+    }
+    return 2;
+}
+"""
+
 
 class Ibv(unittest.TestCase):
     @classmethod
@@ -386,22 +803,29 @@ class Ibv(unittest.TestCase):
             with open(os.path.join(t, name), "w") as f:
                 f.write(text)
         inc = ["-I", IBV_INC]
+        cls.fake = os.path.join(t, "libibverbs.so.1")
         subprocess.run(["gcc", "-shared", "-fPIC", *inc, "-Wl,--version-script=" + os.path.join(t, "fake.map"),
-                        "-o", os.path.join(t, "libibverbs.so.1"), os.path.join(t, "fake.c")], check=True)
+                        "-o", cls.fake, os.path.join(t, "fake.c")], check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared", "-fvisibility=hidden", *inc,
                         "-I", CUDA_INC, "-Wl,--version-script=" + os.path.join(SRC, "nvsnap_ibv.map"),
                         "-o", os.path.join(t, "libnvsnap_ibv.so"), os.path.join(SRC, "nvsnap_ibv.c"),
                         "-ldl", "-lpthread"], check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Werror", *inc, "-o", os.path.join(t, "app"), os.path.join(t, "app.c"), "-ldl"], check=True)
+        with open(os.path.join(t, "probe.c"), "w") as f:
+            f.write(PROBE)
+        subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", *inc, "-I", CUDA_INC,
+                        "-I", SRC, "-o", os.path.join(t, "probe"), os.path.join(t, "probe.c"), "-ldl", "-lpthread"],
+                       check=True)
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_restore_on_another_nic(self):
+        # The fake verbs, whatever NVSNAP_IBV_REAL_LIB the caller has.
         p = subprocess.run([os.path.join(self.tmp, "app"), os.path.join(self.tmp, "libnvsnap_ibv.so")],
                            capture_output=True, text=True, timeout=60,
-                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp))
+                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         rounds = [dict(kv.split("=", 1) for kv in l.split() if "=" in kv) for l in p.stdout.splitlines()]
         for r in (0, 1):  # two checkpoints in a row
@@ -419,6 +843,88 @@ class Ibv(unittest.TestCase):
             self.assertEqual(d, {"held": "1", "wrote": "1", "recvd": "1", "bad": "0", "data": "ok"}, p.stdout + p.stderr)
         moved = [x for x in rounds if "lines" in x]
         self.assertGreaterEqual(int(moved[0]["lines"]), 10, p.stdout)  # per device: a port, 2 keys, 2 queue pairs
+
+    def probe(self, case, **env):
+        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, **env))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
+
+    def test_lookup_sees_one_table_while_it_grows(self):
+        out = self.probe("maprace")
+        self.assertEqual(out["reads_ok"], "1", out)
+        self.assertEqual(out["misses"], "0", "a lookup missed a key while the table grew")
+
+    def test_call_in_the_provider_finishes_during_suspend(self):
+        out = self.probe("portdrain")
+        self.assertEqual(out["fence"], "0", "a port query that finished during the suspend made it fail: %s" % out)
+
+    def test_creation_counts_until_registered(self):
+        out = self.probe("pdgate")
+        self.assertEqual(out["inflight_while_registering"], "1", "a created object left the gate before its shadow")
+        self.assertEqual((out["suspend"], out["live_pds"]), ("0", "0"), out)
+
+    def test_fence_writes_never_reach_nccl(self):
+        out = self.probe("markers")
+        self.assertNotEqual(out["fence"], "0", out)
+        self.assertEqual(out["fence_again"], "0", out)
+        self.assertEqual(out["markers_to_nccl"], "0", "a fence write's completion went to NCCL")
+
+    def test_failed_completion_refuses_the_checkpoint(self):
+        out = self.probe("failedwc")
+        self.assertEqual((out["polled"], out["status_failed"]), ("1", "1"), out)
+        self.assertEqual(out["receives_kept"], "1", "a failed send's completion retired a receive")
+        self.assertNotEqual(out["fence"], "0", "a queue pair with a failed completion was checkpointed")
+
+    def test_suspend_lets_event_acknowledgements_finish(self):
+        out = self.probe("events")
+        self.assertEqual(out["event_shadow"], "1", out)
+        self.assertEqual((out["suspend"], out["qps_destroyed"]), ("0", "1"), out)
+
+    def test_suspend_refuses_unacknowledged_events(self):
+        out = self.probe("events_noack")
+        self.assertNotEqual(out["suspend"], "0", out)
+        self.assertEqual((out["qps_destroyed"], out["reason"]), ("0", "unacked"), out)
+        self.assertLess(int(out["took_ms"]), 2900, out)
+
+    def test_async_wait_that_outlived_a_restore_polls_again(self):
+        out = self.probe("asyncgen", ASYNCGEN="1")
+        self.assertEqual(out["provider_reads"], "0", "read the replaced context's events without polling it")
+        self.assertEqual(out["repolled"], "1", out)
+
+    def test_new_registration_after_restore_gets_its_own_key(self):
+        out = self.probe("newkey")
+        self.assertEqual(out["real_collides"], "1", out)
+        self.assertEqual((out["old_ok"], out["new_ok"], out["distinct"]), ("1", "1", "1"), out)
+
+    def test_retried_restore_sets_up_a_failed_queue_pair_again(self):
+        out = self.probe("retry")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertEqual((out["retry"], out["state_init"], out["receives"]), ("0", "1", "1"), out)
+
+    def test_retried_connect_goes_on_from_rtr(self):
+        out = self.probe("remapretry")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertEqual((out["retry"], out["state_rts"]), ("0", "1"), out)
+
+    def test_sends_after_the_fence_wait_for_the_restore(self):
+        out = self.probe("fenceheld")
+        self.assertEqual(out["sent_before_release"], "0", "a send went out after the fence, before release")
+        self.assertEqual((out["sent_after_restore"], out["completed"]), ("1", "1"), out)
+        self.assertEqual(out["sent_after_open"], "1", out)
+        self.assertEqual(out["held_after_release"], "1", "calls ran again with the real objects destroyed")
+
+    def test_receive_with_too_many_entries_refuses_the_checkpoint(self):
+        self.assertNotEqual(self.probe("sge5")["fence"], "0")
+
+    def test_untracked_queue_pair_refuses_the_checkpoint(self):
+        out = self.probe("noslot")
+        self.assertEqual(out["created"], "1", out)
+        self.assertNotEqual(out["fence"], "0", out)
+
+    def test_open_without_a_wake_fails(self):
+        out = self.probe("noeventfd")
+        self.assertEqual((out["opened"], out["errno_set"], out["contexts"]), ("0", "1", "0"), out)
 
 
 if __name__ == "__main__":

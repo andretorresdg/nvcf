@@ -1242,7 +1242,9 @@ static void do_poll(char *reply, size_t n, int step)
  * With NCCL_IBVERBS_LIB naming libnvsnap_ibv.so, NCCL's RDMA devices,
  * queue pairs and registrations are destroyed at "release" and created
  * again at "load", on the NICs the process has then; "quiesce" first
- * lets every send NCCL posted complete; "fabmap" adds their
+ * lets every send NCCL posted complete, and holds NCCL's verbs calls until
+ * "release" (or until the process runs again without one: ibv_unfence);
+ * "fabmap" adds their
  * new numbers to the exchange and "remap" reconnects them (see
  * nvsnap_ibv.c). */
 static struct {

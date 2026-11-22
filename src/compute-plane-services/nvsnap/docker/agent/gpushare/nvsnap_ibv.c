@@ -24,8 +24,10 @@
  * Handled: reliable-connected queue pairs, completion queues without a
  * completion channel, memory registered with ibv_reg_mr, ibv_reg_mr_iova2
  * or ibv_reg_dmabuf_mr (GPU memory through a CUDA dma-buf), RoCE and IB.
- * A shared receive queue, an address handle or another queue pair type
- * makes the suspend refuse: the workload runs on.
+ * A shared receive queue, an address handle or another queue pair type, a
+ * receive with more than RECV_SGE scatter entries, a queue pair with a
+ * failed completion, or an async event NCCL does not acknowledge makes the
+ * suspend refuse: the workload runs on.
  */
 #define _GNU_SOURCE
 #include <cuda.h>
@@ -120,13 +122,16 @@ static int real_ok(void)
 
 /* Each shadow starts with the struct NCCL sees. */
 struct vctx;
-struct u32map { uint32_t *k, *v; int cap, used; };
+/* One generation of a translation table: readers load the pointer once. */
+struct u32tab { int cap, used; uint32_t *k, *v; };
+struct u32map { struct u32tab *t; };
 struct vgid { uint8_t port; int index; union ibv_gid old, cur; int cur_index; };
 struct vport { uint8_t port; uint16_t old_lid, cur_lid; int queried; };
 struct vctx {
     struct ibv_context v;
     struct ibv_device dev;          /* a copy: NCCL reads its name */
     struct ibv_context *real;
+    unsigned gen;                   /* changes whenever real does */
     int wake;                       /* eventfd: wakes the async event wait */
     struct vgid *gids; int n_gids;
     struct vport *ports; int n_ports;
@@ -145,7 +150,8 @@ struct vcq {
     struct ibv_cq v; struct vctx *c; struct ibv_cq *real; int comp_vector;
     struct ibv_wc *held; int n_held, cap_held;  /* completions polled at suspend, for NCCL */
 };
-struct recv_rec { uint64_t wr_id; int n; struct ibv_sge sg[4]; };
+#define RECV_SGE 4  /* a receive with more makes the process uncheckpointable */
+struct recv_rec { uint64_t wr_id; int n; struct ibv_sge sg[RECV_SGE]; };
 struct vqp {
     struct ibv_qp v; struct vpd *pd; struct ibv_qp *real;
     struct ibv_qp_init_attr init;
@@ -154,9 +160,11 @@ struct vqp {
     struct recv_rec *recvs; int n_recvs, cap_recvs;  /* posted, not completed */
     pthread_mutex_t rmu;
     int remote;                                     /* index into rports after connect */
-    long marker_done;
+    int markers;     /* fence writes posted and not completed yet (omu, or the gate closed) */
+    int fence_wait;  /* the current fence waits for this one's markers */
+    int failed;      /* a completion failed: which receives finished is unknown */
     int slot;
-    int fresh;  /* re-created by a restore, not connected yet */
+    int fresh;  /* re-created by a restore: 1 needs RTR and RTS, 2 RTS */
 };
 
 #define PUSHP(arr, n, x) do { \
@@ -182,9 +190,13 @@ static void drop(void **arr, int *n, void *x)
 
 /* ── the data path gate ───────────────────────────────────────────────── */
 
-/* suspended: the real objects are gone (or going); data path calls wait.
- * translated: the real keys and queue pair numbers differ from NCCL's. */
-static int suspended, translated, inflight;
+/* suspended: the real objects are gone (or going), or a fence holds them
+ * until release; every call that uses a real object waits. Each such call
+ * stays in (inflight) until its shadow is up to date, so a suspend that
+ * has waited for inflight to reach 0 sees every object there is.
+ * translated: the real keys and queue pair numbers differ from NCCL's.
+ * released: the real objects are gone until a restore brings them back. */
+static int suspended, translated, inflight, released;
 static pthread_mutex_t gmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gcv = PTHREAD_COND_INITIALIZER;
 
@@ -205,47 +217,58 @@ static void leave(void) { __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST); }
 
 static uint32_t hash32(uint32_t x) { x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; return x ^ (x >> 16); }
 
-/* Writers hold omu; readers on the data path take no lock, so a table that
- * grows is copied and the old one kept (they are small: one entry per
- * queue pair or registration). Values are written before keys. */
-static void map_put(struct u32map *m, uint32_t k, uint32_t v)
+/* Writers hold omu; readers on the data path take no lock. A table that
+ * grows is a new generation (capacity and both arrays), published with one
+ * pointer that a reader loads once; the old one is kept, never freed (they
+ * are small: one entry per queue pair or registration), so a reader still
+ * on it finishes there. Values are written before keys. */
+static struct u32tab *tab_new(int cap)
 {
-    if (2 * (m->used + 1) > m->cap) {
-        struct u32map b = { calloc(m->cap ? m->cap * 2 : 64, 4), calloc(m->cap ? m->cap * 2 : 64, 4), m->cap ? m->cap * 2 : 64, 0 };
-        if (!b.k || !b.v) abort();
-        memset(b.k, 0xff, b.cap * 4);
-        for (int i = 0; i < m->cap; i++) if (m->k[i] != 0xffffffff) map_put(&b, m->k[i], m->v[i]);
-        __atomic_store_n(&m->v, b.v, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&m->k, b.k, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&m->cap, b.cap, __ATOMIC_SEQ_CST);
-        m->used = b.used;
-    }
+    struct u32tab *t = calloc(1, sizeof(*t));
+    if (!t || !(t->k = malloc(cap * 4)) || !(t->v = calloc(cap, 4))) abort();
+    memset(t->k, 0xff, cap * 4);
+    t->cap = cap;
+    return t;
+}
+
+static void tab_put(struct u32tab *t, uint32_t k, uint32_t v)
+{
     for (uint32_t i = hash32(k);; i++) {
-        uint32_t s = i & (m->cap - 1);
-        if (m->k[s] == 0xffffffff || m->k[s] == k) {
-            if (m->k[s] == 0xffffffff) m->used++;
-            __atomic_store_n(&m->v[s], v, __ATOMIC_SEQ_CST);
-            __atomic_store_n(&m->k[s], k, __ATOMIC_SEQ_CST);
+        uint32_t s = i & (t->cap - 1);
+        if (t->k[s] == 0xffffffff || t->k[s] == k) {
+            if (t->k[s] == 0xffffffff) t->used++;
+            __atomic_store_n(&t->v[s], v, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&t->k[s], k, __ATOMIC_SEQ_CST);
             return;
         }
     }
 }
 
+static void map_put(struct u32map *m, uint32_t k, uint32_t v)
+{
+    struct u32tab *t = m->t;
+    if (!t || 2 * (t->used + 1) > t->cap) {
+        struct u32tab *b = tab_new(t ? t->cap * 2 : 64);
+        for (int i = 0; t && i < t->cap; i++) if (t->k[i] != 0xffffffff) tab_put(b, t->k[i], t->v[i]);
+        __atomic_store_n(&m->t, b, __ATOMIC_SEQ_CST);
+        t = b;
+    }
+    tab_put(t, k, v);
+}
+
 static void map_clear(struct u32map *m)
 {
-    if (m->cap) memset(m->k, 0xff, m->cap * 4);
-    m->used = 0;
+    if (m->t) memset(m->t->k, 0xff, m->t->cap * 4), m->t->used = 0;
 }
 
 static int map_get(const struct u32map *m, uint32_t k, uint32_t *v)
 {
-    int cap = __atomic_load_n(&m->cap, __ATOMIC_SEQ_CST);
-    uint32_t *ks = __atomic_load_n(&m->k, __ATOMIC_SEQ_CST), *vs = __atomic_load_n(&m->v, __ATOMIC_SEQ_CST);
-    if (!cap || !ks || !vs) return -1;
-    for (uint32_t i = hash32(k), n = 0; n < (uint32_t)cap; i++, n++) {
-        uint32_t s = i & (cap - 1);
-        uint32_t x = __atomic_load_n(&ks[s], __ATOMIC_SEQ_CST);
-        if (x == k) { *v = vs[s]; return 0; }
+    const struct u32tab *t = __atomic_load_n(&m->t, __ATOMIC_SEQ_CST);
+    if (!t) return -1;
+    for (uint32_t i = hash32(k), n = 0; n < (uint32_t)t->cap; i++, n++) {
+        uint32_t s = i & (t->cap - 1);
+        uint32_t x = __atomic_load_n(&t->k[s], __ATOMIC_SEQ_CST);
+        if (x == k) { *v = __atomic_load_n(&t->v[s], __ATOMIC_SEQ_CST); return 0; }
         if (x == 0xffffffff) return -1;
     }
     return -1;
@@ -298,9 +321,21 @@ static int w_post_srq_recv(struct ibv_srq *s, struct ibv_recv_wr *wr, struct ibv
 EXPORT struct ibv_context *ibv_open_device(struct ibv_device *dev)
 {
     if (!real_ok()) { errno = ENOSYS; return NULL; }
+    /* Without its wake, a suspend could not stop a thread waiting for its
+     * async events before closing the real context. */
+    int wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (wake < 0) return NULL;
+    enter();
     struct ibv_context *r = R.open_device(dev);
-    if (!r) return NULL;
-    struct vctx *c = calloc(1, sizeof(*c));
+    struct vctx *c = r ? calloc(1, sizeof(*c)) : NULL;
+    if (!c) {
+        int e = errno;
+        if (r) R.close_device(r), e = ENOMEM;
+        leave();
+        close(wake);
+        errno = e;
+        return NULL;
+    }
     c->real = r;
     c->dev = *dev;
     c->v.device = &c->dev;
@@ -313,20 +348,25 @@ EXPORT struct ibv_context *ibv_open_device(struct ibv_device *dev)
     c->v.ops.post_send = w_post_send;
     c->v.ops.post_recv = w_post_recv;
     c->v.ops.post_srq_recv = w_post_srq_recv;
-    c->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    c->wake = wake;
     pthread_mutex_lock(&omu);
     PUSHP(ctxs, n_ctxs, c);
     pthread_mutex_unlock(&omu);
+    leave();
     return &c->v;
 }
 
+/* Objects are created and destroyed inside the gate, the registry update
+ * included (see suspended). */
 EXPORT int ibv_close_device(struct ibv_context *ctx)
 {
     struct vctx *c = (struct vctx *)ctx;
+    enter();
     pthread_mutex_lock(&omu);
     drop((void **)ctxs, &n_ctxs, c);
     pthread_mutex_unlock(&omu);
     int r = c->real ? R.close_device(c->real) : 0;
+    leave();
     if (c->wake >= 0) close(c->wake);
     free(c->gids); free(c->ports); free(c);
     return r;
@@ -403,37 +443,62 @@ EXPORT struct ibv_pd *ibv_alloc_pd(struct ibv_context *ctx)
     struct vctx *c = (struct vctx *)ctx;
     enter();
     struct ibv_pd *r = R.alloc_pd(c->real);
+    struct vpd *p = r ? calloc(1, sizeof(*p)) : NULL;
+    if (p) {
+        p->c = c; p->real = r; p->v.context = ctx; p->v.handle = r->handle;
+        pthread_mutex_lock(&omu);
+        PUSHP(pds, n_pds, p);
+        pthread_mutex_unlock(&omu);
+    } else if (r) {
+        R.dealloc_pd(r), errno = ENOMEM;
+    }
     leave();
-    if (!r) return NULL;
-    struct vpd *p = calloc(1, sizeof(*p));
-    p->c = c; p->real = r; p->v.context = ctx; p->v.handle = r->handle;
-    pthread_mutex_lock(&omu);
-    PUSHP(pds, n_pds, p);
-    pthread_mutex_unlock(&omu);
-    return &p->v;
+    return p ? &p->v : NULL;
 }
 
 EXPORT int ibv_dealloc_pd(struct ibv_pd *pd)
 {
     struct vpd *p = (struct vpd *)pd;
+    enter();
     pthread_mutex_lock(&omu);
     drop((void **)pds, &n_pds, p);
     pthread_mutex_unlock(&omu);
     int r = p->real ? R.dealloc_pd(p->real) : 0;
+    leave();
     free(p);
     return r;
 }
 
+static int key_used(struct u32map *m, uint32_t k)
+{
+    uint32_t v;
+    return !map_get(m, k, &v);
+}
+
+/* Called inside the gate (the caller registered r there). Once a restore
+ * has translated keys, a new registration's real lkey may be a key NCCL
+ * still uses for an older one (whose real key is now another): it then
+ * gets a visible lkey of its own. An lkey never leaves the process, so any
+ * unused value does. Every lkey has its entry from then on, so a visible
+ * key is never taken for a real one. (An rkey goes to peers as it is.) */
 static struct ibv_mr *new_mr(struct vpd *p, struct ibv_mr *r, int kind, int access, uint64_t iova,
                              uint64_t off, size_t dsize, void *addr, size_t len)
 {
     if (!r) return NULL;
     struct vmr *m = calloc(1, sizeof(*m));
+    if (!m) { R.dereg_mr(r); errno = ENOMEM; return NULL; }
     m->pd = p; m->real = r; m->kind = kind; m->access = access; m->iova = iova;
     m->dmabuf_off = off; m->dmabuf_size = dsize;
     m->v = *r;
     m->v.context = &p->c->v; m->v.pd = &p->v; m->v.addr = addr; m->v.length = len;
     pthread_mutex_lock(&omu);
+    struct u32map *lk = &p->c->lkeys;
+    if (lk->t) {
+        static uint32_t next = 0x80000000u;
+        if (key_used(lk, m->v.lkey) && __atomic_load_n(&translated, __ATOMIC_SEQ_CST))
+            do m->v.lkey = next++; while (m->v.lkey == 0xffffffff || key_used(lk, m->v.lkey));
+        map_put(lk, m->v.lkey, r->lkey);
+    }
     PUSHP(mrs, n_mrs, m);
     pthread_mutex_unlock(&omu);
     return &m->v;
@@ -442,16 +507,20 @@ static struct ibv_mr *new_mr(struct vpd *p, struct ibv_mr *r, int kind, int acce
 EXPORT struct ibv_mr *(ibv_reg_mr)(struct ibv_pd *pd, void *addr, size_t len, int access)
 {
     struct vpd *p = (struct vpd *)pd;
-    enter(); struct ibv_mr *r = R.reg_mr(p->real, addr, len, access); leave();
-    return new_mr(p, r, MR_PLAIN, access, (uintptr_t)addr, 0, 0, addr, len);
+    enter();
+    struct ibv_mr *r = new_mr(p, R.reg_mr(p->real, addr, len, access), MR_PLAIN, access, (uintptr_t)addr, 0, 0, addr, len);
+    leave();
+    return r;
 }
 
 EXPORT struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t len, uint64_t iova, unsigned access)
 {
     struct vpd *p = (struct vpd *)pd;
     if (!R.reg_mr_iova2) { errno = EOPNOTSUPP; return NULL; }
-    enter(); struct ibv_mr *r = R.reg_mr_iova2(p->real, addr, len, iova, access); leave();
-    return new_mr(p, r, MR_IOVA2, access, iova, 0, 0, addr, len);
+    enter();
+    struct ibv_mr *r = new_mr(p, R.reg_mr_iova2(p->real, addr, len, iova, access), MR_IOVA2, access, iova, 0, 0, addr, len);
+    leave();
+    return r;
 }
 
 /* GPU memory: NCCL registers [iova, iova + len) through a dma-buf of the
@@ -462,17 +531,22 @@ EXPORT struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t off, size_t 
     struct vpd *p = (struct vpd *)pd;
     if (!R.reg_dmabuf_mr) { errno = EOPNOTSUPP; return NULL; }
     off_t size = lseek(fd, 0, SEEK_END);
-    enter(); struct ibv_mr *r = R.reg_dmabuf_mr(p->real, off, len, iova, fd, access); leave();
-    return new_mr(p, r, MR_DMABUF, access, iova, off, size > 0 ? (size_t)size : off + len, (void *)(uintptr_t)iova, len);
+    enter();
+    struct ibv_mr *r = new_mr(p, R.reg_dmabuf_mr(p->real, off, len, iova, fd, access), MR_DMABUF, access, iova, off,
+                              size > 0 ? (size_t)size : off + len, (void *)(uintptr_t)iova, len);
+    leave();
+    return r;
 }
 
 EXPORT int ibv_dereg_mr(struct ibv_mr *mr)
 {
     struct vmr *m = (struct vmr *)mr;
+    enter();
     pthread_mutex_lock(&omu);
     drop((void **)mrs, &n_mrs, m);
     pthread_mutex_unlock(&omu);
     int r = m->real ? R.dereg_mr(m->real) : 0;
+    leave();
     free(m);
     return r;
 }
@@ -482,26 +556,33 @@ EXPORT struct ibv_cq *ibv_create_cq(struct ibv_context *ctx, int cqe, void *cq_c
 {
     struct vctx *c = (struct vctx *)ctx;
     if (ch) { errno = EOPNOTSUPP; return NULL; }  /* not re-creatable here: NCCL polls */
-    enter(); struct ibv_cq *r = R.create_cq(c->real, cqe, cq_context, NULL, vec); leave();
-    if (!r) return NULL;
-    struct vcq *q = calloc(1, sizeof(*q));
-    q->c = c; q->real = r; q->comp_vector = vec;
-    q->v.context = ctx; q->v.cq_context = cq_context; q->v.cqe = r->cqe; q->v.handle = r->handle;
-    pthread_mutex_init(&q->v.mutex, NULL);
-    pthread_cond_init(&q->v.cond, NULL);
-    pthread_mutex_lock(&omu);
-    PUSHP(cqs, n_cqs, q);
-    pthread_mutex_unlock(&omu);
-    return &q->v;
+    enter();
+    struct ibv_cq *r = R.create_cq(c->real, cqe, cq_context, NULL, vec);
+    struct vcq *q = r ? calloc(1, sizeof(*q)) : NULL;
+    if (q) {
+        q->c = c; q->real = r; q->comp_vector = vec;
+        q->v.context = ctx; q->v.cq_context = cq_context; q->v.cqe = r->cqe; q->v.handle = r->handle;
+        pthread_mutex_init(&q->v.mutex, NULL);
+        pthread_cond_init(&q->v.cond, NULL);
+        pthread_mutex_lock(&omu);
+        PUSHP(cqs, n_cqs, q);
+        pthread_mutex_unlock(&omu);
+    } else if (r) {
+        R.destroy_cq(r), errno = ENOMEM;
+    }
+    leave();
+    return q ? &q->v : NULL;
 }
 
 EXPORT int ibv_destroy_cq(struct ibv_cq *cq)
 {
     struct vcq *q = (struct vcq *)cq;
+    enter();
     pthread_mutex_lock(&omu);
     drop((void **)cqs, &n_cqs, q);
     pthread_mutex_unlock(&omu);
     int r = q->real ? R.destroy_cq(q->real) : 0;
+    leave();
     free(q->held); free(q);
     return r;
 }
@@ -514,12 +595,17 @@ EXPORT struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *
         logf_("queue pair type %d%s: this process cannot be checkpointed", ia->qp_type, ia->srq ? " with an SRQ" : "");
     }
     struct ibv_qp_init_attr a = *ia;
+    enter();
     a.send_cq = ((struct vcq *)ia->send_cq)->real;
     a.recv_cq = ((struct vcq *)ia->recv_cq)->real;
-    enter(); struct ibv_qp *r = R.create_qp(p->real, &a); leave();
-    if (!r) return NULL;
+    struct ibv_qp *r = R.create_qp(p->real, &a);
+    struct vqp *q = r ? calloc(1, sizeof(*q)) : NULL;
+    if (!q) {
+        if (r) R.destroy_qp(r), errno = ENOMEM;
+        leave();
+        return NULL;
+    }
     ia->cap = a.cap;
-    struct vqp *q = calloc(1, sizeof(*q));
     q->pd = p; q->real = r; q->init = *ia; q->remote = -1;
     pthread_mutex_init(&q->rmu, NULL);
     q->v = *r;
@@ -530,9 +616,11 @@ EXPORT struct ibv_qp *ibv_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *
     pthread_mutex_lock(&omu);
     PUSHP(qps, n_qps, q);
     q->slot = qslot_add(q);
+    if (q->slot < 0) logf_("queue pair %u: no slot left to track its receives: this process cannot be checkpointed", r->qp_num);
     map_put(&q->pd->c->qpn_v, r->qp_num, r->qp_num);
     if (q->slot >= 0) map_put(&q->pd->c->qpn_slot, r->qp_num, q->slot);
     pthread_mutex_unlock(&omu);
+    leave();
     return &q->v;
 }
 
@@ -541,8 +629,11 @@ EXPORT int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask)
     struct vqp *q = (struct vqp *)qp;
     int k = !(mask & IBV_QP_STATE) ? -1 : a->qp_state == IBV_QPS_INIT ? 0 : a->qp_state == IBV_QPS_RTR ? 1
             : a->qp_state == IBV_QPS_RTS ? 2 : -1;
-    enter(); int r = R.modify_qp(q->real, a, mask); leave();
+    enter();
+    int r = R.modify_qp(q->real, a, mask);
     if (!r && k >= 0) q->attr[k] = *a, q->mask[k] = mask;
+    if (!r && (mask & IBV_QP_STATE)) q->v.state = a->qp_state;
+    leave();
     if (!r && k == 1) {  /* the port's GID identifies this queue pair to its peer's exchange */
         struct vctx *c = q->pd->c;
         int port = q->mask[0] & IBV_QP_PORT ? q->attr[0].port_num : 1;
@@ -552,7 +643,6 @@ EXPORT int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask)
         struct ibv_port_attr pa;
         (ibv_query_port)(&c->v, port, (struct _compat_ibv_port_attr *)&pa);
     }
-    if (!r && (mask & IBV_QP_STATE)) q->v.state = a->qp_state;
     return r;
 }
 
@@ -568,12 +658,17 @@ EXPORT int ibv_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask, stru
 EXPORT int ibv_destroy_qp(struct ibv_qp *qp)
 {
     struct vqp *q = (struct vqp *)qp;
+    enter();
     pthread_mutex_lock(&omu);
     drop((void **)qps, &n_qps, q);
     if (q->slot >= 0) __atomic_store_n(&qslots[q->slot / QCHUNK][q->slot % QCHUNK], NULL, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&omu);
     int r = q->real ? R.destroy_qp(q->real) : 0;
+    leave();
+    pthread_mutex_lock(&q->rmu);
     free(q->recvs);  /* the shadow itself is kept: a poll may still be reading it */
+    q->recvs = NULL, q->n_recvs = q->cap_recvs = 0;
+    pthread_mutex_unlock(&q->rmu);
     return r;
 }
 
@@ -587,40 +682,83 @@ EXPORT int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
 {
     struct vqp *q = (struct vqp *)qp;
     if (!R.set_ece) return EOPNOTSUPP;
-    enter(); int r = R.set_ece(q->real, ece); leave();
+    enter();
+    int r = R.set_ece(q->real, ece);
     if (!r) q->ece = *ece, q->has_ece = 1;
+    leave();
     return r;
 }
 
+/* Events NCCL got for a queue pair or completion queue and has not
+ * acknowledged yet, with the real object the acknowledgement goes to. The
+ * provider's destroy of that object waits for it, so a suspend destroys
+ * nothing while any is out, and an acknowledgement needs only amu, never
+ * omu (which a suspend holds while it destroys). */
+struct unacked { void *shadow, *real; };
+static struct unacked *unacked; static int n_unacked;
+static pthread_mutex_t amu = PTHREAD_MUTEX_INITIALIZER;
+
+static void **event_obj(struct ibv_async_event *e, int *cq)
+{
+    switch (e->event_type) {
+    case IBV_EVENT_CQ_ERR:
+        *cq = 1;
+        return (void **)&e->element.cq;
+    case IBV_EVENT_QP_FATAL: case IBV_EVENT_QP_REQ_ERR: case IBV_EVENT_QP_ACCESS_ERR:
+    case IBV_EVENT_COMM_EST: case IBV_EVENT_SQ_DRAINED: case IBV_EVENT_PATH_MIG:
+    case IBV_EVENT_PATH_MIG_ERR: case IBV_EVENT_QP_LAST_WQE_REACHED:
+        *cq = 0;
+        return (void **)&e->element.qp;
+    default:
+        return NULL;
+    }
+}
+
+static int unacked_count(void)
+{
+    pthread_mutex_lock(&amu);
+    int n = n_unacked;
+    pthread_mutex_unlock(&amu);
+    return n;
+}
+
 /* Async events: wait on the real context's events and on this library's
- * wake, so that a suspend never closes a descriptor a thread waits on. */
+ * wake, so that a suspend never closes a descriptor a thread waits on. The
+ * context's generation, taken with the descriptor, tells a wait that
+ * outlived a whole suspend and restore (the descriptor it saw ready is
+ * gone, and the new context may have no event: its read would block while
+ * holding the gate) from one that can read. */
 EXPORT int ibv_get_async_event(struct ibv_context *ctx, struct ibv_async_event *ev)
 {
     struct vctx *c = (struct vctx *)ctx;
     for (;;) {
         enter();
+        unsigned gen = __atomic_load_n(&c->gen, __ATOMIC_SEQ_CST);
         struct pollfd p[2] = { { c->real->async_fd, POLLIN, 0 }, { c->wake, POLLIN, 0 } };
         leave();
         if (poll(p, 2, -1) < 0 && errno != EINTR) return -1;
         if (p[1].revents) { uint64_t x; ssize_t __attribute__((unused)) n = read(c->wake, &x, sizeof(x)); continue; }
         if (!(p[0].revents & POLLIN)) continue;  /* also a descriptor a suspend closed */
         enter();
-        if (__atomic_load_n(&suspended, __ATOMIC_SEQ_CST)) { leave(); continue; }
+        if (__atomic_load_n(&suspended, __ATOMIC_SEQ_CST) || __atomic_load_n(&c->gen, __ATOMIC_SEQ_CST) != gen) {
+            leave();
+            continue;
+        }
         int r = R.get_async_event(c->real, ev);
-        if (!r) {
+        int cq;
+        void **obj = r ? NULL : event_obj(ev, &cq);
+        if (obj) {
+            void *real = *obj;
             pthread_mutex_lock(&omu);
-            switch (ev->event_type) {
-            case IBV_EVENT_CQ_ERR:
-                for (int i = 0; i < n_cqs; i++) if (cqs[i]->real == ev->element.cq) { ev->element.cq = &cqs[i]->v; break; }
-                break;
-            case IBV_EVENT_QP_FATAL: case IBV_EVENT_QP_REQ_ERR: case IBV_EVENT_QP_ACCESS_ERR:
-            case IBV_EVENT_COMM_EST: case IBV_EVENT_SQ_DRAINED: case IBV_EVENT_PATH_MIG:
-            case IBV_EVENT_PATH_MIG_ERR: case IBV_EVENT_QP_LAST_WQE_REACHED:
-                for (int i = 0; i < n_qps; i++) if (qps[i]->real == ev->element.qp) { ev->element.qp = &qps[i]->v; break; }
-                break;
-            default: break;
-            }
+            for (int i = 0; cq && i < n_cqs; i++) if (cqs[i]->real == real) { *obj = &cqs[i]->v; break; }
+            for (int i = 0; !cq && i < n_qps; i++) if (qps[i]->real == real) { *obj = &qps[i]->v; break; }
             pthread_mutex_unlock(&omu);
+            if (*obj != real) {
+                struct unacked u = { *obj, real };
+                pthread_mutex_lock(&amu);
+                PUSHP(unacked, n_unacked, u);
+                pthread_mutex_unlock(&amu);
+            }
         }
         leave();
         return r;
@@ -630,19 +768,14 @@ EXPORT int ibv_get_async_event(struct ibv_context *ctx, struct ibv_async_event *
 EXPORT void ibv_ack_async_event(struct ibv_async_event *ev)
 {
     struct ibv_async_event e = *ev;
-    pthread_mutex_lock(&omu);
-    switch (e.event_type) {
-    case IBV_EVENT_CQ_ERR:
-        for (int i = 0; i < n_cqs; i++) if (&cqs[i]->v == e.element.cq) { e.element.cq = cqs[i]->real; break; }
-        break;
-    case IBV_EVENT_QP_FATAL: case IBV_EVENT_QP_REQ_ERR: case IBV_EVENT_QP_ACCESS_ERR:
-    case IBV_EVENT_COMM_EST: case IBV_EVENT_SQ_DRAINED: case IBV_EVENT_PATH_MIG:
-    case IBV_EVENT_PATH_MIG_ERR: case IBV_EVENT_QP_LAST_WQE_REACHED:
-        for (int i = 0; i < n_qps; i++) if (&qps[i]->v == e.element.qp) { e.element.qp = qps[i]->real; break; }
-        break;
-    default: break;
+    int cq;
+    void **obj = event_obj(&e, &cq);
+    if (obj) {
+        pthread_mutex_lock(&amu);
+        for (int i = 0; i < n_unacked; i++)
+            if (unacked[i].shadow == *obj) { *obj = unacked[i].real; unacked[i] = unacked[--n_unacked]; break; }
+        pthread_mutex_unlock(&amu);
     }
-    pthread_mutex_unlock(&omu);
     R.ack_async_event(&e);
 }
 
@@ -652,7 +785,10 @@ EXPORT void ibv_ack_async_event(struct ibv_async_event *ev)
 
 static void recv_add(struct vqp *q, const struct ibv_recv_wr *w)
 {
-    struct recv_rec r = { .wr_id = w->wr_id, .n = w->num_sge > 4 ? 4 : w->num_sge };
+    if (w->num_sge > RECV_SGE && !__atomic_exchange_n(&unsupported, 1, __ATOMIC_SEQ_CST))
+        logf_("queue pair %u: a receive with %d scatter entries (kept: %d): this process cannot be checkpointed",
+              q->v.qp_num, w->num_sge, RECV_SGE);
+    struct recv_rec r = { .wr_id = w->wr_id, .n = w->num_sge > RECV_SGE ? RECV_SGE : w->num_sge };
     memcpy(r.sg, w->sg_list, r.n * sizeof(r.sg[0]));
     pthread_mutex_lock(&q->rmu);
     if (q->n_recvs == q->cap_recvs) {
@@ -754,8 +890,32 @@ static int w_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr, struct ibv_rec
     return r;
 }
 
+/* A completion polled from a real queue: 1 if it is a fence write of this
+ * library's (counted off its queue pair; never NCCL's), else 0 after the
+ * receive it completes is retired. A failed completion's opcode is not
+ * defined (ibv_poll_cq(3)): which receive, if any, it ends is unknown, so
+ * its queue pair is marked and the process is not checkpointed while it
+ * lives (NCCL tears such a connection down). */
+static int seen_wc(struct vcq *cq, const struct ibv_wc *w)
+{
+    struct vqp *q = qp_by_real_num(cq->c, w->qp_num);
+    if (w->wr_id == MARKER && q && __atomic_load_n(&q->markers, __ATOMIC_SEQ_CST) > 0) {
+        if (w->status != IBV_WC_SUCCESS) __atomic_store_n(&q->failed, 1, __ATOMIC_SEQ_CST);
+        __atomic_sub_fetch(&q->markers, 1, __ATOMIC_SEQ_CST);
+        return 1;
+    }
+    if (w->status != IBV_WC_SUCCESS) {
+        if (q && !__atomic_exchange_n(&q->failed, 1, __ATOMIC_SEQ_CST))
+            logf_("queue pair %u: completion status %d: this process cannot be checkpointed while it lives",
+                  q->v.qp_num, w->status);
+    } else if ((w->opcode & IBV_WC_RECV) && q) {
+        recv_done(q, w->wr_id);
+    }
+    return 0;
+}
+
 /* Completions for NCCL: first those a suspend polled, then the real ones,
- * with NCCL's queue pair numbers. */
+ * with NCCL's queue pair numbers, less the fence writes. */
 static int w_poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc)
 {
     struct vcq *q = (struct vcq *)cq;
@@ -767,18 +927,19 @@ static int w_poll_cq(struct ibv_cq *cq, int n, struct ibv_wc *wc)
         memmove(q->held, q->held + got, (q->n_held - got) * sizeof(*wc));
         q->n_held -= got;
     }
-    if (got < n) {
+    while (got < n) {
         int r = q->real->context->ops.poll_cq(q->real, n - got, wc + got);
         if (r < 0) { leave(); return got ? got : r; }
+        if (!r) break;
+        int k = got;
         for (int i = got; i < got + r; i++) {
             uint32_t v;
-            if (wc[i].opcode & IBV_WC_RECV) {
-                struct vqp *x = qp_by_real_num(q->c, wc[i].qp_num);
-                if (x) recv_done(x, wc[i].wr_id);
-            }
+            if (seen_wc(q, &wc[i])) continue;
             if (!map_get(&q->c->qpn_v, wc[i].qp_num, &v)) wc[i].qp_num = v;
+            wc[k++] = wc[i];
         }
-        got += r;
+        if (k == got + r) { got = k; break; }
+        got = k;  /* fence writes left out: poll again for the room they took */
     }
     leave();
     return got;
@@ -804,13 +965,15 @@ static void hold_wc(struct vcq *q, const struct ibv_wc *w)
 
 /* Every send posted before the suspend completes before the queue pair is
  * destroyed: a signaled zero-length write behind them (mark) completes
- * after them. Completions polled here are kept for NCCL. */
+ * after them. Completions polled here are kept for NCCL. A fence write is
+ * counted on its queue pair from its post to its completion, here or in a
+ * later poll (after a fence that failed part way): NCCL never sees one. */
 static int fence(char *reply, size_t n, int mark)
 {
     int want = 0;
+    for (int i = 0; i < n_qps; i++) qps[i]->fence_wait = 0;
     for (int i = 0; mark && i < n_qps; i++) {
         struct vqp *q = qps[i];
-        q->marker_done = 0;
         if (getenv("NVSNAP_IBV_DEBUG")) {
             struct ibv_qp_attr qa;
             struct ibv_qp_init_attr qi;
@@ -828,11 +991,13 @@ static int fence(char *reply, size_t n, int mark)
         if (!(acc & (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ))) continue;
         struct ibv_send_wr w = { .wr_id = MARKER, .send_flags = IBV_SEND_SIGNALED,
                                  .opcode = acc & IBV_ACCESS_REMOTE_WRITE ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ }, *b;
-        if (q->real->context->ops.post_send(q->real, &w, &b)) {
-            snprintf(reply, n, "err fence write on queue pair %u: %s", q->v.qp_num, strerror(errno));
+        int e = q->real->context->ops.post_send(q->real, &w, &b);
+        if (e) {
+            snprintf(reply, n, "err fence write on queue pair %u: %s", q->v.qp_num, strerror(e > 0 ? e : errno));
             return -1;
         }
-        q->marker_done = -1;
+        __atomic_add_fetch(&q->markers, 1, __ATOMIC_SEQ_CST);
+        q->fence_wait = 1;
         want++;
     }
     /* Then until no completion queue has anything left: a completion still
@@ -849,16 +1014,15 @@ static int fence(char *reply, size_t n, int mark)
                 if (wc[j].status != IBV_WC_SUCCESS && getenv("NVSNAP_IBV_DEBUG"))
                     logf_("fence: completion wr_id %#llx qp %u status %d vendor_err %#x opcode %d",
                           (unsigned long long)wc[j].wr_id, wc[j].qp_num, wc[j].status, wc[j].vendor_err, wc[j].opcode);
-                if (wc[j].wr_id == MARKER && q && q->marker_done == -1) {
+                if (seen_wc(cqs[i], &wc[j])) {
                     if (wc[j].status != IBV_WC_SUCCESS) {
                         snprintf(reply, n, "err fence on queue pair %u: completion status %d", q->v.qp_num,
                                  wc[j].status);
                         return -1;
                     }
-                    q->marker_done = 1, want--;
+                    if (q->fence_wait && !__atomic_load_n(&q->markers, __ATOMIC_SEQ_CST)) q->fence_wait = 0, want--;
                     continue;
                 }
-                if ((wc[j].opcode & IBV_WC_RECV) && q) recv_done(q, wc[j].wr_id);
                 uint32_t v;
                 if (!map_get(&cqs[i]->c->qpn_v, wc[j].qp_num, &v)) wc[j].qp_num = v;
                 hold_wc(cqs[i], &wc[j]);
@@ -884,7 +1048,8 @@ static void reopen(void)
 /* Set by nvsnap_ibv_fence, cleared when NCCL's verbs open again. */
 static int fenced;
 
-/* Stop NCCL's verbs calls and wait for those in progress (omu held). */
+/* Stop NCCL's verbs calls and wait for those in progress, without omu: a
+ * call in progress may need it to finish (see suspended). */
 static int stop_calls(char *reply, size_t n)
 {
     if (__atomic_load_n(&unsupported, __ATOMIC_SEQ_CST)) {
@@ -892,7 +1057,9 @@ static int stop_calls(char *reply, size_t n)
         return -1;
     }
     __atomic_store_n(&suspended, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&omu);
     for (int i = 0; i < n_ctxs; i++) { uint64_t one = 1; ssize_t __attribute__((unused)) w = write(ctxs[i]->wake, &one, sizeof(one)); }
+    pthread_mutex_unlock(&omu);
     double t0 = now_s();
     while (__atomic_load_n(&inflight, __ATOMIC_SEQ_CST)) {
         if (now_s() - t0 > 2) {
@@ -905,45 +1072,73 @@ static int stop_calls(char *reply, size_t n)
     return 0;
 }
 
+/* Queue pairs whose state this library cannot save (omu held): one with a
+ * failed completion (see seen_wc), or one it could not track. */
+static int untracked(char *reply, size_t n)
+{
+    for (int i = 0; i < n_qps; i++)
+        if (__atomic_load_n(&qps[i]->failed, __ATOMIC_SEQ_CST) || qps[i]->slot < 0) {
+            snprintf(reply, n, "err queue pair %u %s: its outstanding receives are not known", qps[i]->v.qp_num,
+                     qps[i]->slot < 0 ? "is not tracked (too many created)" : "had a failed completion");
+            return -1;
+        }
+    return 0;
+}
+
 /* gpushare "quiesce": once the GPU work has drained, every send NCCL
  * posted completes (see fence), while every peer, on every node, still has
  * its queue pairs: no node releases before all have quiesced. NCCL's
- * verbs calls run again after it. */
+ * verbs calls stay held until "release": a send posted after the fence
+ * might not complete before release destroys its queue pair (NCCL's proxy
+ * can post the last write of a send whose kernel has finished). Held, it
+ * is posted after the restore, on the new queue pair. Whatever lets the
+ * process run again without a release calls nvsnap_ibv_open. */
 EXPORT int nvsnap_ibv_fence(char *reply, size_t n)
 {
-    pthread_mutex_lock(&omu);
     int r = stop_calls(reply, n);
-    if (r == 0) {
-        r = fence(reply, n, 1);
-        fenced = r == 0;
-        reopen();
-    }
+    if (r < 0) return r;
+    pthread_mutex_lock(&omu);
+    r = untracked(reply, n);
+    if (r == 0) r = fence(reply, n, 1);
+    fenced = r == 0;
     pthread_mutex_unlock(&omu);
+    if (r < 0) reopen();
     return r;
 }
 
 /* Destroy every real object (gpushare "release", after quiesce). After
  * nvsnap_ibv_fence only the completions that arrived since are collected:
- * a fence now could wait on a peer another node has already released. */
+ * a fence now could wait on a peer another node has already released, and
+ * NCCL has posted nothing since (its calls stayed held). */
 EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
 {
-    pthread_mutex_lock(&omu);
-    if (stop_calls(reply, n) < 0) {
-        pthread_mutex_unlock(&omu);
+    if (stop_calls(reply, n) < 0) return -1;
+    /* The provider's destroy waits for every event of the object to be
+     * acknowledged: give NCCL's event thread the time it takes. */
+    double t0 = now_s();
+    int ua;
+    while ((ua = unacked_count()) && now_s() - t0 < 2) usleep(1000);
+    if (ua) {
+        reopen();
+        snprintf(reply, n, "err NCCL has not acknowledged %d async event(s) of a queue pair or completion queue", ua);
         return -1;
     }
-    if (fence(reply, n, !fenced) < 0) {
+    pthread_mutex_lock(&omu);
+    if (untracked(reply, n) < 0 || fence(reply, n, !fenced) < 0) {
         pthread_mutex_unlock(&omu);
         reopen();
         return -1;
     }
     fenced = 0;
+    __atomic_store_n(&released, 1, __ATOMIC_SEQ_CST);
     int bad = 0;
     for (int i = 0; i < n_qps; i++) if (R.destroy_qp(qps[i]->real)) bad++; else qps[i]->real = NULL;
     for (int i = 0; i < n_cqs; i++) if (R.destroy_cq(cqs[i]->real)) bad++; else cqs[i]->real = NULL;
     for (int i = 0; i < n_mrs; i++) if (R.dereg_mr(mrs[i]->real)) bad++; else mrs[i]->real = NULL;
     for (int i = 0; i < n_pds; i++) if (R.dealloc_pd(pds[i]->real)) bad++; else pds[i]->real = NULL;
-    for (int i = 0; i < n_ctxs; i++) if (R.close_device(ctxs[i]->real)) bad++; else ctxs[i]->real = NULL;
+    for (int i = 0; i < n_ctxs; i++)
+        if (R.close_device(ctxs[i]->real)) bad++;
+        else ctxs[i]->real = NULL, __atomic_add_fetch(&ctxs[i]->gen, 1, __ATOMIC_SEQ_CST);
     int nq = n_qps, nm = n_mrs, nc = n_ctxs;
     pthread_mutex_unlock(&omu);
     if (bad) { snprintf(reply, n, "err %d verbs object(s) could not be destroyed", bad); return -1; }
@@ -1046,7 +1241,9 @@ static int pick_gid(struct vctx *c, struct vgid *g)
 /* Create every object again (gpushare "load", after GPU memory is back):
  * devices by name, then protection domains, registrations, completion
  * queues and queue pairs, which go to INIT and get NCCL's outstanding
- * receives again. Peers' new numbers come with "connect". */
+ * receives again. Peers' new numbers come with "connect". An object whose
+ * setup fails part way is destroyed again, so that a retry ("load" again)
+ * sets it up from the start instead of taking it for done. */
 EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
 {
     pthread_mutex_lock(&omu);
@@ -1061,13 +1258,21 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
             bad = 1;
             break;
         }
+        __atomic_add_fetch(&c->gen, 1, __ATOMIC_SEQ_CST);
         /* NCCL reads many GID entries to choose one (some empty); only the
-         * ones a queue pair uses must exist again. */
+         * ones a queue pair uses must exist again. A device that fails the
+         * check is closed again, so a retry checks it again. */
         for (int k = 0; k < c->n_gids && !bad; k++)
             if (pick_gid(c, &c->gids[k]) && gid_used(c, &c->gids[k])) {
                 snprintf(reply, n, "err %s port %d: no GID like index %d had", c->dev.name, c->gids[k].port, c->gids[k].index);
                 bad = 1;
             }
+        if (bad) {
+            R.close_device(c->real);
+            c->real = NULL;
+            __atomic_add_fetch(&c->gen, 1, __ATOMIC_SEQ_CST);
+            break;
+        }
         for (int k = 0; k < c->n_ports && !bad; k++) {
             struct ibv_port_attr pa;
             if (!R.query_port(c->real, c->ports[k].port, (struct _compat_ibv_port_attr *)&pa)) c->ports[k].cur_lid = pa.lid;
@@ -1122,28 +1327,32 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
                 bad = 1;
                 break;
             }
-            if (q->mask[0] && R.modify_qp(q->real, &q->attr[0], q->mask[0])) {
+            if (q->mask[0] && (errno = R.modify_qp(q->real, &q->attr[0], q->mask[0]))) {
                 snprintf(reply, n, "err queue pair %u to INIT: %s", q->v.qp_num, strerror(errno));
                 bad = 1;
-                break;
             }
             /* NCCL's receives still outstanding, with the real keys. */
-            for (int k = 0; k < q->n_recvs; k++) {
+            for (int k = 0; k < q->n_recvs && !bad; k++) {
                 struct recv_rec *rr = &q->recvs[k];
-                struct ibv_sge sg[4];
+                struct ibv_sge sg[RECV_SGE];
                 for (int j = 0; j < rr->n; j++) sg[j] = rr->sg[j], sg[j].lkey = lkey_of(q->pd->c, sg[j].lkey);
                 struct ibv_recv_wr w = { .wr_id = rr->wr_id, .sg_list = sg, .num_sge = rr->n }, *b;
                 if (q->real->context->ops.post_recv(q->real, &w, &b)) {
                     snprintf(reply, n, "err post a receive again on queue pair %u", q->v.qp_num);
                     bad = 1;
-                    break;
                 }
+            }
+            if (bad) {
+                R.destroy_qp(q->real);
+                q->real = NULL;
+                break;
             }
         }
         map_put(&q->pd->c->qpn_v, q->real->qp_num, q->v.qp_num);
         if (q->slot >= 0) map_put(&q->pd->c->qpn_slot, q->real->qp_num, q->slot);
     }
     int nq = n_qps;
+    if (!bad) __atomic_store_n(&released, 0, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&omu);
     if (bad) return -1;
     snprintf(reply, n, "ok re-created %d queue pair(s)", nq);
@@ -1266,10 +1475,16 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
             if (g) a.ah_attr.grh.sgid_index = g->cur_index;
         }
         a.ah_attr.dlid = rports[ri].cur_lid;
-        if (q->has_ece && R.set_ece) R.set_ece(q->real, &q->ece);
-        if (R.modify_qp(q->real, &a, q->mask[1]) ||
-            (q->mask[2] && R.modify_qp(q->real, &q->attr[2], q->mask[2]))) {
-            snprintf(reply, n, "err reconnect queue pair %u: %s", q->v.qp_num, strerror(errno));
+        /* A retry after a failure past RTR goes on from RTR. */
+        int e = 0;
+        if (q->fresh == 1) {
+            if (q->has_ece && R.set_ece) R.set_ece(q->real, &q->ece);
+            if (!(e = R.modify_qp(q->real, &a, q->mask[1]))) q->fresh = 2;
+        }
+        if (!e && q->mask[2]) e = R.modify_qp(q->real, &q->attr[2], q->mask[2]);
+        if (e) {
+            snprintf(reply, n, "err reconnect queue pair %u to %s: %s", q->v.qp_num, q->fresh == 1 ? "RTR" : "RTS",
+                     strerror(e > 0 ? e : errno));
             bad = 1;
             break;
         }
@@ -1284,12 +1499,16 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
     return 0;
 }
 
-/* Let NCCL's verbs calls run again (gpushare "resume"). */
+/* Let NCCL's verbs calls run again (gpushare "resume", or anything that
+ * lets the process run again after a fence without a release). Not while
+ * the real objects are gone: a call would use a destroyed one. */
 EXPORT void nvsnap_ibv_open(void)
 {
     pthread_mutex_lock(&omu);
-    fenced = 0;
+    int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST);
+    if (!gone) fenced = 0;
     pthread_mutex_unlock(&omu);
+    if (gone) { logf_("open: NCCL's verbs objects are not re-created: its calls stay held"); return; }
     reopen();
 }
 
