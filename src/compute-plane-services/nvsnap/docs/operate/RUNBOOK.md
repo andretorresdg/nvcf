@@ -251,20 +251,37 @@ pod (its finding: "holds RDMA devices … a checkpoint cannot save RDMA
 state"), and the configuration starts cold every time.
 
 - On: set `webhook.gpushareIBV: true`. Pods admitted after the rollout get
-  `NCCL_IBVERBS_LIB=/nvsnap/libnvsnap_ibv.so` in their GPU containers; pods
-  already running keep NCCL's own library until they are recreated. The
-  workload keeps its transport: NCCL still runs over RDMA, and the library
-  releases and re-creates NCCL's RDMA state around the capture
-  (docs/design/GPUSHARE.md, "NCCL over InfiniBand or RoCE").
-- Check a pod: `kubectl exec <pod> -c <container> -- printenv NCCL_IBVERBS_LIB`,
-  and in its log `NCCL_IBVERBS_LIB set by environment to /nvsnap/libnvsnap_ibv.so`
-  (with `NCCL_DEBUG=INFO`). The preflight then reports the RDMA devices as a
-  warning, not a block.
+  `NCCL_IBVERBS_LIB=/nvsnap/libnvsnap_ibv.so` in each GPU container that
+  gets the gpushare library (not annotated `nvsnap.io/gpushare: "false"`),
+  unless the container sets `NCCL_IBVERBS_LIB` in `env`, has an `envFrom`
+  that could set it (only the annotation `nvsnap.io/gpushare-ibv: "true"`
+  overrides that), or mounts something other than the node bundle at
+  `/nvsnap`. `gpusharePatches` in `internal/webhook/gpushare.go` applies
+  these rules. Pods already running keep NCCL's own library until they
+  are recreated. The workload keeps its transport: NCCL still runs over
+  RDMA, and the library releases and re-creates NCCL's RDMA state around
+  the capture (docs/design/GPUSHARE.md, "NCCL over InfiniBand or RoCE").
+- Check a pod: `kubectl exec <pod> -c <container> -- printenv NCCL_IBVERBS_LIB`
+  shows what was asked for. NCCL logs
+  `NCCL_IBVERBS_LIB set by environment to /nvsnap/libnvsnap_ibv.so` (with
+  `NCCL_DEBUG=INFO`) before it tries to load the library, so that line
+  does not prove the load. To check the load, list the NCCL processes that
+  have it mapped:
+  `kubectl exec <pod> -c <container> -- grep -l libnvsnap_ibv.so /proc/[0-9]*/maps`.
+  The capture preflight then reports those processes' RDMA devices as a
+  warning ("… through libnvsnap_ibv.so"), not a block.
 - One workload out: annotate its pods `nvsnap.io/gpushare-ibv: "false"`, or
   set `NCCL_IBVERBS_LIB` in the pod; NCCL keeps its own library and the
   capture is refused as before.
 - Not covered: RDMA held by anything other than NCCL in the pod (UCX, NIXL,
-  ModelExpress transfers). Those keep failing the dump, which rolls the
-  workload back to running.
+  ModelExpress transfers) and not released by `mx-pause` or `nixl-pause`.
+  A process that holds such RDMA and does not map the library is blocked
+  by the preflight, and nothing stops. In a process that maps the library,
+  `quiesce` refuses it ("RDMA device file(s) open, … outside NCCL's verbs
+  library"), before anything stops, and the workload runs on uncaptured.
+  RDMA that only shows up after the instance stopped fails the dump; a
+  capture that fails after the instance stopped replaces it cold.
 - Off: set it back to `false`; pods recreated after that use NCCL's own
-  library.
+  library. Pods whose template sets `nvsnap.io/gpushare-ibv: "true"` still
+  get the bundled library: remove the annotation, or set it to `"false"`,
+  before recreating them.

@@ -218,6 +218,14 @@ handles through the agents (`internal/agent/gpushare_fabric.go`).
 
 ![gpushare in nvsnap: admission, capture, the checkpoint, and the restore of a placeholder](figures/nvsnap-gpushare-integration.svg)
 
+RDMA devices block a capture (the preflight's `rdma` check), with one
+exception: a process that maps `libnvsnap_ibv.so`, the verbs library the
+webhook gives NCCL (`webhook.gpushareIBV` or `nvsnap.io/gpushare-ibv`),
+only warns. That library releases NCCL's RDMA state at `release` and
+creates it again at `load`. RDMA anything else holds (UCX, NIXL) cannot
+be told apart from the host, so the process's own `quiesce` refuses it
+before anything stops, and the workload runs on uncaptured.
+
 The full description, limits and validation are in
 [design/GPUSHARE.md](design/GPUSHARE.md); the sources are under
 `docker/agent/gpushare/`.

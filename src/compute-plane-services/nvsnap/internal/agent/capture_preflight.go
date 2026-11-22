@@ -354,8 +354,10 @@ func mapsIBVLib(procBase string, pid int) bool {
 // RDMA devices, one finding per process, naming it and its devices. A
 // process whose NCCL takes its verbs from libnvsnap_ibv.so only warns:
 // the GPU suspend destroys NCCL's RDMA state and the restore creates it
-// again. Devices something else holds (UCX, NIXL) still fail the dump,
-// which rolls the workload back.
+// again. Which of its device files are NCCL's cannot be told from here;
+// the process itself tells them apart (nvsnap_ibv_fds), and its "quiesce"
+// refuses RDMA left outside NCCL's (UCX, NIXL), before anything stops, so
+// the workload runs on (gpushare.c do_quiesce).
 func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []PreflightFinding {
 	pids := make([]int, 0, len(rdma))
 	for pid := range rdma {
@@ -367,7 +369,7 @@ func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []Pref
 		comm, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "comm"))
 		if mapsIBVLib(procBase, pid) {
 			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightWarn, Check: "rdma", PID: pid,
-				Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s through %s: NCCL's are released at the GPU suspend; any other RDMA user in it fails the dump, and the workload is rolled back",
+				Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s through %s: NCCL's are released at the GPU suspend; RDMA anything else in it holds refuses the quiesce, and the workload runs on uncaptured",
 					pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "), ibvLibName)})
 			continue
 		}

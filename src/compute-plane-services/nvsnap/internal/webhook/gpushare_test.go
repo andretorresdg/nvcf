@@ -455,6 +455,73 @@ func TestGPUSharePatches_IBVByDefault(t *testing.T) {
 	}
 }
 
+// A verbs library the pod may bring through envFrom wins over the chart's
+// default; only the annotation overrides what admission cannot read. An
+// envFrom whose prefix cannot form the name brings none.
+func TestGPUSharePatches_IBVEnvFrom(t *testing.T) {
+	m := &Mutator{GPUShareIBVByDefault: true}
+	withEnvFrom := func(prefix string) *corev1.Pod {
+		pod := gpushareTestPod(true, nil)
+		pod.Spec.Containers[1].EnvFrom = []corev1.EnvFromSource{{Prefix: prefix,
+			ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "nccl"}}}}
+		return pod
+	}
+	for _, tc := range []struct {
+		name, prefix, annotation string
+		want                     bool
+	}{
+		{"default, envFrom may set it", "", "", false},
+		{"default, envFrom prefix NCCL_", "NCCL_", "", false},
+		{"default, envFrom prefix cannot form it", "APP_", "", true},
+		{"annotated true, envFrom may set it", "", "true", true},
+		{"annotated false", "APP_", "false", false},
+	} {
+		pod := withEnvFrom(tc.prefix)
+		if tc.annotation != "" {
+			pod.Annotations[GPUShareIBVAnnotation] = tc.annotation
+		}
+		got := applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+		if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); (e != nil) != tc.want {
+			t.Errorf("%s: %s = %+v, want set=%v", tc.name, ncclIBVerbsLibEnv, e, tc.want)
+		}
+	}
+}
+
+// The library path is injected only where the bundle that has it is
+// mounted: a container that already mounts something else at the bundle's
+// path keeps NCCL's own verbs (a path that is not there would turn NCCL's
+// RDMA off), annotated or not. The current node bundle, already placed,
+// still gets it.
+func TestGPUSharePatches_IBVNeedsTheBundle(t *testing.T) {
+	m := &Mutator{GPUShareIBVByDefault: true, BundleID: "v7"}
+	other := func(path string) *corev1.Pod {
+		pod := gpushareTestPod(true, nil)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "tools",
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path}}})
+		pod.Spec.Containers[1].VolumeMounts = append(pod.Spec.Containers[1].VolumeMounts,
+			corev1.VolumeMount{Name: "tools", MountPath: nvsnapToolsMountPath})
+		return pod
+	}
+	for _, annotation := range []string{"", "true"} {
+		pod := other("/opt/old-tools")
+		if annotation != "" {
+			pod.Annotations[GPUShareIBVAnnotation] = annotation
+		}
+		got := applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+		if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e != nil {
+			t.Errorf("annotation %q: another mount at %s, yet %s=%q", annotation, nvsnapToolsMountPath, ncclIBVerbsLibEnv, e.Value)
+		}
+		if e := envOf(got.Spec.Containers[1], "LD_PRELOAD"); e == nil {
+			t.Errorf("annotation %q: the preload was dropped with the verbs library", annotation)
+		}
+	}
+	pod := other(m.bundleDir(m.BundleID))
+	got := applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+	if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e == nil || e.Value != GPUShareIBVLibPath {
+		t.Errorf("the current bundle at %s: %s = %+v, want %s", nvsnapToolsMountPath, ncclIBVerbsLibEnv, e, GPUShareIBVLibPath)
+	}
+}
+
 // Debug variables land on the GPU containers of the matching pods only,
 // next to the gpushare library, and never override the pod's own values.
 func TestDebugEnv(t *testing.T) {

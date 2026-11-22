@@ -340,7 +340,11 @@ the process exits. CRIU cannot dump them, so the capture preflight refuses
 such a pod. Annotated `nvsnap.io/gpushare-ibv: "true"`, or on a cluster whose
 chart sets `webhook.gpushareIBV: true` (every pod under the library unless
 annotated `"false"`), the pod's GPU containers get `NCCL_IBVERBS_LIB` pointed
-at `libnvsnap_ibv.so` from the node bundle (a value the pod sets itself wins).
+at `libnvsnap_ibv.so` from the node bundle. A value the pod sets itself in
+`env` wins. So does one an `envFrom` source might set, except over the
+annotation `"true"`. A container that mounts anything but the selected node
+bundle at `/nvsnap` gets no path: a library that is not there would turn
+NCCL's RDMA off (`gpusharePatches`).
 The workload keeps its transport: NCCL still runs over RDMA. NCCL then loads its verbs from that
 library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
 
@@ -353,7 +357,16 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
   complete: a signaled zero-length write (a read, on a queue pair that allows
   only reads) completes after them. The sends need their peers' queue pairs,
   and no node releases before every node has quiesced. Completions nobody had
-  polled yet are kept for NCCL.
+  polled yet are kept for NCCL, and the fence writes' completions never reach
+  it. NCCL's verbs calls then stay held until `release`: NCCL's proxy can
+  post the last write of a send whose kernel has already finished, and that
+  write would otherwise go out on a queue pair `release` destroys. Held, it
+  goes out on the new queue pair after the restore. Whatever lets the
+  process run again without a release (the gates opening, a `hold` to catch
+  up again) lets the calls run too.
+- `quiesce` also refuses RDMA device files, verbs event files or device
+  mappings left in the process other than NCCL's, before anything stops: the
+  dump could not save them.
 - `release` empties every completion queue, then destroys every queue pair,
   completion queue, registration, protection domain and device, so the
   process holds no RDMA device file.
@@ -369,9 +382,12 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
 
 Every rank NCCL connects must be suspended and restored together, which the
 group checkpoint does. Not handled: a shared receive queue, an address
-handle, a completion channel, or a queue pair other than reliable-connected.
-A process whose NCCL creates one refuses the suspend, and its workload runs
-on. Devices are matched by name (`mlx5_3`), so the restore node needs the
+handle, a completion channel, a queue pair other than reliable-connected, or
+a receive with more than four scatter entries. A process whose NCCL creates
+one refuses the suspend, and its workload runs on. So does a queue pair with
+a failed completion (which of its receives finished is unknown), and an
+async event of a queue pair or completion queue that NCCL does not
+acknowledge within 2 s (the provider cannot destroy the object before). Devices are matched by name (`mlx5_3`), so the restore node needs the
 same NIC names. Other users of verbs in the process (UCX, NIXL) are not
 covered: their devices still fail the dump, which rolls the workload back,
 unless they release them first. ModelExpress (`mx-pause`) and vLLM's NIXL
