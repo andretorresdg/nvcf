@@ -114,7 +114,7 @@ func TestStreamCopiesAnAppendingDownloadAndEndsWithItsTree(t *testing.T) {
 	ls := newLiveSource(src, "uid-holder", fastStream())
 	done, _ := runStream(t, localClient{ls}, dst)
 	write(t, src, "a/shard-1.bin", "one")
-	time.Sleep(600 * time.Millisecond) // settles and is copied before the end
+	waitCopied(t, dst, "a/shard-1.bin") // settles and is copied before the end
 	f, err := os.OpenFile(filepath.Join(src, "a", "shard-2.bin"), os.O_CREATE|os.O_WRONLY, 0o640)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestStreamFollowsARenameWithoutASecondCopy(t *testing.T) {
 	c := &countingClient{liveClient: localClient{ls}}
 	done, _ := runStream(t, c, dst)
 	write(t, src, ".incomplete/w.bin", "weights")
-	time.Sleep(700 * time.Millisecond)
+	waitCopied(t, dst, ".incomplete/w.bin")
 	if err := os.Rename(filepath.Join(src, ".incomplete", "w.bin"), filepath.Join(src, "w.bin")); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestStreamEndsWithTheFinalTreeAfterRewritesAndDeletes(t *testing.T) {
 	done, _ := runStream(t, localClient{ls}, dst)
 	write(t, src, "keep.bin", "v1")
 	write(t, src, "gone.bin", "temp")
-	time.Sleep(700 * time.Millisecond)
+	waitCopied(t, dst, "keep.bin", "gone.bin")
 	write(t, src, "keep.bin", "v2-longer")
 	if err := os.Remove(filepath.Join(src, "gone.bin")); err != nil {
 		t.Fatal(err)
@@ -198,7 +198,7 @@ func TestStreamRecopiesAFileWhoseCopyDoesNotMatchTheFinalManifest(t *testing.T) 
 	ls := newLiveSource(src, "uid-holder", fastStream())
 	done, _ := runStream(t, localClient{ls}, dst)
 	write(t, src, "w.bin", "right")
-	time.Sleep(700 * time.Millisecond)
+	waitCopied(t, dst, "w.bin")
 	// Corrupt the stream's copy behind its back.
 	if err := os.WriteFile(filepath.Join(dst, "w.bin"), []byte("wrong"), 0o640); err != nil {
 		t.Fatal(err)
@@ -348,7 +348,7 @@ func TestStreamFinishHandlesSwappedContents(t *testing.T) {
 	done, _ := runStream(t, localClient{ls}, dst)
 	write(t, src, "a.bin", "AAAA")
 	write(t, src, "b.bin", "BBBB")
-	time.Sleep(700 * time.Millisecond) // both copied
+	waitCopied(t, dst, "a.bin", "b.bin")
 	// The downloader swaps them (same size, so only the content moves).
 	write(t, src, "a.bin", "BBBB")
 	write(t, src, "b.bin", "AAAA")
@@ -459,5 +459,22 @@ func TestStreamRestoresASymlinksOwnMtime(t *testing.T) {
 	}
 	if wf, _ := os.Stat(filepath.Join(dst, "w.bin")); wf.ModTime().Equal(old) {
 		t.Fatal("the link's target got the link's mtime")
+	}
+}
+
+// waitCopied waits until the stream has put every rel in dst.
+func waitCopied(t *testing.T, dst string, rels ...string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for _, rel := range rels {
+		for {
+			if _, err := os.Stat(filepath.Join(dst, filepath.FromSlash(rel))); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the stream did not copy %s", rel)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 }

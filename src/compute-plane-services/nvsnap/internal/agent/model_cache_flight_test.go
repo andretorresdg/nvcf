@@ -486,3 +486,35 @@ func TestSingleFlightRelaysFormATreeNotAChain(t *testing.T) {
 		}
 	}
 }
+
+// A pod that streamed its model is a copy like any other: once its init
+// exits, its node keeps the tree the agent wrote and checked, and lists
+// itself as a source, so the next cold start there needs no network.
+func TestSingleFlightStreamedNodesKeepACopy(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	urls := map[string]string{}
+	a, b := newFlightNode(t, kube, "a", urls), newFlightNode(t, kube, "b", urls)
+	pa, pb := flightPod(t, "pa", "a", "ua"), flightPod(t, "pb", "b", "ub")
+	addPod(t, kube, pa)
+	addPod(t, kube, pb)
+	emptyVolumes(t, map[*mcNode]*corev1.Pod{a: pa, b: pb})
+	tickAll(a, b)
+	a.downloadedLive(t, pa, map[string]string{"model/w.bin": "weights"})
+	a.signal(t, pa)
+	mcEventually(t, "b done", func() bool { tickAll(a, b); return b.marker(pb, modelcache.DoneFile(string(pb.UID))) })
+
+	// b's helper exits: seeded, as it reports.
+	pb.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: "download-ngc-model",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: modelcache.InitSeeded,
+			FinishedAt: metav1.NewTime(time.Now().Add(time.Second))}}}}
+	pb.Status.Phase = corev1.PodRunning
+	if _, err := kube.CoreV1().Pods(pb.Namespace).UpdateStatus(context.Background(), pb, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	mcEventually(t, "b keeps a copy", func() bool { tickAll(b); return b.has(keyOf(pb)) })
+	mcEventually(t, "b is listed", func() bool { return sourcesOf(t, kube, keyOf(pb))["b"] != "" })
+	gen, m, _ := b.c.store.Latest(keyOf(pb))
+	if err := modelcache.Seed(gen, m, t.TempDir()); err != nil {
+		t.Fatalf("seeding from b's copy: %v", err)
+	}
+}

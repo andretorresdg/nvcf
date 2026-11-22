@@ -93,6 +93,21 @@ type flight struct {
 	src           *liveSource // what this node serves for the key, when this pod's volume is it
 	cancel        context.CancelFunc
 	finalized     bool // finalize started (it runs once, in the background)
+	// tree and treeAt: once a stream is done, the fingerprint of the tree
+	// the agent wrote and checked, and when; the node harvests that tree
+	// as it would a download's.
+	tree   string
+	treeAt time.Time
+}
+
+// streamedTree returns the tree a done stream left in the pod's volume.
+func (c *nodeModelCache) streamedTree(uid types.UID) (string, time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if f := c.flights[uid]; f != nil {
+		return f.tree, f.treeAt
+	}
+	return "", time.Time{}
 }
 
 type leaseObs struct {
@@ -557,6 +572,11 @@ func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, s
 			done = true
 			if f.src != nil {
 				f.src.setDone(*s.final)
+			}
+			if ents, serr := modelcache.ScanLive(f.vol, modelCacheMaxEntries); serr == nil {
+				c.mu.Lock()
+				f.tree, f.treeAt = modelcache.Fingerprint(modelcache.Entries(ents)), time.Now()
+				c.mu.Unlock()
 			}
 			_ = writeMarker(keyDir, modelcache.DoneFile(string(f.uid)), "")
 			log.WithField("seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds())).Info("model cache: single flight: streamed; the pod starts")

@@ -300,9 +300,17 @@ func (c *nodeModelCache) handlePod(ctx context.Context, pod *corev1.Pod, d webho
 			c.mu.Unlock()
 			return
 		}
+		tree, finished := modelcache.DownloadedTree(st.State.Terminated.Message), st.State.Terminated.FinishedAt.Time
+		if tree == "" {
+			// A streamed volume: the agent wrote and checked it, and knows
+			// its tree.
+			if t, at := c.streamedTree(pod.UID); t != "" {
+				tree, finished = t, at
+			}
+		}
 		go func() {
 			defer c.end(d.Key)
-			c.harvest(ctx, pod, d, st.State.Terminated.FinishedAt.Time, modelcache.DownloadedTree(st.State.Terminated.Message))
+			c.harvest(ctx, pod, d, finished, tree)
 		}()
 	}
 }
