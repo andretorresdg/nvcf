@@ -16,6 +16,10 @@ on both sides). Each fake logs what vLLM would do. The test checks that
     is prefilled locally;
   * a failed pause leaves the engine serving as before, and the tool exits
     non-zero;
+  * a pause whose rollback failed too is not taken for a finished one: the
+    next pause is refused until a resume reconciles it;
+  * a release the engine started before the pause's deadline is waited
+    for, not reported as a failure while it still runs;
   * a process without vLLM answers ok, and a bad host never reaches Python;
   * nixl-pause names the process's UCX, and refuses a UCX other than 1.22
     (restored into another pod, it would keep the old pod's routes).
@@ -40,7 +44,10 @@ from test_rdma_nccl import SHIM, rdma_defines  # noqa: E402
 # argv: LOG MODE. MODE "none": no vLLM; "busy": a KV send is in flight for
 # 1 s after the first pause request; "fail": the connector shutdown raises;
 # "fail1": it raises on TP worker 1 only; "failresume": the first re-created
-# connector fails to register; "stuck": the listener ignores its stop event.
+# connector fails to register; "stuck": the listener ignores its stop event;
+# "partial": TP worker 1's first shutdown raises and the first three
+# re-created connectors fail to register; "late": the engine reaches its
+# first idle point 59 s after the pause asks, and the shutdown takes 2 s.
 # Env: WORKERS (TP workers, all in this process), LEASE, HELD, UCX_LIB (a
 # stub libucp to load, as NIXL loads UCX; its version is 1.<UCX_MINOR>.0).
 WORKER = r"""
@@ -71,7 +78,7 @@ class Executor:
     def shutdown(self, wait):
         pass
 
-FAILED_REGISTER = []
+FAILED_REGISTER, FAILED_SHUTDOWN = [], []
 
 class Worker:
     def __init__(self, vllm_config, engine_id, kv_cache_config):
@@ -81,13 +88,18 @@ class Worker:
         self._handshake_initiation_executor = Executor()
         log("worker", engine_id)
     def register_kv_caches(self, kv):
-        if MODE == "failresume" and self.engine_id != "e0" and not FAILED_REGISTER:
+        if self.engine_id != "e0" and len(FAILED_REGISTER) < {"failresume": 1, "partial": 3}.get(MODE, 0):
             FAILED_REGISTER.append(1)
             raise RuntimeError("register failed")
         self.device_kv_caches = kv
         log("register", kv)
     def _finish_shutdown(self):
+        if MODE == "late":
+            time.sleep(2)
         if MODE == "fail" or (MODE == "fail1" and self.idx == 1):
+            raise RuntimeError("shutdown failed")
+        if MODE == "partial" and self.idx == 1 and not FAILED_SHUTDOWN:
+            FAILED_SHUTDOWN.append(1)
             raise RuntimeError("shutdown failed")
         log("shutdown", self.engine_id)
 
@@ -162,6 +174,7 @@ if MODE != "none":
             self.vllm_config = types.SimpleNamespace(kv_transfer_config=cfg)
             self._idle_state_callbacks, self.input_queue = [], queue.Queue()
         def run_busy_loop(self):
+            print("ready", flush=True)  # the pause finds the engine from here on
             while True:
                 try:
                     kind, req = self.input_queue.get(timeout=0.05)
@@ -172,7 +185,10 @@ if MODE != "none":
                 if MODE == "busy" and self._idle_state_callbacks and not hasattr(self, "busy"):
                     self.busy = WC[0].connector_worker._reqs_to_send
                     self.busy["r1"] = 1
-                    threading.Timer(1.0, lambda: (self.busy.clear(), log("drained"))).start()
+                    threading.Timer(1.0, lambda: (log("drained"), self.busy.clear())).start()
+                if MODE == "late" and self._idle_state_callbacks and not hasattr(self, "late"):
+                    self.late = True
+                    time.sleep(59)  # the pause waits 60 s for an idle point
                 cbs, self._idle_state_callbacks = self._idle_state_callbacks, []
                 for cb in cbs:
                     cb(self)
@@ -197,7 +213,8 @@ h = ctypes.c_ulonglong()
 fd = os.open(os.devnull, os.O_RDONLY)
 imp = ctypes.CDLL("libcuda.so.1").cuMemImportFromShareableHandle
 r = imp(ctypes.byref(h), ctypes.c_void_p(fd), 1)  # starts the library's control thread
-print("ready" if r == 0 else "import failed: %d" % r, flush=True)
+if r != 0 or MODE == "none":
+    print("ready" if r == 0 else "import failed: %d" % r, flush=True)
 if MODE == "none":
     while True:
         time.sleep(0.1)
@@ -335,6 +352,34 @@ class NixlPauseResume(unittest.TestCase):
         self.assertEqual(ids[0], ids[1], ev)
         self.assertNotEqual(ids[0], "e0", ev)
         self.assertEqual(ev[-1], "pause_state UNPAUSED", ev)
+
+    def test_unfinished_pause_is_not_taken_for_a_pause(self):
+        # The pause fails on worker 1, and its rollback, and the tool's
+        # resume after it, fail to re-create worker 0: the engine is neither
+        # paused nor serving. Another pause must not answer "already paused".
+        self.start("partial", WORKERS="2")
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        p = self.tool("nixl-pause")
+        self.assertNotEqual(p.returncode, 0, "a pause that never finished was taken for one:\n" + p.stdout)
+        self.assertIn("did not finish", p.stdout)
+        # The tool's resume after that refusal reconciles it.
+        self.assertIn("not paused", self.ok("nixl-resume"))
+        self.assertIn("released on 2 worker(s)", self.ok("nixl-pause"))
+        self.assertIn("resumed as engine", self.ok("nixl-resume"))
+
+    def test_release_started_before_the_deadline_is_waited_for(self):
+        # The engine starts the release just before the 60 s deadline and
+        # finishes it after: the pause reports what the release did, and no
+        # rollback re-creates the connector behind it.
+        self.start("late")
+        t0 = time.monotonic()
+        out = self.ok("nixl-pause")
+        self.assertIn("released on 1 worker(s)", out)
+        self.assertGreater(time.monotonic() - t0, 60, out)
+        ev = self.events()
+        self.assertEqual(ev[-2:], ["pause_state PAUSED_NEW", "shutdown e0"], ev)
+        self.assertIn("resumed as engine", self.ok("nixl-resume"))
 
     def test_failed_resume_can_be_retried(self):
         self.start("failresume")

@@ -9,6 +9,7 @@ SYNC_MS and counts its calls. The test checks that
 
   * a "step" permit a held launch has not taken yet counts as busy, and
     quiesce takes it back, so that launch cannot pass the gate afterwards;
+  * a permit taken between the drain check's reads still counts as busy;
   * a drain check ("poll") uses a synchronization that finished between
     two polls, instead of discarding it and reporting busy forever;
   * quiesce never uses a synchronization that finished, or started, before
@@ -17,8 +18,11 @@ SYNC_MS and counts its calls. The test checks that
     held (the ranks are catching up), and opens the gates otherwise;
   * when the process that sent "hold" exits, the gates open again, also
     when the state lock is busy at that moment (retried until it is free),
-    and also after a "resume" from it that failed;
-  * a batched copy (CUDA 12 and 13 entry points) waits at the memory gate.
+    and also after a "resume" from it that failed, or an "open" that found
+    nothing to open;
+  * a batched copy (CUDA 12 and 13 entry points) waits at the memory gate,
+    and a lookup through cuGetProcAddress gets the wrapper of the version
+    and stream it asked for, even at an address no exported name has.
 
 Run: python3 -I tests/gpushare/host/test_gate_sync.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -50,6 +54,11 @@ CUresult cuCtxPopCurrent(void **c) { *c = (void *)1; return 0; }
 int stub_batches;
 CUresult cuMemcpyBatchAsync(void) { __atomic_add_fetch(&stub_batches, 1, __ATOMIC_SEQ_CST); return 0; }
 CUresult cuMemcpyBatchAsync_v2(void) { __atomic_add_fetch(&stub_batches, 1, __ATOMIC_SEQ_CST); return 0; }
+/* An entry point at an address no exported name has, as a driver may
+ * return from cuGetProcAddress. */
+static CUresult unexported(void) { __atomic_add_fetch(&stub_batches, 1, __ATOMIC_SEQ_CST); return 0; }
+CUresult cuGetProcAddress_v2(const char *s, void **p, int v, unsigned long long f, void *q)
+{ (void)s; (void)v; (void)f; (void)q; *p = (void *)unexported; return 0; }
 CUresult cuCtxSynchronize(void)
 {
     const char *e = getenv("SYNC_MS");
@@ -60,8 +69,37 @@ CUresult cuCtxSynchronize(void)
 """
 
 PROBE = r"""
+#define _GNU_SOURCE  /* as gpushare.c: its headers come after this one */
+#include <pthread.h>
+/* Runs once, on the next lock of gate_mu: what another thread did just
+ * before the lock was taken. */
+static void (*on_gate_lock)(void);
+static int probe_lock(pthread_mutex_t *m);
+#define pthread_mutex_lock(m) probe_lock(m)
 #include "gpushare.c"
+#undef pthread_mutex_lock
 #include <sys/wait.h>
+
+static int probe_lock(pthread_mutex_t *m)
+{
+    void (*f)(void) = m == &gate_mu ? on_gate_lock : NULL;
+    if (f) on_gate_lock = NULL, f();
+    return pthread_mutex_lock(m);
+}
+/* What gate_enter does for a held launch let through by "step". */
+static void take_permit(void) { lgate.pass--; __atomic_add_fetch(&lgate.inflight, 1, __ATOMIC_SEQ_CST); }
+static int closed(struct gate *g) { return __atomic_load_n(&g->closed, __ATOMIC_SEQ_CST); }
+/* Wait until n threads wait at gate g. */
+static void wait_waiting(struct gate *g, int n)
+{
+    for (int i = 0; i < 5000; i++) {
+        pthread_mutex_lock(&gate_mu);
+        int w = g->waiting;
+        pthread_mutex_unlock(&gate_mu);
+        if (w >= n) return;
+        usleep(1000);
+    }
+}
 
 extern int stub_syncs, stub_batches;
 static void *waiter(void *arg) { gate_enter(&lgate); gate_exit(&lgate); *(int *)arg = 1; return NULL; }
@@ -83,11 +121,22 @@ int main(int argc, char **argv)
         int passed = 0;
         pthread_t t;
         pthread_create(&t, NULL, waiter, &passed);
-        usleep(200000);
-        printf("passed_after_quiesce=%d\n", passed);
+        wait_waiting(&lgate, 1);
+        usleep(50000);
+        printf("passed_after_quiesce=%d\n", __atomic_load_n(&passed, __ATOMIC_SEQ_CST));
         gate_open();
         pthread_join(t, NULL);
         printf("passed_after_open=%d\n", passed);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "permitrace")) {
+        /* The held launch takes a "step" permit between the drain check's
+         * read of the launches in flight and its read of the permit. */
+        lgate.closed = 1;
+        lgate.pass = 1;
+        on_gate_lock = take_permit;
+        int d = drained(50, &r);
+        printf("drained=%d inflight=%d\n", d, lgate.inflight);
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "between")) {
@@ -122,8 +171,11 @@ int main(int argc, char **argv)
         printf("held=%s:%d:%d\n", rep[0] == 'e' ? "busy" : "ok", lgate.closed, mgate.closed);
         return 0;
     }
-    if (argc > 1 && !strcmp(argv[1], "lease")) {
-        /* A child sends "hold" over the control socket, then exits. */
+    if (argc > 1 && (!strcmp(argv[1], "lease") || !strcmp(argv[1], "leaseopen"))) {
+        /* A child sends "hold" over the control socket, then exits.
+         * leaseopen: it sends "open" before it exits, which finds nothing
+         * a restore held ("ok not held") and opens nothing. */
+        int open_ = !strcmp(argv[1], "leaseopen");
         start_ctl();
         int up[2], down[2];
         if (pipe(up) || pipe(down)) return 3;
@@ -131,17 +183,18 @@ int main(int argc, char **argv)
         if (!c) {
             char b;
             int ok = request(getppid(), "hold", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok held");
+            if (ok && open_) ok = request(getppid(), "open", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok not held");
             if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
             _exit(0);
         }
         char b = 0;
         if (read(up[0], &b, 1) != 1) return 4;
         usleep(300000);
-        printf("hold=%c closed_while_alive=%d\n", b, lgate.closed);
+        printf("hold=%c closed_while_alive=%d\n", b, closed(&lgate));
         if (write(down[1], "x", 1) != 1) return 5;
         waitpid(c, NULL, 0);
-        for (int i = 0; i < 100 && lgate.closed; i++) usleep(10000);
-        printf("closed_after_exit=%d\n", lgate.closed);
+        for (int i = 0; i < 100 && closed(&lgate); i++) usleep(10000);
+        printf("closed_after_exit=%d\n", closed(&lgate));
         return 0;
     }
     if (argc > 1 && (!strcmp(argv[1], "leasebusy") || !strcmp(argv[1], "resumefail") || !strcmp(argv[1], "releasefail"))) {
@@ -173,27 +226,58 @@ int main(int argc, char **argv)
         if (resume && read(up[0], &rb, 1) != 1) return 6;
         waitpid(c, NULL, 0);
         usleep(2600000);  /* lock_ctl gives up after 2 s */
-        printf("hold=%c resume=%c closed_while_locked=%d\n", b, rb, lgate.closed);
+        printf("hold=%c resume=%c closed_while_locked=%d\n", b, rb, closed(&lgate));
         pthread_mutex_unlock(&mu);
-        for (int i = 0; i < 300 && lgate.closed; i++) usleep(10000);
-        printf("closed_after_unlock=%d\n", lgate.closed);
+        for (int i = 0; i < 300 && closed(&lgate); i++) usleep(10000);
+        printf("closed_after_unlock=%d\n", closed(&lgate));
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "batch")) {
         /* cuGetProcAddress("cuMemcpyBatchAsync") returns the CUDA 12
          * function or, for CUDA 13, _v2: each gets its own wrapper. */
         void *v1 = cuda_sym("cuMemcpyBatchAsync"), *v2 = cuda_sym("cuMemcpyBatchAsync_v2");
-        printf("v1=%d v2=%d\n", wrapper_for("cuMemcpyBatchAsync", v1) == (void *)w_cuMemcpyBatchAsync,
-               wrapper_for("cuMemcpyBatchAsync", v2) == (void *)w_cuMemcpyBatchAsync_v2);
-        batch_fn = wrapper_for("cuMemcpyBatchAsync", v1);
+        printf("v1=%d v2=%d\n", wrapper_for("cuMemcpyBatchAsync", v1, 0, 0) == (void *)w_cuMemcpyBatchAsync,
+               wrapper_for("cuMemcpyBatchAsync", v2, 0, 0) == (void *)w_cuMemcpyBatchAsync_v2);
+        batch_fn = wrapper_for("cuMemcpyBatchAsync", v1, 0, 0);
         mgate.closed = 1;
         pthread_t t;
         pthread_create(&t, NULL, batcher, NULL);
-        usleep(200000);
-        printf("copied_while_closed=%d\n", stub_batches);
+        wait_waiting(&mgate, 1);
+        printf("copied_while_closed=%d\n", __atomic_load_n(&stub_batches, __ATOMIC_SEQ_CST));
         gate_open();
         pthread_join(t, NULL);
         printf("copied_after_open=%d\n", stub_batches);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "lookup")) {
+        /* cuGetProcAddress returns a function no exported name has: the
+         * wrapper is the one of the version and stream asked for. CUDA 13
+         * has another cuMemcpyBatchAsync (no failIdx); CUDA 12.2 another
+         * cuMemPrefetchAsync. */
+        enum { PT = CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM };
+        struct { const char *name; int ver, flags; void *want; } c[] = {
+            { "cuMemcpyBatchAsync", 13000, PT, (void *)w_cuMemcpyBatchAsync_v2_ptsz },
+            { "cuMemcpyBatchAsync", 13000, 0, (void *)w_cuMemcpyBatchAsync_v2 },
+            { "cuMemcpyBatchAsync", 12080, PT, (void *)w_cuMemcpyBatchAsync_ptsz },
+            { "cuMemcpyBatchAsync", 12080, 0, (void *)w_cuMemcpyBatchAsync },
+            { "cuMemPrefetchAsync", 12020, PT, (void *)w_cuMemPrefetchAsync_v2_ptsz },
+            { "cuMemPrefetchAsync", 12000, 0, (void *)w_cuMemPrefetchAsync },
+            { "cuLaunchKernel", 13000, PT, (void *)w_cuLaunchKernel_ptsz },
+            { "cuMemcpy", 13000, PT, (void *)w_cuMemcpy_ptds },
+        };
+        for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+            void *p = NULL;
+            w_gpa2(c[i].name, &p, c[i].ver, c[i].flags, NULL);
+            printf("%s@%d/%d=%d\n", c[i].name, c[i].ver, c[i].flags, p == c[i].want);
+        }
+        /* The wrapper calls the function the lookup returned, with the
+         * CUDA 13 arguments. */
+        void *p = NULL;
+        w_gpa2("cuMemcpyBatchAsync", &p, 13000, PT, NULL);
+        int before = stub_batches;
+        ((CUresult (*)(CUdeviceptr *, CUdeviceptr *, size_t *, size_t, CUmemcpyAttributes *, size_t *, size_t,
+                       CUstream))p)(NULL, NULL, NULL, 0, NULL, NULL, 0, NULL);
+        printf("called=%d\n", stub_batches - before);
         return 0;
     }
     return 2;
@@ -234,6 +318,11 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["passed_after_quiesce"], "0", "a launch passed the gate after quiesce")
         self.assertEqual(out["passed_after_open"], "1", out)
 
+    def test_permit_taken_during_the_drain_check_is_busy(self):
+        out = self.probe("permitrace")
+        self.assertEqual(out["inflight"], "1", out)
+        self.assertEqual(out["drained"], "0", "a launch let through during the drain check was reported drained")
+
     def test_sync_finished_between_polls_is_used(self):
         out = self.probe("between", sync_ms=5)
         self.assertGreater(int(out["idle_polls"]), 0, "every poll reported busy on a drained GPU")
@@ -253,6 +342,12 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["hold"], "1", out)
         self.assertEqual(out["closed_while_alive"], "1", out)
         self.assertEqual(out["closed_after_exit"], "0", "launches stayed held after the tool that held them exited")
+
+    def test_open_that_opened_nothing_keeps_the_lease(self):
+        out = self.probe("leaseopen")
+        self.assertEqual(out["hold"], "1", out)
+        self.assertEqual(out["closed_while_alive"], "1", out)
+        self.assertEqual(out["closed_after_exit"], "0", "an open that opened nothing ended the lease: launches stayed held")
 
     def test_gates_open_when_the_holder_exits_on_a_busy_lock(self):
         out = self.probe("leasebusy")
@@ -277,6 +372,13 @@ class GateSync(unittest.TestCase):
         self.assertEqual((out["v1"], out["v2"]), ("1", "1"), out)
         self.assertEqual(out["copied_while_closed"], "0", "a batched copy passed the closed memory gate")
         self.assertEqual(out["copied_after_open"], "1", out)
+
+    def test_lookup_gets_the_wrapper_of_the_version_asked_for(self):
+        out = self.probe("lookup")
+        lookups = {k: v for k, v in out.items() if "@" in k}
+        self.assertEqual(len(lookups), 8, out)
+        self.assertEqual([k for k, v in lookups.items() if v != "1"], [], out)
+        self.assertEqual(out["called"], "1", out)
 
 
 if __name__ == "__main__":

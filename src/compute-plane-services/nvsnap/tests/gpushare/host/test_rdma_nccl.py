@@ -23,7 +23,13 @@ NCCL's context would. The test checks that
     told from NCCL's (the dump fails on it instead);
   * a library without nvsnap_ibv_fds leaves nothing out;
   * end to end, mx-pause passes in a worker whose only RDMA is NCCL's, and
-    refuses one with another file open (test_nixl_host.py: nixl-pause).
+    refuses one with another file open (test_nixl_host.py: nixl-pause);
+  * "quiesce" refuses the same RDMA the pauses refuse, before anything
+    stops, and passes with NCCL's only;
+  * a check that cannot read the process's files fails the pause;
+  * once a quiesce has held NCCL's verbs calls, every path that lets the
+    app run again without a release ("hold" again, the gates opening) lets
+    them run too.
 
 Run: python3 -I tests/gpushare/host/test_rdma_nccl.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -38,7 +44,19 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_mx_host import CUDA_INC, SRC, STUB  # noqa: E402
+from test_mx_host import CUDA_INC, SRC  # noqa: E402
+from test_mx_host import STUB as MX_STUB  # noqa: E402
+
+# Also the calls "quiesce" makes to drain the GPU (one device, idle).
+STUB = MX_STUB + r"""
+CUresult cuDeviceGetCount(int *n) { *n = 1; return 0; }
+CUresult cuDevicePrimaryCtxGetState(int d, unsigned *f, int *a) { (void)d; *f = 0; *a = 1; return 0; }
+CUresult cuDevicePrimaryCtxRetain(void **c, int d) { (void)d; *c = (void *)1; return 0; }
+CUresult cuDevicePrimaryCtxRelease(int d) { (void)d; return 0; }
+CUresult cuCtxPushCurrent(void *c) { (void)c; return 0; }
+CUresult cuCtxPopCurrent(void **c) { *c = (void *)1; return 0; }
+CUresult cuCtxSynchronize(void) { return 0; }
+"""
 
 # A fake libnvsnap_ibv: at load it opens IBDIR/uverbs0 and maps it, and
 # opens an event file (a timerfd), as NCCL's context would; "suspend"
@@ -79,7 +97,8 @@ int nvsnap_ibv_suspend(char *r, size_t n)
 int nvsnap_ibv_restore(char *r, size_t n) { if (fd0 < 0) up(); snprintf(r, n, "ok"); return 0; }
 int nvsnap_ibv_map(FILE *fp) { (void)fp; return 0; }
 int nvsnap_ibv_connect(const char *p, char *r, size_t n) { (void)p; snprintf(r, n, "ok"); return 0; }
-void nvsnap_ibv_open(void) {}
+int shim_opens;  /* nvsnap_ibv_open calls */
+void nvsnap_ibv_open(void) { shim_opens++; }
 int nvsnap_ibv_count(void) { return 1; }
 #ifndef OLD
 int nvsnap_ibv_fds(int *fds, int max)
@@ -135,8 +154,26 @@ int main(int argc, char **argv)
     if (!strcmp(c, "samemap")) open_map("uverbs0", 0);
     if (!strcmp(c, "foreignev") && timerfd_create(CLOCK_MONOTONIC, 0) < 0) return 5;
     int o, m;
-    rdma_files(&o, &m, 1);
-    printf("pause_open=%d pause_mapped=%d\n", o, m);
+    int scanned = rdma_files(&o, &m, 1) == 0;
+    printf("scanned=%d pause_open=%d pause_mapped=%d\n", scanned, o, m);
+    char rep[GPUSHARE_REPLY_MAX];
+    do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", "pause", "");
+    printf("mx_pause_ok=%d\n", !strncmp(rep, "ok", 2));
+    do_quiesce(rep, sizeof(rep));
+    int q = !strcmp(rep, "ok quiesced");
+    printf("quiesce_ok=%d\n", q);
+    /* After a quiesce, the paths that let the app run without a release. */
+    int *opens = dlsym(RTLD_DEFAULT, "shim_opens");
+    void *h = strcmp(c, "noshim") ? dlopen(argv[2], RTLD_NOW | RTLD_NOLOAD) : NULL;
+    if (h) opens = dlsym(h, "shim_opens");
+    if (q && opens) {
+        int o0 = *opens;
+        do_hold(rep, sizeof(rep));
+        int o1 = *opens;
+        do_quiesce(rep, sizeof(rep));
+        gate_open();
+        printf("opens_at_hold=%d opens_at_open=%d\n", o1 - o0, *opens - o1);
+    }
     return 0;
 }
 """
@@ -217,6 +254,9 @@ class RdmaNCCL(unittest.TestCase):
                os.path.join(t, "shim.c"))
         cc("-Wno-unused-function", "-o", os.path.join(t, "probe"), os.path.join(t, "probe.c"),
            os.path.join(t, "libcuda.so.1"), "-Wl,-rpath," + t, "-ldl", "-lpthread")
+        # A process whose files cannot be listed.
+        cc("-Wno-unused-function", "-DGPUSHARE_PROC_SELF=\"%s/noproc\"" % t, "-o", os.path.join(t, "probe-noproc"),
+           os.path.join(t, "probe.c"), os.path.join(t, "libcuda.so.1"), "-Wl,-rpath," + t, "-ldl", "-lpthread")
         cc("-fpatchable-function-entry=4", "-shared", "-fPIC", "-o", os.path.join(t, "libnvsnap_gpushare.so"),
            os.path.join(SRC, "gpushare.c"), "-ldl", "-lpthread")
         cc("-o", os.path.join(t, "nvsnap-gpu-suspend"), os.path.join(SRC, "nvsnap-gpu-suspend.c"), "-ldl", "-lpthread")
@@ -226,8 +266,8 @@ class RdmaNCCL(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def probe(self, case, shim="libnvsnap_ibv.so", **env):
-        p = subprocess.run([os.path.join(self.tmp, "probe"), case, os.path.join(self.tmp, shim)],
+    def probe(self, case, shim="libnvsnap_ibv.so", prog="probe", **env):
+        p = subprocess.run([os.path.join(self.tmp, prog), case, os.path.join(self.tmp, shim)],
                            capture_output=True, text=True, timeout=60, env=dict(self.env, **env))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return dict(kv.split("=", 1) for kv in p.stdout.split())
@@ -235,6 +275,25 @@ class RdmaNCCL(unittest.TestCase):
     def test_nccls_own_are_left_to_release(self):
         out = self.probe("owned")
         self.assertEqual((out["pause_open"], out["pause_mapped"]), ("0", "0"), out)
+        self.assertEqual((out["mx_pause_ok"], out["quiesce_ok"]), ("1", "1"), out)
+
+    def test_quiesce_refuses_rdma_a_dump_cannot_save(self):
+        for case, kw in (("foreignfd", {}), ("foreignev", {}), ("foreignmap", {}), ("noshim", {}),
+                         ("owned", {"FLIP": "1"})):
+            out = self.probe(case, **kw)
+            self.assertEqual(out["quiesce_ok"], "0", "%s %s: quiesce passed with RDMA left: %s" % (case, kw, out))
+
+    def test_unreadable_files_fail_the_pause_and_quiesce(self):
+        out = self.probe("owned", prog="probe-noproc")
+        self.assertEqual(out["scanned"], "0", out)
+        self.assertEqual(out["mx_pause_ok"], "0", "a pause passed without looking at the process's files")
+        self.assertEqual(out["quiesce_ok"], "0", "a quiesce passed without looking at the process's files")
+
+    def test_running_again_without_a_release_lets_nccls_verbs_run(self):
+        out = self.probe("owned")
+        self.assertEqual(out["quiesce_ok"], "1", out)
+        self.assertEqual(out["opens_at_hold"], "1", "a hold after a quiesce left NCCL's verbs calls held")
+        self.assertEqual(out["opens_at_open"], "1", "opening the gates after a quiesce left NCCL's verbs calls held")
 
     def test_another_file_on_nccls_device_counts(self):
         out = self.probe("foreignfd")
