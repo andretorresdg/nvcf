@@ -122,12 +122,14 @@ func readNames(dirfd int, b *walkBudget) ([]string, error) {
 	defer f.Close()
 	var names []string
 	for {
-		batch, err := f.Readdirnames(4096)
+		batch, err := readDirBatch(f, 4096)
 		names = append(names, batch...)
 		if berr := b.add(len(batch)); berr != nil {
 			return nil, berr
 		}
-		if err == io.EOF || len(batch) == 0 {
+		// Only io.EOF ends the listing: any other error, with or without
+		// names, leaves it incomplete.
+		if err == io.EOF {
 			return names, nil
 		}
 		if err != nil {
@@ -135,6 +137,9 @@ func readNames(dirfd int, b *walkBudget) ([]string, error) {
 		}
 	}
 }
+
+// readDirBatch reads up to n names; a test makes it fail.
+var readDirBatch = func(f *os.File, n int) ([]string, error) { return f.Readdirnames(n) }
 
 // entryOf describes n, without its checksum.
 func entryOf(n node, target string) (Entry, error) {

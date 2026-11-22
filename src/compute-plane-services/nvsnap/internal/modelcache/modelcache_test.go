@@ -64,8 +64,10 @@ func TestHarvestThenSeedReproducesTheTree(t *testing.T) {
 	if err != nil || string(b) != `{"a":1}` {
 		t.Fatalf("config.json = %q, %v", b, err)
 	}
-	if fi, err := os.Stat(filepath.Join(dst, "m/run.sh")); err != nil || fi.Mode().Perm() != 0o755 {
-		t.Fatalf("run.sh mode = %v, %v; want 0755", fi.Mode().Perm(), err)
+	if fi, err := os.Stat(filepath.Join(dst, "m/run.sh")); err != nil {
+		t.Fatalf("run.sh: %v", err)
+	} else if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("run.sh mode = %v; want 0755", fi.Mode().Perm())
 	}
 	if fi, err := os.Stat(filepath.Join(dst, "m/empty")); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o750 {
 		t.Fatalf("empty dir = %v, %v; want a 0750 directory", fi, err)
@@ -378,14 +380,17 @@ func TestSeedRestoresModesAndMtimes(t *testing.T) {
 	harvest(t, s, "k1", src)
 	gen, m, _ := s.Latest("k1")
 	// The cache's own copy stays readable whatever the download's mode.
-	if fi, err := os.Stat(filepath.Join(gen, TreeDir, "m/config.json")); err != nil || fi.Mode().Perm() != 0o644 {
-		t.Fatalf("cached copy mode = %v, %v; want 0644", fi.Mode().Perm(), err)
+	if fi, err := os.Stat(filepath.Join(gen, TreeDir, "m/config.json")); err != nil {
+		t.Fatalf("cached copy: %v", err)
+	} else if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("cached copy mode = %v; want 0644", fi.Mode().Perm())
 	}
 	dst := t.TempDir()
 	must(t, Seed(gen, m, dst))
 	fi, err := os.Stat(filepath.Join(dst, "m/config.json"))
-	if err != nil || fi.Mode().Perm() != 0o600 || !fi.ModTime().Equal(when) {
-		t.Fatalf("seeded config.json mode %v mtime %v, %v; want 0600 at %v", fi.Mode().Perm(), fi.ModTime(), err, when)
+	must(t, err)
+	if fi.Mode().Perm() != 0o600 || !fi.ModTime().Equal(when) {
+		t.Fatalf("seeded config.json mode %v mtime %v; want 0600 at %v", fi.Mode().Perm(), fi.ModTime(), when)
 	}
 	// The seeded tree is the download's in everything but change times.
 	a, _ := Scan(src, 0)
@@ -547,5 +552,143 @@ func TestManifestSizesCannotOverflow(t *testing.T) {
 	}
 	if got := AllocEstimate([]Entry{{Path: "a", Type: TypeFile, Size: math.MaxInt64}}); got != math.MaxInt64 {
 		t.Fatalf("AllocEstimate of one huge file = %d", got)
+	}
+}
+
+func TestWalkReportsADirectoryReadError(t *testing.T) {
+	boom := errors.New("getdents failed")
+	prev := readDirBatch
+	readDirBatch = func(*os.File, int) ([]string, error) { return nil, boom }
+	defer func() { readDirBatch = prev }()
+	err := walkNoFollow(modelTree(t), 0, func(node) error { return nil })
+	if !errors.Is(err, boom) {
+		t.Fatalf("walk = %v, want the read error: a failed read is not the end of the listing", err)
+	}
+}
+
+// foreignGID is a group the test's user is not in, so chown to it fails.
+func foreignGID(t *testing.T) int {
+	t.Helper()
+	groups, err := os.Getgroups()
+	must(t, err)
+	in := map[int]bool{os.Getegid(): true}
+	for _, g := range groups {
+		in[g] = true
+	}
+	for g := 1; g < 1<<20; g++ {
+		if !in[g] {
+			return g
+		}
+	}
+	t.Skip("the user is in every group")
+	return 0
+}
+
+func TestOwnerErrorsKeepTheirCause(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("runs as root: any owner or mode can be given")
+	}
+	s := &Store{Root: t.TempDir()}
+	harvest(t, s, "k1", modelTree(t))
+	gen, m, _ := s.Latest("k1")
+	gid := foreignGID(t)
+
+	entry := m
+	entry.Entries = append([]Entry{}, m.Entries...)
+	entry.Entries[len(entry.Entries)-1].GID = gid
+	if err := Seed(gen, entry, t.TempDir()); !errors.Is(err, ErrOwner) || !errors.Is(err, unix.EPERM) {
+		t.Fatalf("an entry's chown: err = %v, want ErrOwner wrapping EPERM", err)
+	}
+
+	vol := m
+	root := *m.Root
+	root.GID = gid
+	vol.Root = &root
+	if err := Seed(gen, vol, t.TempDir()); !errors.Is(err, ErrOwner) || !errors.Is(err, unix.EPERM) {
+		t.Fatalf("the volume's chown: err = %v, want ErrOwner wrapping EPERM", err)
+	}
+
+	// A directory the user does not own: its owner matches, its mode
+	// cannot be set.
+	var st unix.Stat_t
+	must(t, unix.Stat("/", &st))
+	mode := Manifest{Root: &Entry{Type: TypeDir, UID: int(st.Uid), GID: int(st.Gid), Mode: (st.Mode & 0o7777) ^ 0o001}}
+	if err := ApplyMeta("/", mode); !errors.Is(err, ErrOwner) || !errors.Is(err, unix.EPERM) {
+		t.Fatalf("the volume's mode: err = %v, want ErrOwner wrapping EPERM", err)
+	}
+}
+
+func TestPublishSyncsTheAttemptBeforeItsRename(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	prev := syncDir
+	defer func() { syncDir = prev }()
+	type call struct {
+		path     string
+		complete bool
+	}
+	var calls []call
+	syncDir = func(p string) error {
+		_, err := os.Stat(filepath.Join(p, CompleteFile))
+		calls = append(calls, call{p, err == nil})
+		return prev(p)
+	}
+	harvest(t, s, "k1", modelTree(t))
+	var attempt, root bool
+	for _, c := range calls {
+		if strings.HasPrefix(filepath.Base(c.path), AttemptPrefix) && filepath.Dir(c.path) == s.KeyDir("k1") {
+			// Synced after .complete was written, while still an attempt.
+			attempt = attempt || c.complete
+		}
+		root = root || c.path == s.Root
+	}
+	if !attempt {
+		t.Fatalf("the attempt directory was not synced with its manifest and marker before the rename: %v", calls)
+	}
+	if !root {
+		t.Fatalf("the key directory's parent was not synced: %v", calls)
+	}
+}
+
+func TestPublishLeavesNoGenerationWhenTheRenameIsNotDurable(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	prev := syncDir
+	defer func() { syncDir = prev }()
+	boom := errors.New("fsync failed")
+	syncDir = func(p string) error {
+		if p == s.KeyDir("k1") {
+			return boom
+		}
+		return prev(p)
+	}
+	if _, err := s.Harvest("k1", modelTree(t), Limits{}); !errors.Is(err, boom) {
+		t.Fatalf("harvest = %v, want the sync error", err)
+	}
+	if _, _, ok := s.Latest("k1"); ok {
+		t.Fatal("a generation whose rename was not made durable is visible, though the harvest failed")
+	}
+	ents, _ := os.ReadDir(s.KeyDir("k1"))
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), GenPrefix) || strings.HasPrefix(e.Name(), AttemptPrefix) {
+			t.Fatalf("the failed harvest left %s", e.Name())
+		}
+	}
+}
+
+func TestUsageCountsAModelDirectoryNamedLikeAnAttempt(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	src := modelTree(t)
+	must(t, os.MkdirAll(filepath.Join(src, "m", AttemptPrefix+"shards"), 0o755))
+	must(t, os.WriteFile(filepath.Join(src, "m", AttemptPrefix+"shards", "w.bin"), bytes.Repeat([]byte{1}, 2<<20), 0o644))
+	harvest(t, s, "k1", src)
+	used, err := s.Usage()
+	must(t, err)
+	if used < 5<<20 {
+		t.Fatalf("usage = %d, want at least the 3 MiB and 2 MiB files: a model directory named %s* was left out", used, AttemptPrefix)
+	}
+	// An attempt in flight still is not counted.
+	must(t, os.MkdirAll(filepath.Join(s.KeyDir("k1"), AttemptPrefix+"live", TreeDir), 0o755))
+	must(t, os.WriteFile(filepath.Join(s.KeyDir("k1"), AttemptPrefix+"live", TreeDir, "x"), bytes.Repeat([]byte{1}, 4<<20), 0o644))
+	if again, _ := s.Usage(); again != used {
+		t.Fatalf("usage with an attempt in flight = %d, want %d", again, used)
 	}
 }

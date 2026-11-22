@@ -366,7 +366,11 @@ var testKey = func(string) bool { return false }
 func (a *attempt) abort() { _ = os.RemoveAll(a.dir) }
 
 // publish writes the manifest and the completion marker, syncs the tree,
-// and renames the attempt to a generation.
+// and renames the attempt to a generation. The attempt directory (its
+// manifest, marker and tree entries) and the key directory's parent are
+// synced before the rename, and the key directory after it. If that last
+// sync fails, the generation is taken back out of view: a harvest or fetch
+// that reports an error leaves no generation for a pod to seed from.
 func (a *attempt) publish(m Manifest) (string, error) {
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -386,11 +390,27 @@ func (a *attempt) publish(m Manifest) (string, error) {
 	if err := writeSynced(filepath.Join(a.dir, CompleteFile), nil); err != nil {
 		return "", err
 	}
+	if err := syncDir(a.dir); err != nil {
+		return "", err
+	}
+	// The key directory may be new (newAttempt made it): its own entry
+	// lives in the root.
+	if err := syncDir(filepath.Dir(a.keyDir)); err != nil {
+		return "", err
+	}
 	gen := filepath.Join(a.keyDir, GenPrefix+newID())
 	if err := os.Rename(a.dir, gen); err != nil {
 		return "", err
 	}
-	return gen, syncDir(a.keyDir)
+	if err := syncDir(a.keyDir); err != nil {
+		// Visible but not durable: back to the attempt's name, which no
+		// reader takes and the caller's abort removes.
+		if rerr := os.Rename(gen, a.dir); rerr != nil {
+			_ = os.RemoveAll(gen)
+		}
+		return "", err
+	}
+	return gen, nil
 }
 
 // Harvest copies the tree at src (a pod's download volume, read from the
@@ -658,7 +678,7 @@ func ApplyMeta(dst string, m Manifest) error {
 				uid = -1
 			}
 			if err := unix.Lchown(p, uid, e.GID); err != nil {
-				return fmt.Errorf("%w: %s: %v", ErrOwner, e.Path, err)
+				return fmt.Errorf("%w: %s: %w", ErrOwner, e.Path, err)
 			}
 		}
 		if e.Type != TypeSymlink {
@@ -684,12 +704,12 @@ func ApplyMeta(dst string, m Manifest) error {
 				uid = -1
 			}
 			if err := unix.Chown(dst, uid, r.GID); err != nil {
-				return fmt.Errorf("%w: the volume: %v", ErrOwner, err)
+				return fmt.Errorf("%w: the volume: %w", ErrOwner, err)
 			}
 		}
 		if st.Mode&0o7777 != r.Mode {
 			if err := unix.Chmod(dst, r.Mode); err != nil {
-				return fmt.Errorf("%w: the volume's mode: %v", ErrOwner, err)
+				return fmt.Errorf("%w: the volume's mode: %w", ErrOwner, err)
 			}
 		}
 		// Its mtime only matters to nothing the engine does; a volume the
@@ -862,7 +882,9 @@ func (s *Store) Usage() (int64, error) {
 			}
 			return err
 		}
-		if d.IsDir() && strings.HasPrefix(d.Name(), AttemptPrefix) {
+		// Attempts are directly in a key directory; a model directory
+		// deeper in a tree may have any name.
+		if d.IsDir() && strings.HasPrefix(d.Name(), AttemptPrefix) && filepath.Dir(filepath.Dir(p)) == filepath.Clean(s.Root) {
 			return filepath.SkipDir
 		}
 		if p == s.Root {
@@ -918,7 +940,8 @@ func writeSynced(p string, b []byte) error {
 	return f.Close()
 }
 
-func syncDir(p string) error {
+// syncDir flushes directory p's entries to disk; a test replaces it.
+var syncDir = func(p string) error {
 	f, err := os.Open(p)
 	if err != nil {
 		return err
