@@ -305,6 +305,14 @@ func TestSingleFlightARestartedAgentKeepsItsPodsLease(t *testing.T) {
 	}
 	a.downloadedLive(t, pa, map[string]string{"w.bin": "half"})
 
+	// The old agent is gone: its renewals stop, so only the new one can
+	// renew the Lease below. A renewal in flight lands within a tick.
+	a.c.mu.Lock()
+	old := a.c.flights[pa.UID]
+	a.c.mu.Unlock()
+	old.cancel()
+	time.Sleep(2 * a.c.leaseDuration / 6)
+
 	// A new controller for node a: same disk, no memory.
 	a2 := newFlightNode(t, kube, "a", urls)
 	a2.c.store, a2.c.podsRoot, a2.c.podsWrite = a.c.store, a.c.podsRoot, a.c.podsWrite
@@ -516,5 +524,184 @@ func TestSingleFlightStreamedNodesKeepACopy(t *testing.T) {
 	gen, m, _ := b.c.store.Latest(keyOf(pb))
 	if err := modelcache.Seed(gen, m, t.TempDir()); err != nil {
 		t.Fatalf("seeding from b's copy: %v", err)
+	}
+}
+
+// A node can have two waiting pods of a key; only the first is its relay.
+// A pod told to stream from the other gets no bytes from the relay's
+// volume under the other's name: the request names its pod, and the node
+// refuses it at once, so the pod picks another source.
+func TestSingleFlightARemoteReadIsServedOnlyByThePodItNames(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	urls := map[string]string{}
+	b, c := newFlightNode(t, kube, "b", urls), newFlightNode(t, kube, "c", urls)
+	key := "0123456789abcdef0123456789abcdef"
+	vol := t.TempDir()
+	write(t, vol, "w.bin", "the relay's bytes")
+	b.c.mu.Lock()
+	b.c.liveSources[key] = newLiveSource(vol, "ub1", b.c.timing)
+	b.c.mu.Unlock()
+	ctx := context.Background()
+
+	v, err := c.c.clientFor(key, "b/ub2").View(ctx)
+	if err != nil || v.State != liveFailed {
+		t.Fatalf("view of b/ub2 = %+v, %v; want failed at once, not b/ub1's volume", v, err)
+	}
+	if r, err := c.c.clientFor(key, "b/ub2").Open(ctx, "w.bin"); err == nil {
+		r.Close()
+		t.Fatal("served b/ub1's file to a reader of b/ub2")
+	}
+	if v, err := c.c.clientFor(key, "b/ub1").View(ctx); err != nil || v.UID != "ub1" || v.State != liveDownloading {
+		t.Fatalf("view of b/ub1 = %+v, %v; want its source", v, err)
+	}
+}
+
+// The holder published a copy and its pod left: a stream that loses it
+// copies the published copy, checked against its manifest, instead of
+// trying the departed holder until its deadline.
+func TestSingleFlightAStreamCopiesThePublishedCopyWhenTheHolderLeaves(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	urls := map[string]string{}
+	a, b := newFlightNode(t, kube, "a", urls), newFlightNode(t, kube, "b", urls)
+	pa, pb := flightPod(t, "pa", "a", "ua"), flightPod(t, "pb", "b", "ub")
+	addPod(t, kube, pa)
+	addPod(t, kube, pb)
+	emptyVolumes(t, map[*mcNode]*corev1.Pod{a: pa, b: pb})
+	tickAll(a, b)
+	if a.plan(pa) != modelcache.PlanDownload || b.plan(pb) != modelcache.PlanWait {
+		t.Fatalf("plans %q %q", a.plan(pa), b.plan(pb))
+	}
+	files := map[string]string{"model/w-1.bin": "weights one", "model/w-2.bin": "weights two"}
+	a.downloadedLive(t, pa, map[string]string{"model/w-1.bin": "weights one"})
+	mcEventually(t, "b streams", func() bool {
+		tickAll(a, b)
+		_, err := os.Stat(filepath.Join(b.volume(pb, "ngc-models"), "model", "w-1.bin"))
+		return err == nil
+	})
+	// a's download ends and a publishes its copy, then a's pod leaves
+	// before b's stream has the final manifest.
+	a.downloadedLive(t, pa, map[string]string{"model/w-2.bin": "weights two"})
+	key := keyOf(pa)
+	gen, err := a.c.store.Harvest(key, a.volume(pa, "ngc-models"), modelcache.Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.c.register(context.Background(), key, filepath.Base(gen)); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.CoreV1().Pods(pa.Namespace).Delete(context.Background(), pa.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	tickAll(a)
+	mcEventually(t, "b done from the published copy", func() bool {
+		tickAll(b)
+		return b.marker(pb, modelcache.DoneFile(string(pb.UID)))
+	})
+	assertTree(t, b.volume(pb, "ngc-models"), files)
+}
+
+// promoteFixture is a waiting pod on node a that has just taken the
+// Lease.
+func promoteFixture(t *testing.T) (*mcNode, *flight, *fake.Clientset) {
+	t.Helper()
+	kube := fake.NewSimpleClientset()
+	a := newFlightNode(t, kube, "a", map[string]string{})
+	key := "0123456789abcdef0123456789abcdef"
+	vol := t.TempDir()
+	write(t, vol, "w.bin", "streamed so far")
+	f := &flight{key: key, identity: "a/ua", uid: "ua", role: roleFollower, vol: vol, src: newLiveSource(vol, "ua", a.c.timing), cancel: func() {}}
+	a.c.track(f)
+	if got, _, err := a.c.acquire(context.Background(), key, f.identity); !got || err != nil {
+		t.Fatalf("acquire: %v %v", got, err)
+	}
+	if err := os.MkdirAll(a.c.store.KeyDir(key), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return a, f, kube
+}
+
+func leaseHolder(kube *fake.Clientset, key string) string {
+	l, err := kube.CoordinationV1().Leases(mcNS).Get(context.Background(), leaseName(key), metav1.GetOptions{})
+	if err != nil || l.Spec.HolderIdentity == nil {
+		return ""
+	}
+	return *l.Spec.HolderIdentity
+}
+
+// A takeover whose volume cannot be emptied releases the Lease: nobody
+// would renew or serve it, and the other pods would wait out its expiry.
+func TestSingleFlightATakeoverThatCannotEmptyTheVolumeReleasesTheLease(t *testing.T) {
+	a, f, kube := promoteFixture(t)
+	locked := filepath.Join(f.vol, "locked")
+	write(t, locked, "x.bin", "x")
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	a.c.promote(context.Background(), f, a.c.log)
+	if h := leaseHolder(kube, f.key); h == f.identity {
+		t.Fatal("the Lease is still held by a pod that cannot download")
+	}
+	if a.plan(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: f.uid, Labels: map[string]string{webhook.ModelCacheKeyLabel: f.key}}}) == modelcache.PlanDownload {
+		t.Fatal("told to download into a volume that was not emptied")
+	}
+}
+
+// A pod that left the node between taking the Lease and its promotion is
+// not made the holder: the Lease is released and no flight is revived.
+func TestSingleFlightATakeoverOfAPodThatLeftReleasesTheLease(t *testing.T) {
+	a, f, kube := promoteFixture(t)
+	a.c.endFlights(context.Background(), map[types.UID]bool{}) // the pod is gone
+	if leaseHolder(kube, f.key) != f.identity {
+		t.Fatal("fixture: endFlights released a follower's Lease")
+	}
+	a.c.promote(context.Background(), f, a.c.log)
+	if h := leaseHolder(kube, f.key); h == f.identity {
+		t.Fatal("the Lease is held for a pod that left the node")
+	}
+	a.c.mu.Lock()
+	revived := a.c.flights[f.uid]
+	a.c.mu.Unlock()
+	if revived != nil {
+		t.Fatalf("a flight %+v was registered for a pod that left", revived)
+	}
+}
+
+// After an agent restart its flights are forgotten, so a plan written
+// before the restart for a pod that has since left would stay and pin its
+// key against eviction. Each tick removes the plans of pods no longer on
+// the node, and keeps those of pods still there.
+func TestSingleFlightATickRemovesThePlansOfPodsThatLeft(t *testing.T) {
+	kube := fake.NewSimpleClientset()
+	a := newFlightNode(t, kube, "a", map[string]string{})
+	p := flightPod(t, "pa", "a", "ua")
+	addPod(t, kube, p)
+	emptyVolumes(t, map[*mcNode]*corev1.Pod{a: p})
+	other := "0123456789abcdef0123456789abcdef"
+	const gone = "0f1e2d3c-4b5a-4968-8776-655443322110"
+	for _, k := range []string{keyOf(p), other} {
+		dir := a.c.store.KeyDir(k)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := modelcache.WritePlan(dir, gone, modelcache.PlanWait); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeMarker(dir, modelcache.DoneFile(gone), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.c.tick(context.Background())
+	for _, k := range []string{keyOf(p), other} {
+		dir := a.c.store.KeyDir(k)
+		if plans := modelcache.Plans(dir); len(plans) > 0 && !(k == keyOf(p) && len(plans) == 1 && plans[0] == string(p.UID)) {
+			t.Fatalf("key %s keeps plans %v; want only those of pods on the node", k, plans)
+		}
+		if _, err := os.Stat(filepath.Join(dir, modelcache.DoneFile(gone))); !os.IsNotExist(err) {
+			t.Fatalf("key %s keeps the done marker of a pod that left", k)
+		}
+	}
+	if a.plan(p) != modelcache.PlanDownload {
+		t.Fatalf("the plan of the pod on the node is %q; want it kept", a.plan(p))
 	}
 }

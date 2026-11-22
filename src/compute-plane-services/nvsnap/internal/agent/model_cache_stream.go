@@ -97,6 +97,8 @@ type liveSource struct {
 	finalAt map[string]modelcache.LiveEntry // file -> its stat in the final manifest
 	queue   chan modelcache.LiveEntry       // settled files to hash, bounded
 	workers sync.Once
+	hashers sync.WaitGroup // the hash workers, which end with the source
+	closed  bool           // queue is closed: the source ended
 }
 
 type observed struct {
@@ -146,9 +148,12 @@ func (s *liveSource) view() liveView {
 			e.SHA256 = h.sum
 			continue
 		}
-		if now.Sub(o.since) >= s.timing.settle && modelcache.Filled(*e) && !s.hashing[e.Path] {
+		// Checked under the lock the shutdown takes: the source may have
+		// ended since the state was read above.
+		if !s.closed && now.Sub(o.since) >= s.timing.settle && modelcache.Filled(*e) && !s.hashing[e.Path] {
 			s.workers.Do(func() {
 				for i := 0; i < 2; i++ {
+					s.hashers.Add(1)
 					go s.hashWorker()
 				}
 			})
@@ -164,9 +169,16 @@ func (s *liveSource) view() liveView {
 	return v
 }
 
-// hashWorker hashes queued files; two run per source, for its lifetime.
+// hashWorker hashes queued files; two run per source, until it ends.
 func (s *liveSource) hashWorker() {
+	defer s.hashers.Done()
 	for e := range s.queue {
+		s.mu.Lock()
+		ended := s.closed
+		s.mu.Unlock()
+		if ended {
+			continue // drain: nothing reads a hash once the source ended
+		}
 		sum, err := s.hashNow(e)
 		s.mu.Lock()
 		delete(s.hashing, e.Path)
@@ -277,6 +289,7 @@ func (s *liveSource) finalize(fp string) error {
 	s.mu.Lock()
 	s.final, s.finalAt, s.state = &m, at, liveDone
 	s.mu.Unlock()
+	s.shutdown()
 	return nil
 }
 
@@ -297,14 +310,30 @@ func (s *liveSource) setDone(m modelcache.Manifest) {
 	s.mu.Lock()
 	s.final, s.finalAt, s.state = &m, at, liveDone
 	s.mu.Unlock()
+	s.shutdown()
 }
 
+// fail ends the source as failed, unless it is done. Every path that
+// stops serving a source fails it, so its hash workers end too.
 func (s *liveSource) fail() {
 	s.mu.Lock()
 	if s.state == liveDownloading {
 		s.state = liveFailed
 	}
 	s.mu.Unlock()
+	s.shutdown()
+}
+
+// shutdown ends the hash workers once the source is done or failed: no
+// more files are queued, and the workers drain the queue and return. It
+// is idempotent.
+func (s *liveSource) shutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.closed = true
+		close(s.queue)
+	}
 }
 
 // open serves a file of the volume. Once done, only a file of the final
@@ -494,6 +523,12 @@ func (s *streamer) followRenames(root *os.Root, at map[string]modelcache.LiveEnt
 			continue
 		}
 		if _, taken := s.have[to]; taken {
+			continue
+		}
+		if !s.intact(old, c) {
+			// The copy changed since it was recorded: its recorded digest
+			// no longer describes it. Forget it; the file is copied again.
+			delete(s.have, old)
 			continue
 		}
 		if err := root.MkdirAll(path.Dir(to), 0o755); err != nil {
@@ -750,7 +785,7 @@ func applyMetaRoot(root *os.Root, dst string, m modelcache.Manifest) error {
 			return err
 		}
 		t := time.Unix(0, e.Mtime)
-		if err := root.Chtimes(e.Path, t, t); err != nil {
+		if err := rootChtimes(root, e.Path, t, t); err != nil {
 			return err
 		}
 	}
@@ -762,10 +797,15 @@ func applyMetaRoot(root *os.Root, dst string, m modelcache.Manifest) error {
 			return err
 		}
 		t := time.Unix(0, r.Mtime)
-		_ = root.Chtimes(".", t, t)
+		if err := rootChtimes(root, ".", t, t); err != nil {
+			return err
+		}
 	}
 	return nil
 }
+
+// rootChtimes sets a time beneath an os.Root; a test makes it fail.
+var rootChtimes = (*os.Root).Chtimes
 
 // specialBits maps setuid, setgid and sticky from a stat mode to Go's.
 func specialBits(mode uint32) os.FileMode {

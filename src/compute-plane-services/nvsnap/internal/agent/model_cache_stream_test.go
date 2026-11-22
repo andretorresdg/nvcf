@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -191,23 +192,86 @@ func TestStreamEndsWithTheFinalTreeAfterRewritesAndDeletes(t *testing.T) {
 	assertTree(t, dst, map[string]string{"keep.bin": "v2-longer"})
 }
 
+// copiedPass runs one copy pass of every file at src, as a stream's pass
+// does, and returns once the streamer has recorded each copy.
+func copiedPass(t *testing.T, s *streamer, src string) {
+	t.Helper()
+	root, err := os.OpenRoot(s.dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if s.have == nil {
+		s.have, s.first = map[string]copied{}, map[string]observed{}
+	}
+	ents, err := modelcache.ScanLive(src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var todo []modelcache.LiveEntry
+	for _, e := range ents {
+		if e.Type == modelcache.TypeFile {
+			todo = append(todo, e)
+		}
+	}
+	if err := s.copyAll(context.Background(), root, todo, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The source's final manifest is the only truth: a copy whose bytes do
 // not match it is copied again.
 func TestStreamRecopiesAFileWhoseCopyDoesNotMatchTheFinalManifest(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	ls := newLiveSource(src, "uid-holder", fastStream())
-	done, _ := runStream(t, localClient{ls}, dst)
 	write(t, src, "w.bin", "right")
-	waitCopied(t, dst, "w.bin")
+	s := &streamer{client: localClient{ls}, dst: dst, timing: fastStream()}
+	copiedPass(t, s, src) // the copy is recorded before it is corrupted
 	// Corrupt the stream's copy behind its back.
 	if err := os.WriteFile(filepath.Join(dst, "w.bin"), []byte("wrong"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	finish(t, ls)
-	if err := waitDone(t, done); err != nil {
+	if err := s.run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	assertTree(t, dst, map[string]string{"w.bin": "right"})
+}
+
+// A copy changed after it was recorded, whose source file is then renamed:
+// the rename must not carry the changed copy to the new path and record it
+// as good. The end has the source's bytes.
+func TestStreamDoesNotCarryAChangedCopyAcrossARename(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	ls := newLiveSource(src, "uid-holder", fastStream())
+	write(t, src, ".incomplete/w.bin", "good")
+	s := &streamer{client: localClient{ls}, dst: dst, timing: fastStream()}
+	copiedPass(t, s, src)
+	// The copy changes (same size), then the downloader renames the source.
+	if err := os.WriteFile(filepath.Join(dst, ".incomplete", "w.bin"), []byte("oops"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(src, ".incomplete", "w.bin"), filepath.Join(src, "w.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(src, ".incomplete")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	ents, err := modelcache.ScanLive(src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.sync(context.Background(), root, ents)
+	finish(t, ls)
+	if err := s.run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertTree(t, dst, map[string]string{"w.bin": "good"})
 }
 
 func TestStreamFailsWhenTheSourceFails(t *testing.T) {
@@ -431,9 +495,86 @@ func TestStreamStopsMidPassWhenTheHelperDownloads(t *testing.T) {
 			todo = append(todo, e)
 		}
 	}
-	_ = s.copyAll(context.Background(), root, todo, false)
-	if n := c.opens.Load(); n > 3+streamParallel {
-		t.Fatalf("copied %d of 40 files after the helper said it downloads", n)
+	if err := s.copyAll(context.Background(), root, todo, false); !errors.Is(err, errHelperDownloads) {
+		t.Fatalf("copyAll = %v; want %v", err, errHelperDownloads)
+	}
+	// The guard allowed exactly three files: three opens, three copies.
+	if n := c.opens.Load(); n != 3 {
+		t.Fatalf("opened %d of 40 files; want the 3 allowed before the helper said it downloads", n)
+	}
+	if len(s.have) != 3 {
+		t.Fatalf("recorded %d copies; want 3", len(s.have))
+	}
+}
+
+// A source that ends (done or failed) stops its hash workers: they and
+// what they hold do not outlive it.
+func TestLiveSourceStopsItsHashWorkersWhenItEnds(t *testing.T) {
+	for _, end := range []struct {
+		name string
+		do   func(*testing.T, *liveSource)
+	}{
+		{"failed", func(_ *testing.T, ls *liveSource) { ls.fail() }},
+		{"done", func(t *testing.T, ls *liveSource) { finish(t, ls) }},
+	} {
+		t.Run(end.name, func(t *testing.T) {
+			src := t.TempDir()
+			write(t, src, "w.bin", "weights")
+			ls := newLiveSource(src, "uid-holder", fastStream())
+			// Views a settle apart start the workers and hash the file.
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				hashed := false
+				for _, e := range ls.view().Entries {
+					hashed = hashed || (e.Path == "w.bin" && e.SHA256 != "")
+				}
+				if hashed {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the file was never hashed")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			end.do(t, ls)
+			stopped := make(chan struct{})
+			go func() { ls.hashers.Wait(); close(stopped) }()
+			select {
+			case <-stopped:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the hash workers outlived their source")
+			}
+			_ = ls.view() // never sends on the closed queue
+		})
+	}
+}
+
+// A failure to give the volume itself its recorded mtime fails the end of
+// the stream, as it does for every other entry: the pod must not start on
+// a volume that does not match the manifest.
+func TestApplyMetaReportsTheVolumesMtimeFailure(t *testing.T) {
+	dst := t.TempDir()
+	write(t, dst, "w.bin", "w")
+	root, err := os.OpenRoot(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	broken := errors.New("chtimes refused")
+	orig := rootChtimes
+	rootChtimes = func(r *os.Root, name string, a, m time.Time) error {
+		if name == "." {
+			return broken
+		}
+		return orig(r, name, a, m)
+	}
+	defer func() { rootChtimes = orig }()
+	m := modelcache.Manifest{
+		Root:    &modelcache.Entry{Path: ".", Type: modelcache.TypeDir, Mode: 0o755, UID: os.Getuid(), GID: os.Getgid()},
+		Entries: []modelcache.Entry{{Path: "w.bin", Type: modelcache.TypeFile, Mode: 0o640, UID: os.Getuid(), GID: os.Getgid()}},
+	}
+	if err := applyMetaRoot(root, dst, m); !errors.Is(err, broken) {
+		t.Fatalf("applyMetaRoot = %v; want the volume's chtimes failure", err)
 	}
 }
 

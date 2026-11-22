@@ -253,6 +253,7 @@ func (c *nodeModelCache) tick(ctx context.Context) {
 		}
 	}
 	c.endFlights(ctx, live)
+	c.removeStalePlans(live)
 	c.evict(ctx, 0)
 }
 
@@ -577,10 +578,18 @@ func (c *nodeModelCache) getJSON(ctx context.Context, u string, v any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("peer answered %s", resp.Status)
+		return &peerStatusError{code: resp.StatusCode, status: resp.Status}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 256<<20)).Decode(v)
 }
+
+// peerStatusError is a peer's answer other than 200.
+type peerStatusError struct {
+	code   int
+	status string
+}
+
+func (e *peerStatusError) Error() string { return "peer answered " + e.status }
 
 // harvest copies a pod's finished download volume into the cache.
 func (c *nodeModelCache) harvest(ctx context.Context, pod *corev1.Pod, d webhook.ModelCacheDownload, finishedAt time.Time, fingerprint string) {

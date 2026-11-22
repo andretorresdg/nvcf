@@ -214,18 +214,20 @@ measured with single flight:
 | A streamed file fails its hash at the end | It is copied again from the source's final tree. A second mismatch fails the stream, and the pod downloads. |
 | A stream does not finish within 5 hours, or starts over 20 times | It stops before the helper's own 6-hour bound, so it never writes into a volume the helper has given up on. The pod downloads. |
 | The holder's Lease update conflicts (streaming pods record their sources on it) | The renewal is retried; only another holder ends it. |
-| The holder published a copy, and a stream fails | No takeover: a new download would repeat a published copy. The stream retries until its deadline. |
+| The holder published a copy, and a stream fails | No takeover: a new download would repeat a published copy. The stream copies the published copy from a node the sources ConfigMap lists, through the routes a fetch from a peer uses, and checks every file against that copy's manifest. If no listed node serves it, the pod downloads. |
+| A takeover cannot empty the volume, or the pod left the node before it was promoted | The new holder releases the Lease at once, so another waiting pod can take it without waiting for it to expire. |
 | Agent restarts on a streaming node | The heartbeat goes stale, and the helper downloads. Before writing the `download` plan, the agent empties the volume it was writing. The plan is written only after that, so the helper downloads into an empty volume. |
 | No plan within 60 s (agent down) | The pod downloads, as without single flight. |
 | Lease API unavailable | No election. Each pod downloads, as today. |
-| Eviction | A key directory with plan files is never evicted: a waiting init has it mounted. |
+| Eviction | A key directory with plan files is never evicted: a waiting init has it mounted. Each tick removes the plans of pods no longer on the node, so a plan left from before an agent restart does not pin its key. |
 
 ## 6. Security
 
 - The live routes need the same agent authentication as the cache's peer routes. The cache stays off unless
   `--auth-mode=required`.
 - A source serves only the volume of a pod on its node whose key it computed from that pod's spec, never from a
-  label. A pod cannot have its volume served under another tenant's or another model's key.
+  label. Each live request names the pod it reads (`uid`). A node whose source for the key is another pod's volume
+  answers 410, and the reader picks another source, so feed counts and relay depth stay with the pod that sends. A pod cannot have its volume served under another tenant's or another model's key.
 - Paths are opened by the `openat` walk with no symlink followed. FIFOs and devices are refused. After `done`, only
   manifest files are served, and only while unchanged.
 - A streaming node trusts only the final manifest, and checks every byte against it before writing `.done`.

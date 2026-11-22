@@ -90,7 +90,7 @@ func newMCNode(t *testing.T, kube *fake.Clientset, node string, urls map[string]
 	peer := func(_ context.Context, n string) (string, error) { return urls[n], nil }
 	c := newNodeModelCache(cfg, kube, node, mcNS, nil, 0, peer, logrus.New())
 	c.podsRoot = t.TempDir()
-	c.client = http.DefaultClient
+	c.client = &http.Client{} // its own: a test may set its timeout
 	c.statfs = func(string) (int64, int64, error) { return 100 << 30, 90 << 30, nil }
 	r := mux.NewRouter()
 	r.Use(pathVarGuard)

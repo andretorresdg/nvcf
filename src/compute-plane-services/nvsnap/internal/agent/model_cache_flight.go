@@ -147,7 +147,7 @@ func (c *nodeModelCache) flightPod(ctx context.Context, pod *corev1.Pod, d webho
 		// This agent restarted while its pod downloads: keep the Lease,
 		// or it expires into a second download.
 		log.Info("model cache: single flight: this pod still holds the download; keeping it")
-		c.becomeHolder(ctx, d.Key, identity, pod.UID, vol, log)
+		c.becomeHolder(ctx, d.Key, identity, pod.UID, vol, nil, log)
 		return true
 	}
 	if !dirEmpty(vol) || c.downloadingOnItsOwn(pod) {
@@ -161,7 +161,7 @@ func (c *nodeModelCache) flightPod(ctx context.Context, pod *corev1.Pod, d webho
 		return true
 	}
 	if got {
-		c.becomeHolder(ctx, d.Key, identity, pod.UID, vol, log)
+		c.becomeHolder(ctx, d.Key, identity, pod.UID, vol, nil, log)
 		return true
 	}
 	c.becomeFollower(ctx, d.Key, identity, pod.UID, vol, holder, log)
@@ -179,11 +179,21 @@ func dirEmpty(dir string) bool {
 	return err == nil && len(ents) == 0
 }
 
-func (c *nodeModelCache) becomeHolder(ctx context.Context, key, identity string, uid types.UID, vol string, log logrus.FieldLogger) {
+// becomeHolder makes the pod the key's holder. With prev, the pod's
+// flight until now, it does so only while prev is still the pod's flight
+// (checked and replaced under one lock, so endFlights cannot remove it in
+// between), and reports false otherwise.
+func (c *nodeModelCache) becomeHolder(ctx context.Context, key, identity string, uid types.UID, vol string, prev *flight, log logrus.FieldLogger) bool {
 	src := newLiveSource(vol, string(uid), c.timing)
 	fctx, cancel := context.WithCancel(ctx)
 	f := &flight{key: key, identity: identity, uid: uid, role: roleHolder, vol: vol, src: src, cancel: cancel}
 	c.mu.Lock()
+	if prev != nil && c.flights[uid] != prev {
+		c.mu.Unlock()
+		cancel()
+		src.shutdown()
+		return false
+	}
 	c.liveSources[key] = src
 	c.flights[uid] = f
 	c.mu.Unlock()
@@ -192,6 +202,7 @@ func (c *nodeModelCache) becomeHolder(ctx context.Context, key, identity string,
 	}
 	log.Info("model cache: single flight: this pod downloads; others stream from it")
 	go c.renewLoop(fctx, f)
+	return true
 }
 
 // holderStep finalizes once the helper signals its download is over.
@@ -509,7 +520,7 @@ func (c *nodeModelCache) clientFor(key, source string) liveClient {
 			return localClient{src}
 		}
 	}
-	return &httpLiveClient{c: c, node: node, key: key}
+	return &httpLiveClient{c: c, node: node, uid: uid, key: key}
 }
 
 func (c *nodeModelCache) becomeFollower(ctx context.Context, key, identity string, uid types.UID, vol, holder string, log logrus.FieldLogger) {
@@ -536,10 +547,10 @@ func (c *nodeModelCache) becomeFollower(ctx context.Context, key, identity strin
 // follow streams into the pod's volume until it is done, then marks it.
 // When the source fails it takes the Lease if it can (the pod downloads,
 // into its emptied volume), else streams from the new holder, keeping
-// what it copied: only the final manifest decides what stays.
+// what it copied: only the final manifest decides what stays. When the
+// holder published a copy, it copies that instead.
 func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, stopHB func(), log logrus.FieldLogger) {
 	defer stopHB()
-	keyDir := c.store.KeyDir(f.key)
 	// The helper may give up on its plan and download: never write then.
 	s := &streamer{dst: f.vol, timing: c.timing, mayWrite: func() bool { return !c.signalled(f) }}
 	deadline := time.Now().Add(c.followMax)
@@ -570,16 +581,7 @@ func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, s
 		cancel()
 		if err == nil {
 			done = true
-			if f.src != nil {
-				f.src.setDone(*s.final)
-			}
-			if ents, serr := modelcache.ScanLive(f.vol, modelCacheMaxEntries); serr == nil {
-				c.mu.Lock()
-				f.tree, f.treeAt = modelcache.Fingerprint(modelcache.Entries(ents)), time.Now()
-				c.mu.Unlock()
-			}
-			_ = writeMarker(keyDir, modelcache.DoneFile(string(f.uid)), "")
-			log.WithField("seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds())).Info("model cache: single flight: streamed; the pod starts")
+			c.streamed(f, s, start, log)
 			return
 		}
 		if ctx.Err() != nil {
@@ -594,15 +596,20 @@ func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, s
 			bad[source] = true
 			continue
 		}
-		if len(c.sources(ctx, f.key)) > 0 {
-			// The holder published a copy: do not download it again;
-			// try the holder's source until the deadline.
-			select {
-			case <-ctx.Done():
+		if peers := c.sources(ctx, f.key); len(peers) > 0 {
+			// The holder published a copy, and its stream is gone: do not
+			// download it again, nor wait on the holder. Copy the published
+			// copy from a node that lists it, checked against its manifest,
+			// as a fetch from a peer does. With none readable, the pod
+			// downloads.
+			start = time.Now()
+			if c.copyPublished(ctx, s, f.key, peers, deadline, log) {
+				done = true
+				c.streamed(f, s, start, log)
 				return
-			case <-time.After(c.timing.poll):
 			}
-			continue
+			log.Warn("model cache: single flight: no published copy could be read; the pod downloads")
+			return
 		}
 		got, h, aerr := c.acquire(ctx, f.key, f.identity)
 		if aerr != nil {
@@ -610,18 +617,7 @@ func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, s
 			return
 		}
 		if got {
-			// Stop writing, empty the volume, and only then tell the
-			// helper to download into it.
-			if err := emptyVolume(f.vol); err != nil {
-				log.WithError(err).Warn("model cache: single flight: emptying the volume failed; the pod downloads")
-				return
-			}
-			c.mu.Lock()
-			if c.liveSources[f.key] == f.src {
-				delete(c.liveSources, f.key)
-			}
-			c.mu.Unlock()
-			c.becomeHolder(context.WithoutCancel(ctx), f.key, f.identity, f.uid, f.vol, log)
+			c.promote(ctx, f, log)
 			return
 		}
 		if h == "" {
@@ -633,6 +629,66 @@ func (c *nodeModelCache) follow(ctx context.Context, f *flight, holder string, s
 			return
 		case <-time.After(c.timing.poll):
 		}
+	}
+}
+
+// streamed records a done stream into f's volume and tells the helper.
+func (c *nodeModelCache) streamed(f *flight, s *streamer, start time.Time, log logrus.FieldLogger) {
+	if f.src != nil {
+		f.src.setDone(*s.final)
+	}
+	if ents, serr := modelcache.ScanLive(f.vol, modelCacheMaxEntries); serr == nil {
+		c.mu.Lock()
+		f.tree, f.treeAt = modelcache.Fingerprint(modelcache.Entries(ents)), time.Now()
+		c.mu.Unlock()
+	}
+	_ = writeMarker(c.store.KeyDir(f.key), modelcache.DoneFile(string(f.uid)), "")
+	log.WithField("seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds())).Info("model cache: single flight: streamed; the pod starts")
+}
+
+// copyPublished ends s from a published copy of key on one of peers,
+// trying each in turn until the deadline. It reports whether s is done.
+func (c *nodeModelCache) copyPublished(ctx context.Context, s *streamer, key string, peers []string, deadline time.Time, log logrus.FieldLogger) bool {
+	for _, node := range peers {
+		s.client = &publishedClient{c: c, node: node, key: key}
+		sctx, cancel := context.WithDeadline(ctx, deadline)
+		log.WithField("source", node).Info("model cache: single flight: copying the published copy")
+		err := s.run(sctx)
+		cancel()
+		if err == nil {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) || errors.Is(err, errHelperDownloads) {
+			return false
+		}
+		log.WithError(err).WithField("source", node).Warn("model cache: single flight: copying the published copy failed")
+	}
+	return false
+}
+
+// promote makes f's pod the holder after it took the Lease: it stops the
+// pod's relay, empties its volume, and only then writes the download plan.
+// When the volume cannot be emptied, or f's flight ended meanwhile (its pod
+// left the node), it releases the Lease instead: nobody would renew or
+// serve it, and the other pods would wait out its expiry.
+func (c *nodeModelCache) promote(ctx context.Context, f *flight, log logrus.FieldLogger) {
+	bg := context.WithoutCancel(ctx)
+	if f.src != nil {
+		f.src.fail()
+		c.mu.Lock()
+		if c.liveSources[f.key] == f.src {
+			delete(c.liveSources, f.key)
+		}
+		c.mu.Unlock()
+	}
+	if err := emptyVolume(f.vol); err != nil {
+		log.WithError(err).Warn("model cache: single flight: emptying the volume failed; the pod downloads")
+		c.release(bg, f.key, f.identity)
+		return
+	}
+	if ctx.Err() != nil || !c.becomeHolder(bg, f.key, f.identity, f.uid, f.vol, f, log) {
+		log.Info("model cache: single flight: the pod left before it could take the download over")
+		c.release(bg, f.key, f.identity)
 	}
 }
 
@@ -686,6 +742,28 @@ func (c *nodeModelCache) endFlights(ctx context.Context, live map[types.UID]bool
 	}
 }
 
+// removeStalePlans removes the plans, and their markers, of pods no longer
+// on the node. endFlights does so only for the flights this agent knows,
+// and an agent that restarted knows none: a plan left from before would
+// pin its key against eviction for good. A plan of a pod still on the
+// node stays, so its waiting init keeps the key.
+func (c *nodeModelCache) removeStalePlans(live map[types.UID]bool) {
+	for _, k := range c.store.Keys() {
+		keyDir := c.store.KeyDir(k)
+		for _, uid := range modelcache.Plans(keyDir) {
+			if live[types.UID(uid)] {
+				continue
+			}
+			modelcache.RemovePlan(keyDir, uid)
+			for _, name := range []string{modelcache.FinalFile(uid), modelcache.DoneFile(uid)} {
+				if name != "" {
+					_ = os.Remove(filepath.Join(keyDir, name))
+				}
+			}
+		}
+	}
+}
+
 // Live routes. Behind the agent's token guard like every agent-to-agent
 // route, under a prefix the cache's own routes do not match.
 
@@ -705,6 +783,13 @@ func (c *nodeModelCache) liveSourceFor(w http.ResponseWriter, r *http.Request) *
 	c.mu.Unlock()
 	if src == nil {
 		http.NotFound(w, r)
+		return nil
+	}
+	// The reader names the pod it chose; this node's source may be another
+	// pod's volume (the node's first waiting pod is its only relay).
+	if uid := r.URL.Query().Get("uid"); uid != "" && uid != src.uid {
+		http.Error(w, "not this pod's source", http.StatusGone)
+		return nil
 	}
 	return src
 }
@@ -731,16 +816,25 @@ func (c *nodeModelCache) liveFileHandler(w http.ResponseWriter, r *http.Request)
 	_, _ = io.Copy(w, f)
 }
 
-// httpLiveClient reads a source on another node.
+// httpLiveClient reads a source on another node: the volume of the pod
+// uid, which every request names.
 type httpLiveClient struct {
-	c         *nodeModelCache
-	node, key string
-	fails     int
+	c              *nodeModelCache
+	node, uid, key string
+	fails          int
 }
 
 func (h *httpLiveClient) base(ctx context.Context) (string, error) {
 	b, err := h.c.peerURL(ctx, h.node)
 	return b + "/v1/model-cache-live/" + h.key, err
+}
+
+// query names the source's pod; the peer refuses a request for another.
+func (h *httpLiveClient) query() string {
+	if h.uid == "" {
+		return ""
+	}
+	return "uid=" + url.QueryEscape(h.uid)
 }
 
 func (h *httpLiveClient) View(ctx context.Context) (liveView, error) {
@@ -750,11 +844,19 @@ func (h *httpLiveClient) View(ctx context.Context) (liveView, error) {
 	var v liveView
 	b, err := h.base(ctx)
 	if err == nil {
+		if q := h.query(); q != "" {
+			b += "?" + q
+		}
 		err = h.c.getJSON(ctx, b, &v)
 	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		var se *peerStatusError
+		if errors.As(err, &se) && se.code == http.StatusGone {
+			// The node serves another pod's volume: no source here.
+			return liveView{State: liveFailed}, nil
+		}
 		// A source that is gone is a failed one, after a few polls.
 		if h.fails++; h.fails >= 5 {
 			return liveView{State: liveFailed}, nil
@@ -778,7 +880,11 @@ func (h *httpLiveClient) Open(ctx context.Context, rel string) (io.ReadCloser, e
 	if err != nil {
 		return fail(err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b+"/file?path="+url.QueryEscape(rel), nil)
+	u := b + "/file?path=" + url.QueryEscape(rel)
+	if q := h.query(); q != "" {
+		u += "&" + q
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fail(err)
 	}
@@ -804,4 +910,58 @@ func (b spanBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.end()
 	return err
+}
+
+// publishedClient reads a complete copy a node published, through the
+// routes a fetch from a peer uses. It is done from the start: its view is
+// the copy's manifest, and a streamer copies every file it does not hold
+// and checks it against that manifest.
+type publishedClient struct {
+	c         *nodeModelCache
+	node, key string
+	gen       string
+}
+
+func (p *publishedClient) View(ctx context.Context) (liveView, error) {
+	base, err := p.c.peerURL(ctx, p.node)
+	var pm modelPeerManifest
+	if err == nil {
+		err = p.c.getJSON(ctx, base+"/v1/model-cache/"+p.key, &pm)
+	}
+	if err == nil && (!strings.HasPrefix(pm.Gen, modelcache.GenPrefix) || !validPathSegmentOK(pm.Gen)) {
+		err = fmt.Errorf("peer named generation %q", pm.Gen)
+	}
+	if err != nil {
+		// A copy that cannot be read now is not waited for: the next node.
+		p.c.log.WithError(err).WithField("peer", p.node).Warn("model cache: single flight: the published copy is unavailable")
+		return liveView{State: liveFailed}, nil
+	}
+	p.gen = pm.Gen
+	m := pm.Manifest
+	return liveView{State: liveDone, Final: &m}, nil
+}
+
+func (p *publishedClient) Open(ctx context.Context, rel string) (io.ReadCloser, error) {
+	if p.gen == "" {
+		return nil, errors.New("model cache: no published generation chosen")
+	}
+	base, err := p.c.peerURL(ctx, p.node)
+	if err != nil {
+		return nil, err
+	}
+	u := base + "/v1/model-cache/" + p.key + "/" + p.gen + "/file?path=" + url.QueryEscape(rel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+	resp, err := p.c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("peer answered %s for %s", resp.Status, rel)
+	}
+	return resp.Body, nil
 }
