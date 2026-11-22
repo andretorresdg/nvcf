@@ -35,6 +35,18 @@ type LiveEntry struct {
 	Dev   uint64 `json:"dev"`
 	Ino   uint64 `json:"ino"`
 	Ctime int64  `json:"ctime"`
+	// Allocated is the bytes the filesystem holds for the file. A
+	// downloader that sizes a file first and fills it in later leaves it
+	// short of Size until it is full.
+	Allocated int64 `json:"allocated"`
+}
+
+// Filled reports whether a file's blocks cover its size: one sized ahead
+// and still being filled is not. A filesystem that compresses reports
+// fewer blocks than bytes; its files then count as filled only at the end
+// of the download, when a stream copies whatever is left.
+func Filled(e LiveEntry) bool {
+	return e.Type != TypeFile || e.Allocated >= e.Size
 }
 
 // Entries returns the Entries of live, change times kept, for Fingerprint.
@@ -64,7 +76,7 @@ func ScanLive(root string, max int) ([]LiveEntry, error) {
 	if err := unix.Lstat(root, &rst); err != nil {
 		return nil, err
 	}
-	out := []LiveEntry{{Entry: r, Dev: uint64(rst.Dev), Ino: rst.Ino, Ctime: rst.Ctim.Nano()}}
+	out := []LiveEntry{{Entry: r, Dev: uint64(rst.Dev), Ino: rst.Ino, Ctime: rst.Ctim.Nano(), Allocated: rst.Blocks * 512}}
 	err = walkNoFollow(root, max, func(n node) error {
 		var target string
 		if n.st.Mode&unix.S_IFMT == unix.S_IFLNK {
@@ -78,7 +90,7 @@ func ScanLive(root string, max int) ([]LiveEntry, error) {
 		if err != nil {
 			return err
 		}
-		out = append(out, LiveEntry{Entry: e, Dev: uint64(n.st.Dev), Ino: n.st.Ino, Ctime: n.st.Ctim.Nano()})
+		out = append(out, LiveEntry{Entry: e, Dev: uint64(n.st.Dev), Ino: n.st.Ino, Ctime: n.st.Ctim.Nano(), Allocated: n.st.Blocks * 512})
 		return nil
 	})
 	return out, err

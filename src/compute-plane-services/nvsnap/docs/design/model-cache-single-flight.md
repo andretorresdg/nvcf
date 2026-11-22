@@ -128,7 +128,9 @@ there; if not, single flight stays off, and admission adds no plans. This adds n
 by an ordinary harvest of that volume.
 
 - It polls `live` every 2 s. A file is copied once its size, mtime and change time have not changed for 10 s, and
-  copied again whenever they change. It is written to a temporary name and renamed into place, hashed as it is
+  its allocated blocks cover its size, and it is copied again whenever they change. The block rule matters: the
+  registry's client sizes each file first and fills it in, sparse, so a file that pauses half-filled would otherwise
+  look settled and be copied twice (seen on a cluster, a 1.56 TB download, before the rule). It is written to a temporary name and renamed into place, hashed as it is
   written.
 - A file that reappears under a new path with the same device and inode (a downloader's temporary name, renamed) is
   renamed locally, not copied again.

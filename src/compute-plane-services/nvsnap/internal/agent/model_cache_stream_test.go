@@ -295,3 +295,42 @@ func TestApplyMetaStaysInTheVolume(t *testing.T) {
 		t.Fatalf("a file outside the volume became %o", fi.Mode().Perm())
 	}
 }
+
+// A downloader that sizes a file first and fills it in later (as the
+// registry's client does, sparse): a half-filled file that pauses is not
+// settled. It is copied once, when full, not once half-empty and again.
+func TestStreamWaitsForAPreallocatedFileToFill(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	ls := newLiveSource(src, "uid-holder", fastStream())
+	c := &countingClient{liveClient: localClient{ls}}
+	done, _ := runStream(t, c, dst)
+	const size = 1 << 20
+	p := filepath.Join(src, "w.bin")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	half := make([]byte, size/2)
+	for i := range half {
+		half[i] = 'a'
+	}
+	if _, err := f.WriteAt(half, 0); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second) // paused, well past the settle time
+	if _, err := f.WriteAt(half, size/2); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	time.Sleep(700 * time.Millisecond)
+	finish(t, ls)
+	if err := waitDone(t, done); err != nil {
+		t.Fatal(err)
+	}
+	if n := c.opens.Load(); n != 1 {
+		t.Fatalf("the file was read %d times; want once, when full", n)
+	}
+}

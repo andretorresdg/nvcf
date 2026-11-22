@@ -135,7 +135,7 @@ func (s *liveSource) view() liveView {
 			e.SHA256 = h.sum
 			continue
 		}
-		if now.Sub(o.since) >= s.timing.settle && !s.hashing[e.Path] {
+		if now.Sub(o.since) >= s.timing.settle && modelcache.Filled(*e) && !s.hashing[e.Path] {
 			s.hashing[e.Path] = true
 			go s.hash(*e)
 		}
@@ -448,7 +448,7 @@ func (s *streamer) sync(ctx context.Context, root *os.Root, ents []modelcache.Li
 			s.first[p] = observed{e: e, since: now}
 			continue
 		}
-		if now.Sub(o.since) >= s.timing.settle {
+		if now.Sub(o.since) >= s.timing.settle && modelcache.Filled(e) {
 			todo = append(todo, e)
 		}
 	}
