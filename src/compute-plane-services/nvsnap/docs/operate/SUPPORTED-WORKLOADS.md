@@ -25,9 +25,9 @@ an error: it runs normally and starts cold, and the agent logs why. Each row giv
 | Prefill/decode disaggregation | Refused by both rows above (several groups, and NIXL's RDMA). The shared-companions check runs first (`sharedCompanionsBlockCapture`, before `capturePreflight` in `captureGroup`), so only its refusal is logged | the shared-companions line above; not the RDMA one | `captureGroup`, `internal/agent/criu_group.go` |
 | A Dynamo rank connected to no etcd or NATS in its namespace | Does not capture it: there is nothing to capture with it | `CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it` | `captureGroup`, `internal/agent/criu_group.go` |
 
-Releasing RDMA around a capture is in review: an RDMA verbs library that releases and re-creates NCCL's RDMA state
-(#3593), pause and resume for ModelExpress (#3524) and NIXL (#3552), and their pause checks with NCCL over InfiniBand
-(#3636). Until they merge, this page describes `main`. Even with them, ModelExpress and NIXL KV transfer in one process
+Releasing RDMA around a capture is in review in #3522: an RDMA verbs library that releases and re-creates NCCL's RDMA
+state, pause and resume for ModelExpress and NIXL, and their pause checks with NCCL over InfiniBand. Until it merges,
+this page describes `main`. Even with them, ModelExpress and NIXL KV transfer in one process
 stay unsupported: each pause trips on the other's RDMA.
 
 ## Restores that are refused
