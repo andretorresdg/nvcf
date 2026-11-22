@@ -145,7 +145,7 @@ func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int
 				Info("CRIU fallback: the record is of another process configuration; the pod's instance captures again")
 			reason = ""
 			if data[groupReconfiguredKey] == "" {
-				a.markReconfigured(ctx, key)
+				a.markReconfigured(ctx, key, ordinal, processConfig)
 			}
 		} else if reason != "" && data[groupReconfiguredKey] != "" && replaceableRecord(data, time.Now()) {
 			a.log.WithFields(logrus.Fields{"criuGroup": key, "state": data["state"], "reconfiguredAt": data[groupReconfiguredKey]}).
@@ -176,9 +176,13 @@ func otherConfiguration(data map[string]string, ordinal int, processConfig strin
 }
 
 // markReconfigured marks the failed group record of key (its instance's
-// through an alias) reconfigured. A failure to is logged: the pods that
-// see the record unmarked fall back as before.
-func (a *Agent) markReconfigured(ctx context.Context, key string) {
+// through an alias) reconfigured, if its slot for rank ordinal still holds
+// another process configuration than processConfig: a failure under the
+// library may have rewritten the record to processConfig since the caller
+// read it (markFailedConfiguration), and that configuration's pods must
+// keep falling back. A failure to mark is logged: the pods that see the
+// record unmarked fall back as before.
+func (a *Agent) markReconfigured(ctx context.Context, key string, ordinal int, processConfig string) {
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cm, err := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{})
@@ -192,6 +196,9 @@ func (a *Agent) markReconfigured(ctx context.Context, key string) {
 		case criuGroupStateFailed, criuGroupStateRestoreFailed, criuGroupStateGPUShareFailed:
 		default:
 			return nil // taken over meanwhile
+		}
+		if !otherConfiguration(cm.Data, ordinal, processConfig, time.Now()) {
+			return nil // the record now holds this pod's configuration
 		}
 		if cm.Data[groupReconfiguredKey] != "" {
 			return nil

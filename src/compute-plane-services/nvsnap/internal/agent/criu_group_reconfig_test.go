@@ -12,6 +12,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
@@ -278,5 +280,56 @@ func TestGPUShareFailureRecordsTheFailingConfiguration(t *testing.T) {
 	c0 := stamped(r0, "", suffix("c3"))
 	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(c0)); ok {
 		t.Fatalf("a third configuration falls back: %+v", fb)
+	}
+}
+
+// A failure under another configuration can rewrite the record between the
+// admission's read and its reconfigured mark: the record then holds the
+// admitted pod's own configuration. The mark must not land on it, or that
+// configuration's pods skip their fallback and start under the library
+// again until a capture replaces the record.
+func TestMarkReconfiguredRechecksTheFreshRecord(t *testing.T) {
+	a, cs := fallbackAgent(t)
+	ctx := context.Background()
+	suffix := func(v string) corev1.EnvVar { return corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: v} }
+	r0 := stsRank("eng-0", "0", "2", "sts-c", true)
+	r1 := stsRank("eng-1", "1", "2", "sts-c", true)
+	reconfigFallbackRecord(t, a, criuGroupStateGPUShareFailed, stamped(r0, "", suffix("a1")), stamped(r1, "", suffix("a1")))
+	b0, b1 := stamped(r0, "", suffix("b7")), stamped(r1, "", suffix("b7"))
+	name := criuGroupConfigMapName(fnKey(t, a))
+	ns := a.criuFailedNamespace()
+
+	// The admission's first read sees the record of a1; meanwhile a failure
+	// of b7 under the library rewrites it to b7 (markFailedConfiguration).
+	first := true
+	cs.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		get := action.(k8stesting.GetAction)
+		if !first || get.GetName() != name {
+			return false, nil, nil
+		}
+		first = false
+		obj, err := cs.Tracker().Get(corev1.SchemeGroupVersion.WithResource("configmaps"), ns, name)
+		if err != nil {
+			return true, nil, err
+		}
+		stale := obj.(*corev1.ConfigMap).DeepCopy()
+		fresh := stale.DeepCopy()
+		markFailedConfiguration(fresh.Data, b0, 0)
+		if err := cs.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), fresh, ns); err != nil {
+			return true, nil, err
+		}
+		return true, stale, nil
+	})
+
+	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, webhook.ProcessConfig(b0)); ok {
+		t.Fatalf("on the stale read, another configuration falls back: %+v", fb)
+	}
+	if at := getRecord(t, a, name)[groupReconfiguredKey]; at != "" {
+		t.Fatalf("the record of the admitted pod's own configuration was marked reconfigured (%s)", at)
+	}
+	for ord, p := range []*corev1.Pod{b0, b1} {
+		if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", ord, webhook.ProcessConfig(p)); !ok || fb.Reason != webhook.FallbackGPUShareFailed {
+			t.Fatalf("rank %d of the configuration that failed under the library: fallback %+v, %v; want %s", ord, fb, ok, webhook.FallbackGPUShareFailed)
+		}
 	}
 }
