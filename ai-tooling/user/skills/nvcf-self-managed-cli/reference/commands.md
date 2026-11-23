@@ -51,7 +51,7 @@ Full subcommand list. Always pair with [flags.md](flags.md) for global flags and
 
 ## Tasks
 
-Task commands require a task key and `NVCF_BASE_NVCT_URL` set to the NVCT gateway endpoint. The CLI reads the task key from `NVCF_NVCT_API_KEY`, or from `nvctApiKey` in the CLI state that `api-key generate` writes. It never uses `NVCF_API_KEY` or the admin token for task commands. If no task key is set, or the saved key has expired, task commands stop with "no valid task API key configured". Check `nvctApiKeyExpiration` in the state and regenerate with `api-key generate --for task --validate` if it is missing or expired. `NVCF_NVCT_API_KEY` takes precedence over the saved key and is sent without an expiration check, so an invalid or expired value fails with an authentication error from the server. Unset or replace it after regenerating.
+Task commands require a task key and the NVCT gateway endpoint, set as `base_nvct_url` in the CLI config or `NVCF_BASE_NVCT_URL`. The CLI reads the task key from `NVCF_NVCT_API_KEY`, or from `nvctApiKey` in the CLI state that `api-key generate` writes. It never uses `NVCF_API_KEY` or the admin token for task commands. If no task key is set, or the saved key has expired, task commands stop with "no valid task API key configured". Check `nvctApiKeyExpiration` in the state and regenerate with `api-key generate --for task --validate` if it is missing or expired. `NVCF_NVCT_API_KEY` takes precedence over the saved key and is sent without an expiration check, so an invalid or expired value fails with an authentication error from the server. Unset or replace it after regenerating.
 
 | Command | Purpose | Notes |
 |---|---|---|
