@@ -37,6 +37,7 @@ type fakeFabricMember struct {
 	verdicts []string
 	ins      []string
 	unlocks  []string
+	opens    []string
 }
 
 func (f *fakeFabricMember) Name() string { return f.name }
@@ -73,6 +74,37 @@ func (f *fakeFabricMember) Unlock(_ context.Context, verdict string) error {
 	f.unlocks = append(f.unlocks, verdict)
 	return nil
 }
+func (f *fakeFabricMember) Open(_ context.Context, token, verdict string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opens = append(f.opens, token+" "+verdict)
+	return nil
+}
+
+// holds reports the member's tool holds its launches at the resume until
+// the driver's open verdict (--sync-open).
+func (f *fakeFabricMember) holds() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reg = true
+	f.st.HoldsOpen = true
+}
+
+// resumed reports the member resumed, its launches held, under token.
+func (f *fakeFabricMember) resumed(token string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reg = true
+	f.st.HoldsOpen = true
+	f.st.Resumed = token
+}
+
+func (f *fakeFabricMember) opened() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.opens...)
+}
+
 func (f *fakeFabricMember) restored() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -352,18 +384,18 @@ func TestGPUShareArgs_FabricMap(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("suspend args = %v, want %v", got, want)
 	}
-	if got := gpushareSuspendArgs("/s", "", []int{7}); strings.Contains(strings.Join(got, " "), "fabric") {
-		t.Errorf("single-node suspend carries --fabric-map: %v", got)
+	if single := gpushareSuspendArgs("/s", "", []int{7}); strings.Contains(strings.Join(single, " "), "fabric") {
+		t.Errorf("single-node suspend carries --fabric-map: %v", single)
 	}
-	got = gpushareResumeArgs("/s/gpus", "/f", false, 0, []int{7})
+	got = gpushareResumeArgs("/s/gpus", "/f", false, 0, 0, []int{7})
 	want = []string{"--gpu-map", "/s/gpus", "--fabric-map", "/f", "resume", "7"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("resume args = %v, want %v", got, want)
 	}
-	if got := gpushareResumeArgs("", "", false, 0, []int{7}); !reflect.DeepEqual(got, []string{"resume", "7"}) {
-		t.Errorf("plain resume args = %v", got)
+	if plain := gpushareResumeArgs("", "", false, 0, 0, []int{7}); !reflect.DeepEqual(plain, []string{"resume", "7"}) {
+		t.Errorf("plain resume args = %v", plain)
 	}
-	got = gpushareResumeArgs("/s/gpus", "/f", true, 0, []int{7, 8})
+	got = gpushareResumeArgs("/s/gpus", "/f", true, 0, 0, []int{7, 8})
 	want = []string{"--hold-gate", "--gpu-map", "/s/gpus", "--fabric-map", "/f", "resume", "7", "8"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("held resume args = %v, want %v", got, want)
@@ -379,6 +411,7 @@ func fabricTestAgent(t *testing.T) (*Agent, *httptest.Server) {
 	r.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/verdict", a.fabricVerdictHandler).Methods("PUT")
 	r.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/in", a.fabricInHandler).Methods("PUT")
 	r.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/unlock", a.fabricUnlockHandler).Methods("PUT")
+	r.HandleFunc("/v1/gpushare/fabric/{session}/{namespace}/{pod}/open", a.fabricOpenHandler).Methods("PUT")
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return a, srv
@@ -976,4 +1009,223 @@ func TestDriveFabric_StalledMemberDoesNotHoldTheAbort(t *testing.T) {
 	if out := <-res; out.Went {
 		t.Errorf("outcome %+v: went with a stalled member", out)
 	}
+}
+
+// openDrive drives the open phase of an in-place group resume.
+func openDrive(members []fabricMember, deadline time.Duration) (*doneSet, chan fabricOutcome, context.CancelFunc) {
+	return startDriveOpts(members, fabricDriveOpts{Open: true, OpenDeadline: deadline, NoExchange: true})
+}
+
+// No member's launches go through until every member that holds them has
+// resumed; then each gets "open" for its own token, once.
+func TestDriveFabric_OpenOnceEveryMemberResumed(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	a.holds()
+	b.holds()
+	ds, res, cancel := openDrive([]fabricMember{a, b}, time.Minute)
+	defer cancel()
+	a.resumed("11-0")
+	time.Sleep(5 * fabricPollInterval)
+	if o := a.opened(); len(o) != 0 {
+		t.Fatalf("a got %v before b resumed: its launches would run into memory b has not bound", o)
+	}
+	b.resumed("22-0")
+	eventually(t, "open reaches both", func() bool { return len(a.opened()) == 1 && len(b.opened()) == 1 })
+	time.Sleep(3 * fabricPollInterval)
+	if !reflect.DeepEqual(a.opened(), []string{"11-0 open"}) || !reflect.DeepEqual(b.opened(), []string{"22-0 open"}) {
+		t.Errorf("a=%v b=%v; want each its own token, once", a.opened(), b.opened())
+	}
+	ds.set(0)
+	ds.set(1)
+	if out := <-res; !out.Opened || out.OpenAborted != "" {
+		t.Errorf("outcome = %+v, want opened", out)
+	}
+}
+
+// A member that does not report resumed by the deadline (counted from the
+// first marker) ends the wait: the others get "abort", which their tools
+// answer by opening anyway, and the outcome names it.
+func TestDriveFabric_OpenAbortsAtTheDeadline(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	a.holds()
+	b.holds()
+	const deadline = 600 * time.Millisecond
+	ds, res, cancel := openDrive([]fabricMember{a, b}, deadline)
+	defer cancel()
+	time.Sleep(deadline + 2*fabricPollInterval) // the deadline runs from the first marker, not the start
+	t0 := time.Now()
+	a.resumed("11-0")
+	eventually(t, "abort reaches a", func() bool { return len(a.opened()) == 1 })
+	if took := time.Since(t0); took < deadline {
+		t.Errorf("aborted %s after the first marker, before the %s deadline", took, deadline)
+	}
+	if o := a.opened(); !reflect.DeepEqual(o, []string{"11-0 abort"}) {
+		t.Errorf("a got %v, want an abort for its token", o)
+	}
+	// b reports late: it gets the abort too, for its own token.
+	b.resumed("22-0")
+	eventually(t, "abort reaches b", func() bool { return len(b.opened()) == 1 })
+	if o := b.opened(); !reflect.DeepEqual(o, []string{"22-0 abort"}) {
+		t.Errorf("b got %v", o)
+	}
+	ds.set(0)
+	ds.set(1)
+	out := <-res
+	if out.Opened || !strings.HasSuffix(out.OpenAborted, ": b") {
+		t.Errorf("outcome = %+v, want aborted naming b", out)
+	}
+}
+
+// A member that holds its launches and ends without reporting resumed (its
+// resume failed) aborts the wait at once.
+func TestDriveFabric_OpenAbortsWhenAMemberEndsWithoutResuming(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	a.holds()
+	b.holds()
+	ds, res, cancel := openDrive([]fabricMember{a, b}, time.Minute)
+	defer cancel()
+	time.Sleep(3 * fabricPollInterval) // the driver sees b hold
+	ds.set(1)
+	a.resumed("11-0")
+	eventually(t, "abort reaches a", func() bool { return len(a.opened()) == 1 })
+	if o := a.opened(); !reflect.DeepEqual(o, []string{"11-0 abort"}) {
+		t.Errorf("a got %v", o)
+	}
+	ds.set(0)
+	if out := <-res; out.Opened || !strings.HasSuffix(out.OpenAborted, "ended before reporting resumed: b") {
+		t.Errorf("outcome = %+v, want aborted naming b", out)
+	}
+}
+
+// A member whose tool does not hold its launches (one from before
+// --sync-open) takes no part: the others do not wait for it.
+func TestDriveFabric_OpenLeavesOutMembersThatDoNotHold(t *testing.T) {
+	a, b := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "b"}
+	b.vote(0, true) // registered, but no HoldsOpen
+	ds, res, cancel := openDrive([]fabricMember{a, b}, time.Minute)
+	defer cancel()
+	a.resumed("11-0")
+	eventually(t, "open reaches a", func() bool { return len(a.opened()) == 1 })
+	if o := a.opened(); !reflect.DeepEqual(o, []string{"11-0 open"}) {
+		t.Errorf("a got %v", o)
+	}
+	ds.set(1)
+	ds.set(0)
+	if out := <-res; !out.Opened {
+		t.Errorf("outcome = %+v", out)
+	}
+	if o := b.opened(); len(o) != 0 {
+		t.Errorf("b, which does not hold, got %v", o)
+	}
+}
+
+// openBlockedMember refuses open verdicts while block is set.
+type openBlockedMember struct {
+	*fakeFabricMember
+	block atomic.Bool
+}
+
+func (b *openBlockedMember) Open(ctx context.Context, token, verdict string) error {
+	if b.block.Load() {
+		return errors.New("unreachable")
+	}
+	return b.fakeFabricMember.Open(ctx, token, verdict)
+}
+
+// An "open" that reached one member is not overtaken by an "abort" when
+// that member ends while the open is still on its way to another.
+func TestDriveFabric_OpenInFlightIsNotOvertakenByAbort(t *testing.T) {
+	a := &fakeFabricMember{name: "a"}
+	b := &openBlockedMember{fakeFabricMember: &fakeFabricMember{name: "b"}}
+	b.block.Store(true)
+	ds, res, cancel := openDrive([]fabricMember{a, b}, 400*time.Millisecond)
+	defer cancel()
+	a.resumed("11-0")
+	b.resumed("22-0")
+	eventually(t, "open reaches a", func() bool { return len(a.opened()) == 1 })
+	ds.set(0) // a opened and its capture returned
+	time.Sleep(600 * time.Millisecond)
+	b.block.Store(false)
+	eventually(t, "a verdict reaches b", func() bool { return len(b.opened()) == 1 })
+	if o := b.opened(); !reflect.DeepEqual(o, []string{"22-0 open"}) {
+		t.Errorf("b got %v, want the open a got", o)
+	}
+	ds.set(1)
+	if out := <-res; !out.Opened || out.OpenAborted != "" {
+		t.Errorf("outcome = %+v", out)
+	}
+}
+
+// The member side over HTTP: the state carries the holds flag and the
+// resumed token, and the open verdict lands in DIR/o for the tool.
+func TestFabricSession_OpenOverHTTP(t *testing.T) {
+	a, srv := fabricTestAgent(t)
+	s, closeF, err := a.openFabricSession("s1", "ns", "p", "uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeF()
+	m := &httpFabricMember{client: http.DefaultClient, base: srv.URL, session: "s1", ns: "ns", pod: "p"}
+	st, ok, err := m.State(context.Background())
+	if err != nil || !ok || st.HoldsOpen || st.Resumed != "" {
+		t.Fatalf("fresh session: %+v ok=%v err=%v", st, ok, err)
+	}
+	s.holdsOpen.Store(true)
+	dir := a.fabricHostDir("uid", "s1")
+	if err = os.WriteFile(filepath.Join(dir, "resumed"), []byte("1234-0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if st, ok, err = m.State(context.Background()); err != nil || !ok || !st.HoldsOpen || st.Resumed != "1234-0" {
+		t.Fatalf("after resume: %+v ok=%v err=%v", st, ok, err)
+	}
+	if err := m.Open(context.Background(), "1234-0", "open"); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "o")); err != nil || string(b) != "1234-0 open\n" {
+		t.Errorf("DIR/o = %q, %v", b, err)
+	}
+	for _, q := range []string{"token=1234-0&verdict=maybe", "token=../x&verdict=open", "verdict=open", "token=1234-0"} {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPut, srv.URL+"/v1/gpushare/fabric/s1/ns/p/open?"+q, http.NoBody)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("open %q: status %d, want 400", q, resp.StatusCode)
+		}
+	}
+	// A marker the workload garbled is not a report: the member has not
+	// resumed, and the rest of its state is still served.
+	if err := os.WriteFile(filepath.Join(dir, "resumed"), []byte("x y z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if st, ok, err := m.State(context.Background()); err != nil || !ok || st.Resumed != "" || !st.HoldsOpen {
+		t.Errorf("garbled marker: %+v ok=%v err=%v; want the state, not resumed", st, ok, err)
+	}
+}
+
+// The open verdict is decided once: a member first seen holding after it
+// was decided (its agent was not reachable before) does not turn the
+// "open" still on its way to another member into an "abort".
+func TestDriveFabric_OpenVerdictIsDecidedOnce(t *testing.T) {
+	a, c := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "c"}
+	b := &openBlockedMember{fakeFabricMember: &fakeFabricMember{name: "b"}}
+	b.block.Store(true)
+	ds, res, cancel := openDrive([]fabricMember{a, b, c}, 300*time.Millisecond)
+	defer cancel()
+	a.resumed("11-0")
+	b.resumed("22-0")
+	eventually(t, "open reaches a", func() bool { return len(a.opened()) == 1 })
+	c.holds()
+	time.Sleep(600 * time.Millisecond) // past the deadline
+	b.block.Store(false)
+	eventually(t, "a verdict reaches b", func() bool { return len(b.opened()) == 1 })
+	if o := b.opened(); !reflect.DeepEqual(o, []string{"22-0 open"}) {
+		t.Errorf("b got %v, want the open a got", o)
+	}
+	ds.set(0)
+	ds.set(1)
+	ds.set(2)
+	<-res
 }

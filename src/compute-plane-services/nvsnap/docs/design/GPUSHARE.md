@@ -251,6 +251,66 @@ dump. `leaveRunning: false` dumps it for a move: the processes stop, and the
 dump's network lock keeps the source pods from sending resets until they are
 deleted. Each checkpoint records its pod's IP and index in the instance.
 
+An in-place resume opens the GPU launch gates only once every node has
+resumed. Each node binds its share of the memory multicast across nodes
+(NCCL NVLS) again at its resume. A node that launched before another had
+bound its share would have its NVLink accesses refused (Xid 137 on the node
+that launched) and its kernels would spin. Before the suspend, each member's
+agent tells the driver that its tool will hold (`holdsOpen` in the member's
+fabric state, `syncOpenFor` in `internal/agent/checkpoint_v2.go`) when the
+tool has `--sync-open`. The suspend then runs as before, and so does `stop`:
+the holder leaves the processes stopped for CRIU and exits. After the dump,
+the agent runs `resume --fabric-map DIR --sync-open <ms>`. The tool loads,
+exchanges handles, remaps, and sends `resume hold`. It then thaws the
+processes, writes `DIR/resumed` (`<token>`: its pid and round), and waits
+for `DIR/o`. The driver answers every member `<token> open` once all
+members that hold have reported resumed. The tool then sends `open` to
+every process (`open_synced` in `nvsnap-gpu-suspend.c`, `fabricOpener` in
+`internal/agent/gpushare_fabric.go`). The handle exchange makes every node
+load before any remaps, so the markers normally come close together.
+
+- The driver answers `<token> abort` when a member that holds ends without
+  reporting resumed, or when one has not reported 2 minutes after the first
+  (`fabricOpenDeadline`). A member that reports later gets `abort` too. The
+  tool also gives up on its own after `--sync-open` (3 minutes, a minute
+  after the driver; `gpushareSyncOpenWait`).
+- On `abort`, or with no verdict, the tool opens the gates anyway and prints
+  `GPU launches let through before every node resumed`. Gates left closed
+  would stall the workload for good. An early launch hangs it only if a
+  node has not bound its memory yet. The member's capture fails as
+  `resume_stalled`, and the group's error names the members that did not
+  report. No pod is deleted for this. The kernel-log check (`kmsg.go`) reads
+  until after the open, so an Xid from an early launch is reported too.
+- The tool prints the same text when a process's library has no `resume
+  hold` (it opened at its resume), and when the resume goes through a
+  holder that is still there (the stop after the suspend failed): that
+  node was not held.
+- A verdict counts only for the token the tool wrote. The tool removes
+  `DIR/o` before it writes `DIR/resumed`, and the session directory is new
+  for every session. So a verdict from another round or session never
+  opens the gates. A `DIR/resumed` that is not a token (the directory is
+  the workload's to write) is not counted, and the agent logs it.
+- A member that reported resumed and then ended counts as resumed: its share
+  of the memory was bound.
+- The resume runs under the agent's resume deadline (60 minutes,
+  `gpushareResumeDeadline`), which covers the handle exchange (at most 10
+  minutes), the load and remap, and the 3-minute wait. If the tool dies
+  while it waits (killed at that deadline), the processes run with their
+  launches held: `resume hold` ended the `hold` lease. The resume fails, the
+  source counts as left suspended, and the instance's pods are deleted. So
+  are they when `open` fails for a process after the verdict (the tool
+  says "not every pid's GPU launches were let through").
+- A member whose tool has no `--sync-open` (an older node bundle) is not
+  waited for. It opens at its own resume, as before, and the agent logs
+  that.
+- A suspend that fails after `release` and rolls back does not wait: its
+  rollback opens at once, as before. It runs while the other nodes may
+  still be suspending or dumping, so a wait could only end at the deadline,
+  and its output reports the failed suspend already.
+- Without `--sync-open` (one node, a dump for a move, a group restore,
+  which holds with `--hold-gate` and `open` instead), the resume is as
+  before.
+
 Limits of the group checkpoint:
 
 - If a member's checkpoint ends before the vote passes, later votes are

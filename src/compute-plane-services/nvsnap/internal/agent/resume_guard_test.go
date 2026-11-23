@@ -5,13 +5,16 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -259,5 +262,104 @@ func TestGroupCheckpoint_LeaveRunningWatchesThePods(t *testing.T) {
 	})
 	if !errors.Is(err, errResumeStalled) || !strings.Contains(err.Error(), "ns/b") {
 		t.Fatalf("a member restarted after the resume: %v, want a stall naming ns/b", err)
+	}
+}
+
+// groupOpenFixture runs a leave-running group checkpoint of pods a and b
+// against a fake peer agent that plays both members' tools on the fabric
+// routes: each holds its launches and reports resumed as its checkpoint
+// runs, and its checkpoint returns once the driver answered it (or after
+// 10 s). failB: b's checkpoint fails after a moment without resuming.
+// Returns the verdict each member got.
+func groupOpenFixture(t *testing.T, failB bool) (map[string]string, error) {
+	t.Helper()
+	old := postResumeWatch
+	postResumeWatch = resumeWatchOpts{ReadyWait: 300 * time.Millisecond, Steady: 100 * time.Millisecond, Poll: 20 * time.Millisecond}
+	defer func() { postResumeWatch = old }()
+
+	var mu sync.Mutex
+	verdicts, resumed := map[string]string{}, map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/gpushare/fabric/"), "/")
+		switch {
+		case r.URL.Path == "/v1/checkpoint":
+			var req CheckpointRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if failB && req.PodName == "b" {
+				time.Sleep(5 * fabricPollInterval) // the driver sees it hold first
+				http.Error(w, "gpushare resume: remap failed", http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			resumed[req.PodName] = true
+			mu.Unlock()
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				mu.Lock()
+				v := verdicts[req.PodName]
+				mu.Unlock()
+				if v != "" {
+					break
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"checkpointId":"c"}`))
+		case strings.HasPrefix(r.URL.Path, "/v1/gpushare/fabric/") && r.Method == http.MethodGet && len(parts) == 3:
+			mu.Lock()
+			st := fabricState{HoldsOpen: true}
+			if resumed[parts[2]] {
+				st.Resumed = map[string]string{"a": "11-0", "b": "22-0"}[parts[2]]
+			}
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(st)
+		case strings.HasPrefix(r.URL.Path, "/v1/gpushare/fabric/") && len(parts) == 4 && parts[3] == "open":
+			mu.Lock()
+			verdicts[parts[2]] = r.URL.Query().Get("token") + " " + r.URL.Query().Get("verdict")
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: "InternalIP", Address: u.Hostname()}}}}
+	a, b := memberPod("a", true, 0), memberPod("b", true, 0)
+	a.Spec.NodeName, b.Spec.NodeName = "n1", "n1"
+	ag := &Agent{kubeClient: fake.NewClientset(node, a, b), config: Config{ListenAddr: ":" + u.Port()}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = ag.groupCheckpoint(ctx, GroupCheckpointRequest{LeaveRunning: true,
+		Members: []CheckpointRequest{{Namespace: "ns", PodName: "a"}, {Namespace: "ns", PodName: "b"}}}, guardLog())
+	mu.Lock()
+	defer mu.Unlock()
+	return maps.Clone(verdicts), err
+}
+
+// A leave-running group checkpoint opens its members' GPU launch gates
+// once every member has resumed; a member that fails without resuming
+// gets the others "abort" (they open anyway), and the capture fails as
+// stalled, naming it.
+func TestGroupCheckpoint_LeaveRunningOpensOnceEveryMemberResumed(t *testing.T) {
+	got, err := groupOpenFixture(t, false)
+	if err != nil {
+		t.Fatalf("healthy instance: %v", err)
+	}
+	if want := map[string]string{"a": "11-0 open", "b": "22-0 open"}; !maps.Equal(got, want) {
+		t.Errorf("verdicts = %v, want %v", got, want)
+	}
+	got, err = groupOpenFixture(t, true)
+	if want := map[string]string{"a": "11-0 abort"}; !maps.Equal(got, want) {
+		t.Errorf("verdicts = %v, want %v", got, want)
+	}
+	if !errors.Is(err, errResumeStalled) || !strings.Contains(err.Error(), "ended before reporting resumed: ns/b") {
+		t.Fatalf("b failed without resuming: %v, want a stall naming ns/b", err)
+	}
+	if sourceMustBeReplacedText(err.Error()) {
+		t.Errorf("an unsynced open deletes the pods: %v", err)
 	}
 }

@@ -5,8 +5,12 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // The pid-namespace dump settles its source the same way.
@@ -71,5 +75,57 @@ func TestSuspendGuard_SettlesAFailureBeforeTheDump(t *testing.T) {
 	e := g.settle(g.settle(nil))
 	if n != 1 || e != nil {
 		t.Errorf("settle twice: %d resumes, err %v; want 1, nil", n, e)
+	}
+}
+
+// A resume whose GPU launches were let through before every node of the
+// instance resumed (the tool's --sync-open gave up waiting) leaves the
+// workload running: the capture fails as stalled, and the source is not
+// reported left suspended, which would replace the instance.
+func TestSettleSource_UnsyncedOpenIsNotLeftSuspended(t *testing.T) {
+	unsynced := fmt.Errorf("%w: sync-open: the driver aborted; %s", errResumeStalled, openUnsyncedText)
+	err := settleSource(true, true, false, func() error { return unsynced })
+	if !errors.Is(err, errResumeStalled) || errors.Is(err, errSourceLeftSuspended) {
+		t.Errorf("settleSource = %v; want stalled, not left suspended", err)
+	}
+	if sourceMustBeReplacedText(err.Error()) {
+		t.Errorf("an unsynced open replaces the instance: %v", err)
+	}
+	var g suspendGuard
+	g.arm(func() error { return unsynced }, nil)
+	err = g.settle(syscall.ENOSPC)
+	if !errors.Is(err, errResumeStalled) || errors.Is(err, errSourceLeftSuspended) || !errors.Is(err, syscall.ENOSPC) {
+		t.Errorf("guard.settle = %v; want the capture's error and stalled, not left suspended", err)
+	}
+}
+
+// A suspend holds the in-place resume's GPU launches (--sync-open) only in
+// place, across nodes, with a tool that has the option, and then declares
+// it to the driver before the suspend.
+func TestSyncOpenFor(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	tool := "--sync-open MS: (suspend, with --fabric-map) ..."
+	for _, c := range []struct {
+		name         string
+		leaveRunning bool
+		fabric       bool
+		tool         string
+		want         time.Duration
+	}{
+		{"in place across nodes", true, true, tool, gpushareSyncOpenWait},
+		{"dump for a move", false, true, tool, 0},
+		{"one node", true, false, tool, 0},
+		{"older tool", true, true, "--hold-gate --fabric-map DIR", 0},
+	} {
+		var f *fabricSessionDir
+		if c.fabric {
+			f = &fabricSessionDir{}
+		}
+		if got := syncOpenFor(c.leaveRunning, f, c.tool, "v1", log); got != c.want {
+			t.Errorf("%s: %s, want %s", c.name, got, c.want)
+		}
+		if f != nil && f.holdsOpen.Load() != (c.want > 0) {
+			t.Errorf("%s: holdsOpen = %v", c.name, f.holdsOpen.Load())
+		}
 	}
 }

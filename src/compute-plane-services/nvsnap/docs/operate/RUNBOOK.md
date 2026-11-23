@@ -254,6 +254,21 @@ suspended or locked, as before.
     Ready again within 60 s, a container restarted or ended, or the pod
     was replaced or deleted within the next 10 s
     (`internal/agent/resume_guard.go`, `postResumeWatch`).
+  - On a member's node, in a group captured in place: its GPU launch
+    gates were opened before every node of the instance had resumed
+    (`GPU launches let through before every node resumed`). The driver
+    answered `abort`, because a member's resume failed or a member did not
+    report resumed within 2 minutes of the first. Or no verdict came within
+    3 minutes. Or the stop after the suspend failed, so the resume went
+    through the holder and opened at once. Or the pod runs an older
+    `libnvsnap_gpushare` without `resume hold`, so it opened at its own
+    resume: then every in-place group capture of it fails as
+    `resume_stalled`. Restart the pod onto the new library; retrying does
+    not help. The group's error names the members that did not report
+    (`the GPU launch gates were opened before every node resumed: …`). The
+    workload runs, but it may hang on memory that another node had not
+    bound yet. Check for the Xid above on this node, and look at the named
+    member's own error.
   The limit: neither check sees the GPU work itself. A workload whose
   GPU work hangs while its processes run and its readiness probe passes
   still passes these checks. A hang seen so far came with the Xid above.

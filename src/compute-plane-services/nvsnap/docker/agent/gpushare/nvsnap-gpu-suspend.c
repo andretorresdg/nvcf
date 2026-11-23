@@ -68,6 +68,18 @@ SPDX-License-Identifier: Apache-2.0
  * writes to multicast memory (NCCL NVLS) that another node has not bound
  * again yet; those writes are lost and the kernels waiting for them spin.
  * A library that predates it resumes as without it.
+ * --sync-open MS (resume after stop, with --fabric-map; not with
+ * --hold-gate): the same for a resume in place, where no one else sends
+ * "open". The resume holds the launches, thaws, writes DIR/resumed
+ * ("<token>", its pid and round), and lets them through ("open") once DIR/o
+ * reads "<token> open": the driver writes it once every node has resumed.
+ * On "<token> abort" (a node failed to resume, or did not in time), or with
+ * no verdict after MS, it lets them through anyway and says "GPU launches
+ * let through before every node resumed": closed gates would wedge the
+ * workload for good, while an early launch only hangs it if a node has not
+ * bound its memory yet. It says so too when a process's library has no
+ * "resume hold" (it opened at its resume). Without --sync-open the resume
+ * opens at once, as before.
  * --clock-at NS (resume after stop + CRIU restore): NS is the CLOCK_MONOTONIC
  * CRIU dumped. Thaw only once the pids' clock (in their time namespace) has
  * reached it, so that no thread sees its clock behind the dump, nor the
@@ -384,6 +396,9 @@ static int probe(void)
 static const char *gpu_map_file;
 static const char *store_dir, *ckpt_dir, *cache_dir, *fabric_dir;
 static int hold_gate;  /* --hold-gate */
+static unsigned sync_open_ms;  /* --sync-open */
+static int sync_gate;  /* resume_unheld, with --sync-open: hold, then open_synced */
+static int held_fallback;  /* resume_held: processes whose library has no "resume hold" */
 static long long clock_at = -1;  /* --clock-at, ns */
 static int resume_held(const int *pids, int n);
 
@@ -882,7 +897,7 @@ static int remap_all(const int *pids, int n)
         if (rmdir(local_dir) != 0) fprintf(stderr, "%s: %s (left behind)\n", local_dir, strerror(errno));
         local_dir[0] = 0;
     }
-    if (r >= 0 && hold_gate) r = resume_held(pids, n);
+    if (r >= 0 && (hold_gate || sync_gate)) r = resume_held(pids, n);
     else if (r >= 0) r = ctl_all(pids, n, "resume");
     if (r >= 0) resume_diag(pids, n);
     return r;
@@ -895,7 +910,7 @@ static int resume_held(const int *pids, int n)
     int count = 0;
     for (int i = 0; i < n; i++) {
         int r = ctl(pids[i], "resume hold");
-        if (r == -3) r = ctl(pids[i], "resume");
+        if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
         if (r < 0) return r;
         count += r == 0;
     }
@@ -1157,9 +1172,12 @@ static void wait_clock(int pid)
 /* Resume without a holder: pids are CHECKPOINTED and possibly SIGSTOPped
  * (after stop + CRIU restore). Freeze everything but the restore threads,
  * SIGCONT, restore + unlock, thaw. */
+static int open_synced(const int *pids, int n);
+
 static int resume_unheld(const int *pids, int n)
 {
     if (load_api() < 0) return -1;
+    sync_gate = fabric_dir && sync_open_ms;
     long long d;
     if (clock_at >= 0 && clock_behind(pids[0], &d) < 0) return -1;
     struct frozen *fz = calloc(n, sizeof(*fz));
@@ -1185,6 +1203,13 @@ out:
         if (clock_at >= 0) wait_clock(pids[0]);  /* every pid is in one time namespace */
         thaw_all(fz, n);
         printf("thawed all pids\n");
+        /* --sync-open: the pids run, their launches held until every node
+         * has resumed. A pid that then fails to open is not CHECKPOINTED,
+         * but may be held for good: the resume fails. */
+        if (sync_gate && open_synced(pids, n) < 0) {
+            fprintf(stderr, "resumed, but not every pid's GPU launches were let through (open failed above)\n");
+            rc = -1;
+        }
     } else {
         /* Do not let CHECKPOINTED threads run: leave them stopped. */
         for (int i = 0; i < n; i++) kill(pids[i], SIGSTOP);
@@ -1356,6 +1381,67 @@ static void wait_slot(void)
 /* Attempts in a row that keep the ranks held (catching up across nodes)
  * before all are let go and held again at a common instant. */
 #define HOLD_ROUNDS 8
+
+#define SYNC_OPEN_UNSYNCED "GPU launches let through before every node resumed"
+
+/* --sync-open: after resume_unheld resumed the pids with their launches held,
+ * report this node resumed (DIR/resumed, "<token>") and let the launches
+ * through once the driver answers "<token> open" in DIR/o, or anyway on
+ * "<token> abort" or after sync_open_ms with no answer (see the top). The
+ * token, this tool's pid and round, keeps a verdict for another tool or
+ * round from counting; a verdict left from one is removed first. DIR
+ * belongs to the workload's user: every name is opened relative to it,
+ * never through a symlink. Returns what open_all returns. */
+static int sync_round;
+static int open_synced(const int *pids, int n)
+{
+    char tok[32], line[96], why[160] = "", t[32], v[16];
+    snprintf(tok, sizeof(tok), "%d-%d", (int)getpid(), sync_round++);
+    int got = 0;  /* 1 open, -1 abort */
+    int dfd = open(fabric_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dfd < 0) snprintf(why, sizeof(why), "%s: %s", fabric_dir, strerror(errno));
+    if (dfd >= 0) {
+        if (unlinkat(dfd, "o", 0) != 0 && errno != ENOENT)
+            fprintf(stderr, "%s/o: %s (a verdict left there is ignored: its token is not this one)\n", fabric_dir, strerror(errno));
+        unlinkat(dfd, "resumed.tmp", 0);
+        int fd = openat(dfd, "resumed.tmp", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        int len = snprintf(line, sizeof(line), "%s\n", tok);
+        int ok = fd >= 0 && write(fd, line, len) == len;
+        if (fd >= 0 && close(fd) != 0) ok = 0;
+        if (!ok || renameat(dfd, "resumed.tmp", dfd, "resumed") != 0) {
+            snprintf(why, sizeof(why), "cannot report resumed in %s: %s", fabric_dir, strerror(errno));
+            unlinkat(dfd, "resumed.tmp", 0);
+        }
+    }
+    if (!why[0]) {
+        printf("sync-open: resumed with launches held (%s); waiting up to %u ms for every node\n", tok, sync_open_ms);
+        double t0 = now_ms();
+        while (!got) {
+            int fd = openat(dfd, "o", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd >= 0) {
+                ssize_t r = read(fd, line, sizeof(line) - 1);
+                close(fd);
+                line[r > 0 ? r : 0] = 0;
+                if (sscanf(line, "%31s %15s", t, v) == 2 && !strcmp(t, tok))
+                    got = !strcmp(v, "open") ? 1 : !strcmp(v, "abort") ? -1 : 0;
+            }
+            if (got) break;
+            if (now_ms() - t0 >= sync_open_ms) {
+                snprintf(why, sizeof(why), "no verdict in %s/o after %u ms", fabric_dir, sync_open_ms);
+                break;
+            }
+            usleep(100000);
+        }
+        if (got < 0) snprintf(why, sizeof(why), "the driver answered abort (a node did not resume, or not in time)");
+    }
+    if (dfd >= 0) close(dfd);
+    int r = open_all(pids, n);
+    if (got > 0 && held_fallback)
+        snprintf(why, sizeof(why), "%d process(es) without \"resume hold\" opened at their resume", held_fallback);
+    if (got > 0 && !held_fallback) printf("sync-open: every node resumed: launches let through\n");
+    else printf("sync-open: %s; " SYNC_OPEN_UNSYNCED "\n", why);
+    return r;
+}
 
 static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
 {
@@ -1571,6 +1657,9 @@ static int resume(const int *pids, int n, unsigned timeout_s)
     if (state_exists(hp)) {
         if (hold_gate) printf("--hold-gate: not for an in-place resume; launches go through at once\n");
         if (clock_at >= 0) printf("--clock-at: not for an in-place resume; ignored\n");
+        /* The stop failed after the suspend: the holder resumes and opens
+         * at once, so the caller learns this node was not held. */
+        if (sync_open_ms) printf("sync-open: only after stop; " SYNC_OPEN_UNSYNCED "\n");
         return signal_holder(pids, SIGUSR1, timeout_s);
     }
     return resume_unheld(pids, n);
@@ -1849,6 +1938,8 @@ static void usage(const char *prog)
         "--fabric-map DIR: (suspend, resume) multi-node NVLink: after load, write the new\n"
         "         fabric handles to DIR/out and wait for DIR/in, all nodes' out merged\n"
         "--hold-gate: (resume after CRIU restore) thaw with GPU launches held until open\n"
+        "--sync-open MS: (resume after stop, with --fabric-map) hold the GPU launches,\n"
+        "         write DIR/resumed and open on DIR/o, or anyway after MS\n"
         "--clock-at NS: (resume after CRIU restore) thaw once the pids' CLOCK_MONOTONIC\n"
         "         reaches NS, the value CRIU dumped\n"
         "Cache:   cache-prefetch STORE CKPT-DIR CACHE | cache-gc CACHE MAX-GiB\n"
@@ -1883,6 +1974,16 @@ int main(int argc, char **argv)
             cache_dir = argv[argi + 1];
         else if (strcmp(argv[argi], "--fabric-map") == 0)
             fabric_dir = argv[argi + 1];
+        else if (strcmp(argv[argi], "--sync-open") == 0) {
+            char *end;
+            errno = 0;
+            unsigned long v = strtoul(argv[argi + 1], &end, 10);
+            if (errno || end == argv[argi + 1] || *end || argv[argi + 1][0] == '-' || v == 0 || v > 86400000UL) {
+                fprintf(stderr, "--sync-open needs a number of milliseconds above 0, not %s\n", argv[argi + 1]);
+                return 1;
+            }
+            sync_open_ms = (unsigned)v;
+        }
         else if (strcmp(argv[argi], "--libcuda") == 0)
             libcuda_path = argv[argi + 1];
         else if (strcmp(argv[argi], "--host") == 0)
@@ -1901,6 +2002,20 @@ int main(int argc, char **argv)
      * can still send "go" to the other nodes. */
     if (fabric_dir && timeout_ms == 0) {
         fprintf(stderr, "--fabric-map needs --timeout-ms above 0\n");
+        return 1;
+    }
+    /* Only the driver of a fabric session answers DIR/resumed; after
+     * --hold-gate the caller sends "open" itself. */
+    if (sync_open_ms && !fabric_dir) {
+        fprintf(stderr, "--sync-open goes with --fabric-map\n");
+        return 1;
+    }
+    if (sync_open_ms && hold_gate) {
+        fprintf(stderr, "--sync-open does not go with --hold-gate\n");
+        return 1;
+    }
+    if (sync_open_ms && (argi >= argc || strcmp(argv[argi], "resume"))) {
+        fprintf(stderr, "--sync-open goes with resume\n");
         return 1;
     }
 

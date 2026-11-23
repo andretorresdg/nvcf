@@ -222,6 +222,7 @@ API is specified in [openapi.yaml](../internal/server/openapi.yaml).
 | `/v1/gpushare/fabric/{session}/{namespace}/{pod}/verdict` | PUT | `fabricVerdictHandler` |
 | `/v1/gpushare/fabric/{session}/{namespace}/{pod}/in` | PUT | `fabricInHandler` |
 | `/v1/gpushare/fabric/{session}/{namespace}/{pod}/unlock` | PUT | `fabricUnlockHandler` |
+| `/v1/gpushare/fabric/{session}/{namespace}/{pod}/open` | PUT | `fabricOpenHandler` |
 | `/v1/gpushare/group-restore` | POST | `groupRestoreHandler` |
 | `/v1/restore` | POST | `restoreHandler` |
 | `/v1/pods/{namespace}/{pod}/peers` | GET | `peersHandler`: Instance companions (criu_companion.go): a rank's connections, and the continue of a companion restored stopped. |
