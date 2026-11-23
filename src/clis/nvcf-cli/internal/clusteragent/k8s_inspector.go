@@ -365,11 +365,16 @@ func instancesTerminating(instances []Instance, terminating map[string]bool) boo
 // terminationListedIDs returns, by namespace, the instance IDs that termination
 // requests list. NVCA records a termination on the termination request, so
 // until it reports them terminated, the instances it is removing look running on
-// their creation request.
+// their creation request. A failed termination request is not removing the
+// instances it lists, so they are left out.
 func terminationListedIDs(items []unstructured.Unstructured) map[string]map[string]bool {
 	ids := map[string]map[string]bool{}
 	for i := range items {
 		if nestedString(items[i].Object, "spec", "action") != actionTermination {
+			continue
+		}
+		switch nestedString(items[i].Object, "status", "requestStatus") {
+		case statusFailed, statusFailureAcknowledged:
 			continue
 		}
 		listed, _, _ := unstructured.NestedStringSlice(items[i].Object, "spec", "terminationMsgInfo", "instanceIds")
