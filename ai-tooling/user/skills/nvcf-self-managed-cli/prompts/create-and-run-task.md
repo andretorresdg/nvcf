@@ -53,7 +53,9 @@ Before running any `task` command in a fresh agent session, verify credentials:
    ```
 
 4. The CLI reads the saved task key from its state, so no injection is
-   needed. Never print the key into chat.
+   needed. `NVCF_NVCT_API_KEY` takes precedence over the saved key, so if it
+   holds an expired key, unset or replace it after regenerating. Never print
+   the key into chat.
 
 Error classification:
 
