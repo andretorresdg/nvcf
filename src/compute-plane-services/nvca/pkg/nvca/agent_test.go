@@ -3414,12 +3414,13 @@ type instanceStatusICMSClient struct {
 	mockICMSClient
 	failPosts map[string]bool
 
-	mu     sync.Mutex
-	posted []string
+	mu       sync.Mutex
+	posted   []string
+	statuses map[string][]types.ICMSRequestStatus
 }
 
 func (m *instanceStatusICMSClient) PostInstanceStatusUpdate(_ context.Context, _, instanceID string,
-	_ *types.ICMSInstanceStatusUpdateRequest,
+	payload *types.ICMSInstanceStatusUpdateRequest,
 ) error {
 	if m.failPosts[instanceID] {
 		return assert.AnError
@@ -3427,7 +3428,18 @@ func (m *instanceStatusICMSClient) PostInstanceStatusUpdate(_ context.Context, _
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.posted = append(m.posted, instanceID)
+	if m.statuses == nil {
+		m.statuses = map[string][]types.ICMSRequestStatus{}
+	}
+	m.statuses[instanceID] = append(m.statuses[instanceID], payload.Status)
 	return nil
+}
+
+// postedStatuses returns the request statuses of the updates posted for instanceID, in order.
+func (m *instanceStatusICMSClient) postedStatuses(instanceID string) []types.ICMSRequestStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]types.ICMSRequestStatus(nil), m.statuses[instanceID]...)
 }
 
 func instanceStatusPod(name string) *v1.Pod {
@@ -4388,7 +4400,8 @@ func TestSyncICMSRequest_TaskCompletesOnlyOnceAcknowledged(t *testing.T) {
 				"the acknowledged request completes")
 			loop.syncCache(t)
 			loop.pass(ctx, t)
-			assert.Contains(t, icms.posted, tt.ready, "the fulfillment is posted once the request is acknowledged")
+			assert.Contains(t, icms.postedStatuses(tt.ready), types.ICMSRequestFulfilled,
+				"the fulfillment is posted once the request is acknowledged")
 		})
 	}
 }
