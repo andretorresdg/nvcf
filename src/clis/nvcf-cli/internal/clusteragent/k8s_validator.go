@@ -434,11 +434,12 @@ const utilsPodName = "utils"
 // (Helm) instance resolves to the "utils" Pod in its own namespace. An
 // instance NVCA has reported terminated is not checked for readiness: it stays
 // listed while the rest of its request runs, and its Pod is expected to be gone.
-// A Pod of such an instance that is still there, and not being deleted, is a
-// warning: NVCA reports an instance terminated even when deleting its Pod
-// failed, and deletes it again on a later pass.
+// A Pod of such an instance that is still there, and not being deleted, is
+// reported whatever the readiness of the other instances: NVCA reports an
+// instance terminated even when deleting its Pod failed, and deletes it again on
+// a later pass. It is a warning when the other instances are healthy, and is
+// added to the message otherwise.
 func checkPodReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.Interface, namespace string, instances []Instance) CheckResult {
-	res := CheckResult{Name: "pod-readiness"}
 	var live, ended []Instance
 	for _, in := range instances {
 		if instanceReportedTerminated(in) {
@@ -447,6 +448,22 @@ func checkPodReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.
 			live = append(live, in)
 		}
 	}
+	res := liveInstancesReadiness(ctx, cs, dc, namespace, live)
+	if msg := remainingPodWarning(ctx, cs, namespace, ended); msg != "" {
+		if res.Status == CheckPassed {
+			res.Status = CheckWarning
+			res.Message = msg
+		} else {
+			res.Message += "; " + msg
+		}
+	}
+	return res
+}
+
+// liveInstancesReadiness checks the Pods of the instances NVCA has not reported
+// terminated.
+func liveInstancesReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.Interface, namespace string, live []Instance) CheckResult {
+	res := CheckResult{Name: "pod-readiness"}
 	if len(live) == 0 {
 		res.Status = CheckFailed
 		res.Message = "no instances running for this function version"
@@ -493,9 +510,6 @@ func checkPodReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.
 				warnMsg = fmt.Sprintf("instance %s not yet ready: %s", in.ID, reason)
 			}
 		}
-	}
-	if warnMsg == "" {
-		warnMsg = remainingPodWarning(ctx, cs, namespace, ended)
 	}
 	if warnMsg != "" {
 		res.Status = CheckWarning

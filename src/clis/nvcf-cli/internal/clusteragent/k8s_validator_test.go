@@ -777,6 +777,44 @@ func TestValidateDeploymentSkipsInstancesReportedTerminated(t *testing.T) {
 			wantMessage:   "no instances running for this function version",
 			wantQueue:     CheckWarning,
 		},
+		{
+			name: "every instance reported terminated while a pod is still there",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("terminated", "terminated"),
+			},
+			pods:          []runtime.Object{fakePod(testRequestsNS, "inst-a", corev1.ConditionFalse)},
+			wantReadiness: CheckFailed,
+			wantMessage: "no instances running for this function version; " +
+				"instance inst-a was reported terminated but its pod still exists",
+			wantQueue: CheckWarning,
+		},
+		{
+			name: "every instance reported terminated while its pod is being deleted",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("terminated", "terminated"),
+			},
+			pods:          []runtime.Object{deleting},
+			wantReadiness: CheckFailed,
+			wantMessage:   "no instances running for this function version",
+			wantQueue:     CheckWarning,
+		},
+		{
+			name: "reported terminated while its pod is still there, beside a pod not ready yet",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			pods: []runtime.Object{
+				fakePod(testRequestsNS, "inst-a", corev1.ConditionTrue),
+				fakePod(testRequestsNS, "inst-b", corev1.ConditionFalse),
+			},
+			wantReadiness: CheckWarning,
+			wantMessage: "instance inst-b not yet ready: pod condition Ready=False; " +
+				"instance inst-a was reported terminated but its pod still exists",
+			wantQueue: CheckPassed,
+		},
 	}
 
 	for _, tt := range tests {
