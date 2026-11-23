@@ -197,6 +197,37 @@ int main(int argc, char **argv)
         printf("closed_after_exit=%d\n", closed(&lgate));
         return 0;
     }
+    if (argc > 1 && (!strcmp(argv[1], "resumelease") || !strcmp(argv[1], "resumeleaseopen"))) {
+        /* As after "resume hold" (--sync-open): the launches are held for an
+         * "open" and no lease is left (release ended it). A child sends
+         * "lease", then exits. resumeleaseopen: it sends "open" first, which
+         * opens the gates and ends the lease; the gates are closed again
+         * before it exits, and must stay closed. */
+        int open_ = !strcmp(argv[1], "resumeleaseopen");
+        start_ctl();
+        hold_launches();
+        held = 1;
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return 3;
+        pid_t c = fork();
+        if (!c) {
+            char b;
+            int ok = request(getppid(), "lease", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok leased");
+            if (ok && open_) ok = request(getppid(), "open", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok opened");
+            if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
+            _exit(0);
+        }
+        char b = 0;
+        if (read(up[0], &b, 1) != 1) return 4;
+        if (open_) hold_launches();  /* a later hold of some other caller's */
+        usleep(300000);
+        printf("lease=%c closed_while_alive=%d\n", b, closed(&lgate));
+        if (write(down[1], "x", 1) != 1) return 5;
+        waitpid(c, NULL, 0);
+        for (int i = 0; i < 100 && closed(&lgate); i++) usleep(10000);
+        printf("closed_after_exit=%d\n", closed(&lgate));
+        return 0;
+    }
     if (argc > 1 && (!strcmp(argv[1], "leasebusy") || !strcmp(argv[1], "resumefail") || !strcmp(argv[1], "releasefail"))) {
         /* leasebusy: the holder exits while the state lock is busy.
          * resumefail: the holder's "resume" fails on the busy state lock,
@@ -348,6 +379,18 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["hold"], "1", out)
         self.assertEqual(out["closed_while_alive"], "1", out)
         self.assertEqual(out["closed_after_exit"], "0", "an open that opened nothing ended the lease: launches stayed held")
+
+    def test_gates_open_when_the_tool_that_leased_a_resume_hold_exits(self):
+        out = self.probe("resumelease")
+        self.assertEqual(out["lease"], "1", out)
+        self.assertEqual(out["closed_while_alive"], "1", out)
+        self.assertEqual(out["closed_after_exit"], "0",
+                         "launches held by \"resume hold\" stayed held after the tool that would open them exited")
+
+    def test_open_ends_the_lease(self):
+        out = self.probe("resumeleaseopen")
+        self.assertEqual(out["lease"], "1", out)
+        self.assertEqual(out["closed_after_exit"], "1", "a lease outlived the open that ended it and opened a later hold")
 
     def test_gates_open_when_the_holder_exits_on_a_busy_lock(self):
         out = self.probe("leasebusy")

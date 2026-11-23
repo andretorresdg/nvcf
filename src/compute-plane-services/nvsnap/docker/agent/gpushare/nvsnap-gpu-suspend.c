@@ -911,6 +911,11 @@ static int resume_held(const int *pids, int n)
     for (int i = 0; i < n; i++) {
         int r = ctl(pids[i], "resume hold");
         if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
+        else if (r == 0 && sync_gate && ctl(pids[i], "lease") < 0)
+            /* An older library has no "lease": if this tool dies before
+             * open_synced, that pid's launches stay held. */
+            fprintf(stderr, "pid=%d: no lease on its held launches; they stay held if this tool dies before it opens them\n",
+                    pids[i]);
         if (r < 0) return r;
         count += r == 0;
     }

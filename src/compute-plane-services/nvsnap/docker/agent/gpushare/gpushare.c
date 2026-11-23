@@ -2274,7 +2274,9 @@ static void do_ipcget(unsigned long long base, int s)
  * minute while the nodes catch up, and if it dies then (killed, OOM), the
  * gates would stay closed until someone sends "resume". So "hold" takes a
  * pidfd of the process that sent it, and when that process exits the gates
- * open again. "release" ends the lease (released memory must not be used
+ * open again. "lease" takes one alone: a tool that sent "resume hold" and
+ * will send "open" itself (--sync-open) takes it, so that its death does not
+ * leave the gates closed for good. "release" ends the lease (released memory must not be used
  * until "resume"), and so do "resume" and "open". Only the control thread
  * touches it. */
 #ifndef SYS_pidfd_open
@@ -2764,6 +2766,7 @@ static void serve(int s)
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "lease")) { snprintf(rep, sizeof(rep), "ok leased"); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "ibv")) { snprintf(rep, sizeof(rep), "ok ibv %d", ibv_devices()); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3, ""); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "nixl ", 5)) {
@@ -2784,7 +2787,7 @@ static void serve(int s)
      * reopened the gates, or ("resume hold") left them for "open"; "open"
      * only once it opened them ("ok not held" opened nothing). If one fails
      * (a busy state lock), the holder's exit still reopens them. */
-    if (!strcmp(buf, "hold") && !strcmp(rep, "ok held")) lease_take(s);
+    if ((!strcmp(buf, "hold") && !strcmp(rep, "ok held")) || !strcmp(buf, "lease")) lease_take(s);
     else if ((!strncmp(buf, "release", 7) && strcmp(rep, "err busy (state lock)") && strcmp(rep, "err not quiesced")) ||
              (!strncmp(buf, "resume", 6) && !strncmp(rep, "ok", 2)) || (!strcmp(buf, "open") && !strcmp(rep, "ok opened"))) {
         lease_end();

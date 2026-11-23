@@ -91,6 +91,8 @@ def serve():
             held, rep = True, "ok resumed (0 multicast bind(s), 0 multicast mapping(s)); launches held until open"
         elif cmd == "resume":
             held, rep = False, "ok resumed (0 multicast bind(s), 0 multicast mapping(s))"
+        elif cmd == "lease" and not old_lib:
+            rep = "ok leased"
         elif cmd == "open":
             rep = "ok opened" if held else "ok not held"
             held = False
@@ -260,6 +262,9 @@ class SyncOpen(unittest.TestCase):
         self.assertGreaterEqual(self.at(cmds, "open")[0], drv.verdict_at,
                                 "the gates opened before every node had resumed:\n" + out)
         self.assertLess(self.at(cmds, "resume hold")[0], drv.verdict_at)
+        lease = self.at(cmds, "lease")
+        self.assertEqual(len(lease), 1, "the held launches have no lease on this tool: %s" % names)
+        self.assertTrue(self.at(cmds, "resume hold")[0] <= lease[0] <= drv.verdict_at, names)
         self.assertRegex(drv.token, r"^[0-9]+-[0-9]+$")
         self.assertNotIn(UNSYNCED, out)
         self.assertIn("sync-open: every node resumed", out)
@@ -320,6 +325,7 @@ class SyncOpen(unittest.TestCase):
         self.assertIn("resume", names, out)
         self.assertNotIn("resume hold", names, out)
         self.assertNotIn("open", names, out)
+        self.assertNotIn("lease", names, out)
         self.assertFalse(os.path.exists(os.path.join(self.fabric, "resumed")), "a marker without --sync-open")
         self.assertNotIn("sync-open", out)
 

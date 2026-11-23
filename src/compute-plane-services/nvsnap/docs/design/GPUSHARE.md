@@ -295,8 +295,12 @@ load before any remaps, so the markers normally come close together.
 - The resume runs under the agent's resume deadline (60 minutes,
   `gpushareResumeDeadline`), which covers the handle exchange (at most 10
   minutes), the load and remap, and the 3-minute wait. If the tool dies
-  while it waits (killed at that deadline), the processes run with their
-  launches held: `resume hold` ended the `hold` lease. The resume fails, the
+  while it waits (killed at that deadline, or with its agent), each process
+  opens its gates once the tool has exited. Right after `resume hold` the
+  tool sends `lease`, which takes a lease like the one `hold` takes
+  (`release` ended that one), and a successful `open` ends it. Without the
+  lease, a tool that died with its agent would leave the workload held for
+  good, with no agent left to delete it. The resume fails, the
   source counts as left suspended, and the instance's pods are deleted. So
   are they when `open` fails for a process after the verdict (the tool
   says "not every pid's GPU launches were let through").
