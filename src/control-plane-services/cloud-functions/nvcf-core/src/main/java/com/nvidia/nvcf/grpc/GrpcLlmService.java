@@ -23,6 +23,7 @@ import static com.nvidia.nvcf.util.NvcfConstants.SCOPE_LLM_CHECK_WORKER;
 import com.nvidia.boot.exceptions.BadRequestException;
 import com.nvidia.boot.exceptions.ForbiddenException;
 import com.nvidia.boot.exceptions.UnauthorizedException;
+import com.nvidia.nvcf.configuration.exceptions.FunctionDegradedException;
 import com.nvidia.nvcf.grpc.auth.SecurityExpression;
 import com.nvidia.nvcf.proto.llm_gateway.AuthLlmInvokeRequest;
 import com.nvidia.nvcf.proto.llm_gateway.AuthLlmInvokeResponse;
@@ -31,17 +32,19 @@ import com.nvidia.nvcf.proto.llm_gateway.AuthLlmWorkerResponse;
 import com.nvidia.nvcf.proto.llm_gateway.LlmGatewayGrpc.LlmGatewayImplBase;
 import com.nvidia.nvcf.rest.function.management.dto.LlmConfigValidator;
 import com.nvidia.nvcf.service.account.AccountService;
+import com.nvidia.nvcf.service.accountratelimit.AccountRateLimitService;
 import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult;
 import com.nvidia.nvcf.service.apikeys.LlmApiKeyService;
 import com.nvidia.nvcf.service.function.FunctionLlmService;
 import com.nvidia.nvcf.service.function.FunctionMapperService;
 import com.nvidia.nvcf.service.function.invocation.FunctionInvocationValidationService;
 import com.nvidia.nvcf.service.function.invocation.FunctionInvocationValidationService.FunctionContext;
-import com.nvidia.nvcf.service.serviceaccount.ServiceAccountService;
 import com.nvidia.nvcf.service.token.GrpcAuthService;
 import com.nvidia.nvcf.service.token.GrpcTokenService;
 import com.nvidia.nvcf.service.token.GrpcTokenService.NvcfIssuedToken.TokenType;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
@@ -51,7 +54,6 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.core.OAuth2AuthenticatedPrincipal;
 import org.springframework.security.oauth2.server.resource.authentication.BearerTokenAuthenticationToken;
-import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 
 @Slf4j
 @GrpcService
@@ -70,7 +72,7 @@ public class GrpcLlmService extends LlmGatewayImplBase {
     private final FunctionMapperService functionMapperService;
     private final FunctionLlmService functionLlmService;
     private final FunctionInvocationValidationService functionInvocationValidationService;
-    private final ServiceAccountService serviceAccountService;
+    private final AccountRateLimitService accountRateLimitService;
     private final LlmApiKeyService llmApiKeyService;
     private final boolean accountTokenRateLimitEnabled;
 
@@ -81,7 +83,7 @@ public class GrpcLlmService extends LlmGatewayImplBase {
             FunctionMapperService functionMapperService,
             FunctionLlmService functionLlmService,
             FunctionInvocationValidationService functionInvocationValidationService,
-            ServiceAccountService serviceAccountService,
+            AccountRateLimitService accountRateLimitService,
             LlmApiKeyService llmApiKeyService,
             @Value("${nvcf.account-token-rate-limit-enabled:false}") boolean accountTokenRateLimitEnabled) {
         this.grpcAuthService = grpcAuthService;
@@ -90,7 +92,7 @@ public class GrpcLlmService extends LlmGatewayImplBase {
         this.functionMapperService = functionMapperService;
         this.functionLlmService = functionLlmService;
         this.functionInvocationValidationService = functionInvocationValidationService;
-        this.serviceAccountService = serviceAccountService;
+        this.accountRateLimitService = accountRateLimitService;
         this.llmApiKeyService = llmApiKeyService;
         this.accountTokenRateLimitEnabled = accountTokenRateLimitEnabled;
     }
@@ -114,8 +116,17 @@ public class GrpcLlmService extends LlmGatewayImplBase {
             throw new BadRequestException(mesg);
         }
         var ncaId = accountService.getNcaId(authentication);
-        var functions = functionInvocationValidationService.lookupAndValidateAccess(
-                authentication, ncaId, functionId, null);
+        final List<FunctionContext> functions;
+        try {
+            functions = functionInvocationValidationService.lookupAndValidateAccess(
+                    authentication, ncaId, functionId, null);
+        } catch (FunctionDegradedException e) {
+            // Not UNAVAILABLE: the gateway reserves that for auth-service outages.
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                                             .withDescription(e.getBody().getDetail())
+                                             .asRuntimeException());
+            return;
+        }
 
         var first = functions.getFirst();
         var functionModels = functionMapperService.toFunctionModels(
@@ -180,30 +191,21 @@ public class GrpcLlmService extends LlmGatewayImplBase {
         return Optional.of(value);
     }
 
-    // The API-key path's rate limit comes from the LLM-specific apikey.llm_allow evaluation
-    // (LlmApiKeyService), attached to its ApiKeyValidationResult. JWT has no such attribute,
-    // so it calls ServiceAccountService directly by ncaId instead.
+    // API keys: the LLM API-key evaluation returns auth and rates in one call. Client JWTs and
+    // invocation tokens are validated here, so their ncaId goes to the account rate-limit evaluation.
     private Optional<ApiKeyValidationResult.RateLimitAttributes> resolveAccountRateLimit(
             Authentication authentication,
             String ncaId) {
         if (!accountTokenRateLimitEnabled) {
             return Optional.empty();
         }
-        if (authentication instanceof JwtAuthenticationToken) {
-            return Optional.ofNullable(serviceAccountService.getTieredRateLimit(ncaId));
-        }
-        if (!(authentication.getPrincipal() instanceof OAuth2AuthenticatedPrincipal principal)) {
-            return Optional.empty();
-        }
-        if (principal.getAttribute(ApiKeyValidationResult.POLICY_RESULT_ATTRIBUTE)
-                instanceof ApiKeyValidationResult result
+        if (authentication.getPrincipal() instanceof OAuth2AuthenticatedPrincipal principal
+                && principal.getAttribute(ApiKeyValidationResult.POLICY_RESULT_ATTRIBUTE)
+                        instanceof ApiKeyValidationResult result
                 && result.accountTokenRateLimit() != null) {
             return Optional.of(result.accountTokenRateLimit());
         }
-        // An older policy deploy that doesn't populate accountTokenRateLimit yet - fall back
-        // to the standalone lookup instead of silently skipping enforcement during a
-        // policy/nvcf-core rollout skew.
-        return Optional.ofNullable(serviceAccountService.getTieredRateLimit(ncaId));
+        return Optional.ofNullable(accountRateLimitService.getTieredRateLimit(ncaId));
     }
 
     private Optional<Long> resolvePriority(FunctionContext context) {

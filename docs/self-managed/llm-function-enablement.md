@@ -39,9 +39,77 @@ When enabled, the stack creates:
 
 - `llm-api-gateway` in the `nvcf` namespace.
 - `llm-request-router` in the `nvcf` namespace.
-- The `llm.invocation.<domain>` HTTPRoute when Gateway API ingress is enabled.
+- The `llm.<domain>` and `llm.invocation.<domain>` HTTPRoutes when Gateway API
+  ingress is enabled. To skip either route, for example when callers reach the
+  gateway in-cluster, set `ingress.gatewayApi.routes.llmApiGateway.enabled` or
+  `ingress.gatewayApi.routes.llmInvocation.enabled` to `false`.
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
+
+When a worker pod of a container-based LLM function is removed, for example on
+scale-down, the function container gets a `preStop` pause before its stop
+signal, so it keeps serving requests while the `pylon` sidecar stops. The
+pause is 60 seconds by default. The pod's termination grace period is the
+pause plus 60 seconds, or 120 seconds if that is longer, and the `pylon`
+sidecar gets `PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS` set to the pause minus 5
+seconds; a `pylon` version that reads this variable uses it as its drain
+deadline. A removed pod therefore releases its GPU up to one pause later. To
+change the pause, set `worker.llmInferenceStopPause` in the `nvca-operator`
+chart values, for example `90s`, between `10s` and `1h`; it applies to worker
+pods created after NVCA picks up the new value. The pause runs `sleep` in the
+function container; an image without `sleep` stops at once, as before. When
+the function uses Bring Your Own Observability (BYOO), the BYOO collector and
+log-forwarder sidecars wait for the same pause, so telemetry from requests
+served during the pause is still sent. They use the Kubernetes `sleep`
+lifecycle action, which is stable since Kubernetes 1.34. The function
+container's own shutdown output after the pause may not be sent.
+
+A new worker registers with `llm-request-router` at a fixed 100 input tokens
+per second. To start it at a measured rate instead, set
+`PYLON_DO_CALIBRATION: "true"` in `agent.functionEnvOverrides` of the
+`nvca-operator` chart values. `pylon` then measures each model's input rate
+before it registers. Older `pylon` versions ignore this variable and start at
+100. A model whose calibration fails starts at 100 and logs a warning.
+Calibration adds about 5 to 15 seconds per model name to worker startup. Unless
+`PYLON_READINESS_GATE` is on, the worker pod can be Ready during that time. If
+the function has no other registered worker, a request then gets `404` with
+`no_eligible_candidates`.
+
+To change the time limit for each calibration load step, 5 seconds by default,
+set `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` there. `PYLON_DO_CALIBRATION` must
+be `true` or `false`, and `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` must be a
+positive number of milliseconds. The overrides apply to every LLM function on
+the cluster, so an invalid value stops `pylon` on every new LLM worker there.
+Both variables apply to worker pods created after NVCA picks up the new values.
+
+By default an LLM worker pod is Ready as soon as `pylon` starts, so a version
+can become `ACTIVE` before its model workers load. To hold readiness until the
+function's health check passes, set `PYLON_READINESS_GATE: "true"` in
+`agent.functionEnvOverrides`. Any value other than `true` or `false` stops
+`pylon`. `pylon` then waits for the declared check, with its path, port,
+expected status, and timeout, before it calibrates and registers. NVCA adds a
+readiness probe on `pylon`'s `/ready`. It returns `200` after
+`llm-request-router` accepts the registration. NVCA runs `pylon` with a reverse
+tunnel, so `/ready` also waits until the tunnel connects.
+
+Before you enable the switch:
+
+- Make sure every LLM worker runs a `pylon` that serves `/ready`. The control
+  plane sets the image with `nvcf.sidecars.llm-router-client-image`. If it is
+  empty, NVCA uses a built-in image without `/ready`. An older `pylon` exits at
+  startup with an `unexpected argument` error.
+- Verify the health check of each LLM function: path, port, expected status,
+  and timeout. For a Helm function, the `pylon` pod must reach the health port.
+  If the check never passes, NVCA removes the worker when
+  `INFERENCE_READY_TIMEOUT` ends.
+- If you override `INFERENCE_HEALTH_TIMEOUT`, use an ISO-8601 value such as
+  `PT10S`. `pylon` stops at startup on a Go duration such as `1m30s`.
+
+Declare a check that waits for the model workers, for example a sidecar that
+returns `200` only when enough workers are ready. Without a declared check, the
+NVCF default `/v2/health/ready` applies. If the backend answers it with `401`,
+`403`, `404`, or `405`, `pylon` uses its usual health paths, and readiness does
+not wait for the workers. A gRPC health check gets no readiness probe.
 
 ## Enable on an Existing Installation
 
@@ -58,8 +126,8 @@ services:
   unless `certManager.enabled: false`.
 - Changed resources: the OpenBao migration Job, which creates the
   `services/all/pki/root` mount and the LLM policies, the NVCF API remote
-  configuration, and the `ingress` release, which adds the
-  `llm.invocation.<domain>` HTTPRoute and the LLM worker routes when enabled.
+  configuration, and the `ingress` release, which adds the `llm.<domain>` and
+  `llm.invocation.<domain>` HTTPRoutes and the LLM worker routes when enabled.
 - No existing Deployment or StatefulSet changes. Running non-LLM functions
   keep serving.
 
@@ -81,7 +149,7 @@ Before applying:
 3. Review the rendered change before applying:
 
    ```bash
-   cd path/to/nvcf-self-managed-stack
+   cd "$BUNDLE_DIR/deploy/stacks/self-managed"
    HELMFILE_ENV=<environment-name> helmfile --environment default diff --suppress-secrets
    ```
 
@@ -268,7 +336,7 @@ For a split control-plane and compute-plane deployment, override this value
 with a host and port that worker pods can reach.
 
 The stack maps the configured or default address to
-`api.remoteConfig.configData.nvcf.llm-request-router.worker-address`. The NVCF
+`api.remoteConfig.configData.nvcf.llm.request-router.worker-address`. The NVCF
 API then includes the address in LLM worker configuration. Do not configure
 the worker address under `api.env`. When the LLM addon is disabled, the stack
 does not pass a staged endpoint to the API chart.
@@ -687,7 +755,7 @@ the API creates a new LLM function version.
 Apply the updated control-plane environment:
 
 ```bash
-cd path/to/nvcf-self-managed-stack
+cd "$BUNDLE_DIR/deploy/stacks/self-managed"
 make apply HELMFILE_ENV=<environment-name>
 ```
 
@@ -961,10 +1029,10 @@ To remove the LLM addon from a running control plane:
    not affected.
 2. Set `addons.llm.enabled: false` in the environment file, or restore the
    environment file from before enablement, and apply the control-plane
-   stack. This removes the `llm.invocation.<domain>` route and clears the
-   LLM settings in the NVCF API remote configuration, so new LLM functions
-   can no longer be invoked or launched with the sidecar. No running
-   Deployment or StatefulSet changes.
+   stack. This removes the `llm.<domain>` and `llm.invocation.<domain>`
+   routes and clears the LLM settings in the NVCF API remote configuration,
+   so new LLM functions can no longer be invoked or launched with the
+   sidecar. No running Deployment or StatefulSet changes.
 3. Remove the addon releases. With the addon disabled, the Helmfile no longer
    contains these releases, so the apply leaves them installed and running
    instead of uninstalling them:
@@ -1083,8 +1151,15 @@ A `404` with `no eligible candidates` from `llm.invocation.<domain>` means the
 request reached the LLM Gateway, but the requested function or model was
 unknown or was not registered on the selected request router. The message is
 in `error.message`, as described in [Error Responses](#error-responses).
-Similar `503` candidate errors mean the router knows the target but has no
-active eligible backend. Check:
+A `503` with `no ready backends` means the router knows the model but no
+backend is ready, for example while the only instance is replaced or the model
+is still loading. The response carries `Retry-After`, and clients should retry.
+By default the router keeps a model known for 15 minutes after its last
+backend leaves, so a removed function returns this `503` before it returns
+`404`. The request router flag `--deregistered-model-grace-ms` sets this
+period, and `0` disables it. Each request router replica keeps this in
+memory, so a replica that never saw the model, or restarted since, returns
+`404` right away. Check:
 
 - The deployment became `ACTIVE` more than about one minute ago. The sidecar
   registers with the request routers after the pod is `Running`.

@@ -187,6 +187,15 @@ table and keep the workload `namespace`, `pod`, and `container` labels. The
 DCGM job reads these labels with an `exported_` prefix, which a scrape adds
 when the exporter labels conflict with the target labels.
 
+The worker and DCGM job names require observability stack 1.1.0 or later,
+which ships `nvcf-default-monitors` 0.3.0. Observability stack 1.0.0 has no
+`jobName` setting. Its PodMonitors store these series under the default job,
+`<namespace>/<PodMonitor name>`, such as
+`monitoring/nvcf-default-monitors-worker` and
+`monitoring/nvcf-default-monitors-dcgm`. Federation then exports no worker or
+DCGM series, such as `nvcf_worker_service_request_total` or
+`DCGM_FI_DEV_GPU_UTIL`. Upgrade the observability stack to export them.
+
 The compute-plane stack pins NVCA and BYOO collector releases that support this
 setting. Older releases ignore it and federate from the default target described
 in [Federation scrape errors in the collector log](#federation-scrape-errors-in-the-collector-log).
@@ -419,7 +428,9 @@ The collector sends each signal only to the endpoint attached for that signal.
 - Container logs, when `BYOOFluentBit` is on. For container workloads, Fluent
   Bit reads the logs of the inference or task container. For Helm workloads, it
   reads the logs of the application pods in the workload namespace that run on
-  the same node as the utils pod.
+  the same node as the utils pod. It skips the utils pod, the shared storage
+  SMB server pod, and any `byoo-otel-collector`, `fluentbit-logs`, or
+  `model-cache-init` container.
 - The collector's own `otelcol_*` metrics, with the workload metrics.
 - Worker, NVCA, DCGM, cAdvisor, and kube-state-metrics series for the workload,
   only when platform metrics federation is on. Federation is off by default on

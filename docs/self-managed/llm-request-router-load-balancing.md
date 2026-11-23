@@ -287,6 +287,28 @@ accepts parameters regardless of the router release. In that case, a model with
 parameters gets HTTP `400` on every request until the router is upgraded or
 the parameters are removed.
 
+## Audit cache-affinity key use
+
+Count keyed proxy attempts by model and routing method. The first filter
+removes terminal color codes:
+
+```bash
+kubectl logs -n nvcf deployment/llm-request-router --all-pods=true --since=24h \
+  | perl -pe 's/\e\[[0-9;]*m//g' \
+  | grep 'proxying request' \
+  | grep 'request.cache_affinity_key_present=true' \
+  | grep -oE ' (model_id|requested_algorithm|routing_algorithm)=("[^"]*"|[^ ]*)' \
+  | paste -d ' ' - - - | sort | uniq -c | sort -rn
+```
+
+Use `statefulset/llm-request-router` instead when the StatefulSet workload is
+explicitly selected. `kubectl logs` reads only the current log file, so the
+counts miss attempts before a log rotation. For a full audit, use your
+retained cluster logs.
+
+To read the result, see
+[Algorithms that use the cache-affinity key](https://github.com/NVIDIA/nvcf/blob/main/src/libraries/rust/stargate/docs/load-balancer-configuration.md#algorithms-that-use-the-cache-affinity-key).
+
 ## Keep router headers trusted
 
 The gateway can send the following headers to Stargate. Derive or validate
@@ -378,7 +400,7 @@ kubectl get httproute -n <gateway-namespace> llm-invocation -o yaml
 Apply the self-managed environment from the unpacked stack directory:
 
 ```bash
-cd path/to/nvcf-self-managed-stack
+cd "$BUNDLE_DIR/deploy/stacks/self-managed"
 make apply HELMFILE_ENV=<environment-name>
 ```
 
@@ -454,7 +476,7 @@ metric names, labels, and scrape configuration.
 | Pod does not start after a configuration change | Inspect request-router logs for file read, JSON parse, unknown field, or algorithm factory errors. |
 | HTTP `400` before backend selection | Read `error.message` in the response body; see [Rejections](#rejections). Request-router logs record the code as `rejection_reason`, and the gateway returns it in `error.code` when `exposeRouterErrorCodes` is enabled. Compare the function `routingMethod` with the configured algorithm and `request_algorithms`. Check required and numeric gateway headers. |
 | HTTP `400` for affinity-aware routing | Confirm the gateway generated a nonblank affinity key when `require_cache_affinity_key` is enabled. |
-| HTTP `503` with no eligible candidates | Confirm pylons are registered and publish the capacity, queue, and optional KV-cache statistics required by the algorithm. |
+| HTTP `503` with no ready backends | Confirm pylons are registered, report the model as active, and publish the capacity, queue, and optional KV-cache statistics required by the algorithm. The request router also returns this after a model's last pylon leaves, for example during an instance replacement, for 15 minutes by default (`--deregistered-model-grace-ms`, `0` disables). |
 | New ConfigMap value has no effect | Confirm the pod creation time. Restart the selected Deployment or StatefulSet because Stargate does not reload the file. |
 | Unexpected fallback or retries | Compare routing selection, proxy attempt, retry, and retry-exhaustion metrics. Check pylon retry reasons. |
 | Affinity differs between replicas | Compare the ConfigMap, pod creation times, startup summaries, seed values, and registered candidate set. |

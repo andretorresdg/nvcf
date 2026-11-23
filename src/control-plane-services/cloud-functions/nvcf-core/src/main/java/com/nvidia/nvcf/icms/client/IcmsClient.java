@@ -38,6 +38,7 @@ import com.nvidia.boot.exceptions.NotFoundException;
 import com.nvidia.boot.exceptions.UpstreamException;
 import com.nvidia.boot.registries.service.registry.client.ngc.NgcRegistryUtils;
 import com.nvidia.boot.registries.service.registry.dto.ArtifactTypeEnum;
+import com.nvidia.nvcf.configuration.LlmProperties;
 import com.nvidia.nvcf.configuration.nats.NatsConfiguration.NatsProperties;
 import com.nvidia.nvcf.configuration.staticclientauth.FixedBearerExchangeFilterFunction;
 import com.nvidia.nvcf.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientIcmsProperties;
@@ -51,6 +52,7 @@ import com.nvidia.nvcf.persistence.function.entity.FunctionType;
 import com.nvidia.nvcf.persistence.function.entity.GpuSpecificationEntity;
 import com.nvidia.nvcf.persistence.function.entity.Protocol;
 import com.nvidia.nvcf.rest.function.deployment.dto.InstanceUsageTypeEnum;
+import com.nvidia.nvcf.rest.function.management.dto.LlmInvocationConfigDto;
 import com.nvidia.nvcf.rest.registry.dto.ProvisionedByEnum;
 import com.nvidia.nvcf.service.function.FunctionMapperService;
 import com.nvidia.nvcf.service.registry.RegistryArtifactValidationService;
@@ -170,7 +172,7 @@ public class IcmsClient {
     private final String otelCollectorContainer;
     private final String llmCredentialManagerImage;
     private final String llmRouterClientImage;
-    private final String llmRequestRouterAddress;
+    private final LlmProperties llmProperties;
     private final JsonMapper jsonMapper;
     private final GrpcTokenService grpcTokenService;
     private final FunctionMapperService functionMapperService;
@@ -212,7 +214,6 @@ public class IcmsClient {
             @Value("${nvcf.sidecars.otel-collector-container:}") String otelCollectorContainer,
             @Value("${nvcf.sidecars.llm-credential-manager-image}") String llmCredentialManagerImage,
             @Value("${nvcf.sidecars.llm-router-client-image}") String llmRouterClientImage,
-            @Value("${nvcf.llm-request-router.worker-address}") String llmRequestRouterAddress,
             @Value("${nvcf.fqdn}") String selfFqdn,
             @Value("${nvcf.global-fqdn-grpc}") String globalFqdnGrpc,
             @Value("${" + OTLP_ENDPOINT_PROPERTY + ":}") String tracingEndpoint,
@@ -230,6 +231,7 @@ public class IcmsClient {
             JsonMapper jsonMapper,
             GrpcTokenService grpcTokenService,
             FunctionMapperService functionMapperService,
+            LlmProperties llmProperties,
             NatsProperties natsProperties,
             TelemetryService telemetryService,
             RegistryArtifactValidationService registryArtifactValidationService,
@@ -247,7 +249,7 @@ public class IcmsClient {
         this.otelCollectorContainer = otelCollectorContainer;
         this.llmCredentialManagerImage = llmCredentialManagerImage;
         this.llmRouterClientImage = llmRouterClientImage;
-        this.llmRequestRouterAddress = llmRequestRouterAddress;
+        this.llmProperties = llmProperties;
         this.selfFqdn = selfFqdn;
         this.globalFqdnGrpc = globalFqdnGrpc;
         this.jsonMapper = jsonMapper;
@@ -393,6 +395,7 @@ public class IcmsClient {
         // for container-based it should be null
         var configuration = isNotBlank(function.getHelmChart()) ? gpuSpec.getConfiguration() : null;
         var models = getFunctionModels(function);
+        var terminationGracePeriod = terminationGracePeriod(function);
         var response = service.createInstance(backend, gpu, instanceType, ncaId,
                                               rawAvailabilityZones, count,
                                               getInferenceContainer(function), helmChart, env,
@@ -413,6 +416,7 @@ public class IcmsClient {
                                               regions,
                                               attributes,
                                               function.getFunctionType(),
+                                              terminationGracePeriod,
                                               telemetries,
                                               helmValidationPolicy);
         if (response == null || response.getRequestId() == null) {
@@ -483,7 +487,13 @@ public class IcmsClient {
             envStream = Stream.concat(envStream, Stream.of(
                     Pair.of("LLM_CREDENTIAL_MANAGER_IMAGE", llmCredentialManagerImage),
                     Pair.of("LLM_ROUTER_CLIENT_IMAGE", llmRouterClientImage),
-                    Pair.of("LLM_REQUEST_ROUTER_ADDRESS", llmRequestRouterAddress)));
+                    Pair.of("LLM_REQUEST_ROUTER_ADDRESS",
+                            llmProperties.getRequestRouter().getWorkerAddress())));
+            var terminationGracePeriod = terminationGracePeriod(function);
+            if (terminationGracePeriod != null) {
+                envStream = Stream.concat(envStream, Stream.of(
+                        Pair.of("TERMINATION_GRACE_PERIOD", terminationGracePeriod)));
+            }
         }
         if (function.getFunctionType() == FunctionType.STREAMING) {
             envStream = Stream.concat(envStream,
@@ -511,9 +521,43 @@ public class IcmsClient {
         }
 
         var env = envStream
-                .map(pair -> pair.getFirst() + "=" + pair.getSecond())
+                .map(pair -> pair.getFirst() + "=" + encodeEnvironmentValue(pair.getSecond()))
                 .collect(Collectors.joining("\n"));
         return Base64.getEncoder().encodeToString(env.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String terminationGracePeriod(FunctionEntity function) {
+        if (function.getFunctionType() != FunctionType.LLM) {
+            return null;
+        }
+        LlmInvocationConfigDto config = functionMapperService.toLlmInvocationConfigDto(
+                function.getLlmConfig());
+        var duration = config == null ? null : config.terminationGracePeriodDuration();
+        // if duration is not set in database we should send a default value which is equals to min
+        return (duration == null ? llmProperties.getWorker().getTerminationGracePeriod().getMin()
+                : duration).toString();
+    }
+
+    // The worker reads one KEY=value entry per line and unquotes Go double-quoted values, so a
+    // value with a control character is quoted to stay one entry. Other values are not quoted, so
+    // workers see the same bytes as before.
+    // Example: "a\nb" becomes "a\\u000ab", which the worker unquotes back to "a\nb".
+    static String encodeEnvironmentValue(Object value) {
+        var text = String.valueOf(value);
+        if (text.chars().noneMatch(Character::isISOControl)) {
+            return text;
+        }
+        var quoted = new StringBuilder("\"");
+        text.chars().forEach(c -> {
+            if (c == '"' || c == '\\') {
+                quoted.append('\\').append((char) c);
+            } else if (Character.isISOControl(c)) {
+                quoted.append("\\u%04x".formatted(c));
+            } else {
+                quoted.append((char) c);
+            }
+        });
+        return quoted.append('"').toString();
     }
 
     private String getFunctionModels(FunctionEntity function) {
@@ -724,7 +768,10 @@ public class IcmsClient {
         try {
             return service.getInstancesByDeploymentId(
                     ncaId, deploymentId, includeTerminated, true, includeExpiredAckedInstances);
-        } catch (NotFoundException ex) {
+        } catch (UpstreamException ex) {
+            if (!(ex.getCause() instanceof NotFoundException)) {
+                throw ex;
+            }
             log.info(MSG_NO_INSTANCES_FOUND, ncaId, deploymentId);
             return IcmsStubService.Instances.builder().Instances(List.of()).build();
         }
