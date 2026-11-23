@@ -3,7 +3,7 @@ module byoo
 go 1.25.0
 
 require (
-	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20260909200940-19c20e004ec9
+	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20261123070219-35d8bc806b6e
 	gopkg.in/yaml.v3 v3.0.1
 )
 
