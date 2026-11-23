@@ -250,6 +250,33 @@ func TestInit_DropsOnlyKeysWhoseRouteChanged(t *testing.T) {
 	}
 }
 
+// When only the task route changes, init keeps the function key and drops the
+// task key. The next task command must not send the kept function key, or any
+// other credential, to the new task route.
+func TestInit_TaskCommandDoesNotSendFunctionKeyToChangedTaskRoute(t *testing.T) {
+	setupInitTest(t, nil)
+	var gotAuth []string
+	taskRoute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tasks":[]}`))
+	}))
+	t.Cleanup(taskRoute.Close)
+	seedKeys(t, baseRouteConfig(), true)
+	applyRouteConfig(t, baseRouteConfig().with("base_nvct_url", taskRoute.URL))
+
+	require.NoError(t, runInit(nil, nil))
+	got := state.DefaultStateManager.GetState()
+	require.Equal(t, "function-key", got.APIKey)
+	require.Empty(t, got.NVCTAPIKey)
+
+	err := runTaskList(taskListCmd, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "api-key generate --for task")
+	assert.Empty(t, gotAuth, "the changed task route received a request")
+}
+
 // Keys saved by a release that did not record bindings are dropped once.
 func TestInit_DropsKeysWithoutRecordedBinding(t *testing.T) {
 	setupInitTest(t, nil)
