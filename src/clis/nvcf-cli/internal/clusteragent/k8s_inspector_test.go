@@ -244,6 +244,45 @@ func TestListFunctionsRecoversIdentityForTerminationRequestViaInstanceIDs(t *tes
 	}
 }
 
+// A termination request that failed is not removing the instances it lists, so
+// it does not make the function they belong to DRAINING.
+func TestListFunctionsIgnoresFailedTerminationRequestsForDrain(t *testing.T) {
+	tests := []struct {
+		terminationStatus string
+		want              Phase
+	}{
+		{terminationStatus: statusInProgress, want: PhaseDraining},
+		{terminationStatus: statusCompleted, want: PhaseDraining},
+		{terminationStatus: statusFailed, want: PhaseActive},
+		{terminationStatus: statusFailureAcknowledged, want: PhaseActive},
+	}
+	for _, tt := range tests {
+		t.Run(tt.terminationStatus, func(t *testing.T) {
+			insp := newFakeInspector(
+				icmsRequest("nvcf-backend", "r1", "fn-1", "v1", "", statusCompleted, false),
+				icmsTerminationRequest("nvcf-backend", "r2", tt.terminationStatus, "inst-a"),
+			)
+
+			got, err := insp.ListFunctions(context.Background(), ListOptions{})
+			if err != nil {
+				t.Fatalf("ListFunctions returned error: %v", err)
+			}
+			var creation *ScheduledFunction
+			for i := range got {
+				if got[i].Action != actionTermination {
+					creation = &got[i]
+				}
+			}
+			if creation == nil {
+				t.Fatalf("no creation request record in %+v", got)
+			}
+			if creation.Phase != tt.want {
+				t.Errorf("creation request phase = %q, want %q", creation.Phase, tt.want)
+			}
+		})
+	}
+}
+
 func TestListFunctionsOmitsTerminationRequestWithNoRecoverableIdentity(t *testing.T) {
 	// When no other CR's status.instances shares an instance ID with the
 	// termination request, identity truly cannot be recovered. Per the
