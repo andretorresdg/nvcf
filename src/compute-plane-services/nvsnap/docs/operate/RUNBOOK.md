@@ -20,6 +20,7 @@ records are in `nvsnap-system`.
 - [NvsnapRestoreNotRunRepeatedly](#nvsnaprestorenotrunrepeatedly)
 - [NvsnapTeardownKilled](#nvsnapteardownkilled)
 - [NvsnapCaptureFailed](#nvsnapcapturefailed)
+- [Leave-running capture failures](#leave-running-capture-failures)
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
 - [Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)](#workloads-whose-nccl-uses-rdma-webhookgpushareibv)
@@ -202,7 +203,9 @@ three times.
 - The node's account: the failed capture's logs are kept on its node under
   `/var/lib/nvsnap/checkpoints/.failed-logs/<capture>/` (the newest 20),
   CRIU's and, when the GPU tool failed it, its whole output
-  (`nvsnap-gpu-suspend-suspend.log`):
+  (`nvsnap-gpu-suspend-<command>.log`, up to 4 MiB; the error carries only
+  its last 8 lines and ends with
+  `(the tool's whole output is kept on the node in <path>)`):
   `kubectl -n nvsnap-system exec <agent> -c agent -- ls /var/lib/nvsnap/checkpoints/.failed-logs`.
 - `gpushare-failed`: the record's `gpushareFailure` has the container's
   last termination (reason, exit code, its termination message) and, for a
@@ -214,10 +217,58 @@ three times.
   log only, never on the record: search the agent's log for "the end of
   the failed run's log" and the pod's name.
 - Captures that failed for the workload's own doing (`reason`
-  `workload_exited`: it ended during the capture; `no_gpu_process`: it had
+  `workload_exited`: it ended during the capture, including when the GPU
+  tool ended with it, see
+  [Leave-running capture failures](#leave-running-capture-failures);
+  `no_gpu_process`: it had
   nothing on the GPU; `modelexpress_version`: it runs a ModelExpress older
   than 0.7, so it serves uncaptured until its owner updates ModelExpress)
   do not fire this alert; they are on the dashboard's "Capture outcomes".
+
+## Leave-running capture failures
+
+A capture asked to leave its workload running (`leaveRunning`, as
+`POST /v1/gpushare/group-checkpoint` takes it) suspends the workload's GPU
+work, dumps it, and resumes it. It is a success only once the workload is
+seen running again. These failures are counted as failed captures, and
+none of them deletes a pod. Pods are deleted only when a member was left
+suspended or locked, as before.
+
+- `the kernel reported a GPU fault during the capture` (reason `gpu_xid`):
+  between the suspend and the end of the resume, the node's kernel logged
+  Xid 137 (an NVLink access the GPU refused, "PRIV Error") on one of the
+  workload's GPUs. A workload resumed after one has hung: its GPUs show
+  100 % utilization, it completes no request, and the engine's own timeout
+  (300 s in vLLM) kills it later. The lines are kept in the failed
+  capture's logs as `kernel-gpu-faults.log`. The agent reads `/dev/kmsg`
+  from the start of the capture (`internal/agent/kmsg.go`). It reads at
+  most 1 MiB, for at most 2 s. If it cannot open `/dev/kmsg` (an agent that
+  is not privileged), it logs `cannot read the node's kernel log` and the
+  check is off. Recover the workload by deleting its pods. Do not capture
+  it in place again until the cause is fixed.
+- `the workload stopped making progress after resume` (reason
+  `resume_stalled`), one of:
+  - On a member's node: a GPU process the capture suspended had ended once
+    the resume was done (`GPU process(es) … ended after their resume`).
+  - On the group's driver, after the holds end: a member's pod was not
+    Ready again within 60 s, a container restarted or ended, or the pod
+    was replaced or deleted within the next 10 s
+    (`internal/agent/resume_guard.go`, `postResumeWatch`).
+  The limit: neither check sees the GPU work itself. A workload whose
+  GPU work hangs while its processes run and its readiness probe passes
+  still passes these checks. A hang seen so far came with the Xid above.
+- `the workload exited during the capture` (reason `workload_exited`): the
+  workload's process ended while the capture ran. The GPU tool runs in
+  the workload's pid namespace, so when the workload's init exits the
+  kernel kills the tool too (`signal: killed`). Or the tool sees the
+  workload's processes stop answering (`err no reply`,
+  `Connection reset by peer`) and exits a moment before. The agent waits
+  up to 5 s for the init to end, then says the workload exited. It does
+  not say the tool failed or that the workload could not be resumed. When
+  the capture had suspended the workload, the text adds
+  `the instance is replaced`, and its pods are deleted as before. Look at
+  the workload's own log for why it exited. In the case above, it was the
+  engine's timeout after a hang from an earlier cycle.
 
 ## NvsnapInventoryStale
 

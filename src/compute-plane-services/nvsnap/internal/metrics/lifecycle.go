@@ -321,13 +321,29 @@ const (
 	ModelExpressVersionText = "needs modelexpress >= 0.7"
 )
 
+// The texts Reason classes as a capture that broke the workload it left
+// running: nvsnap's doing, which the capture alert counts.
+const (
+	// GPUFaultText: the node's kernel reported a GPU fault (an NVLink
+	// Xid) on the workload's GPUs between the start of a leave-running
+	// capture and its resume (internal/agent/kmsg.go).
+	GPUFaultText = "the kernel reported a gpu fault during the capture"
+	// ResumeStalledText: a leave-running capture resumed the workload, but
+	// it stopped serving after (internal/agent/resume_guard.go).
+	ResumeStalledText = "the workload stopped making progress after resume"
+)
+
 // Reason classes a failure's text into a bounded label value.
 func Reason(text string) string {
 	t := strings.ToLower(text)
 	switch {
 	case t == "":
 		return ""
-	// The workload's own doing, checked first: the rest of the text is
+	// A GPU fault the capture raised, first: a workload that exited, or
+	// stopped, after one did so because of it.
+	case strings.Contains(t, GPUFaultText):
+		return "gpu_xid"
+	// The workload's own doing, checked next: the rest of the text is
 	// what the capture ran into because of it.
 	case strings.Contains(t, WorkloadExitedText):
 		return "workload_exited"
@@ -335,6 +351,8 @@ func Reason(text string) string {
 		return "no_gpu_process"
 	case strings.Contains(t, ModelExpressVersionText):
 		return "modelexpress_version"
+	case strings.Contains(t, ResumeStalledText):
+		return "resume_stalled"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):

@@ -656,8 +656,7 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 		// A failed capture leaves nothing a restore could use; its logs are
 		// kept to say why.
 		if retErr != nil {
-			writeToolOutput(checkpointDir, retErr)
-			keepFailureLogs(a.config.CheckpointDir, checkpointDir, log)
+			retErr = keepFailedCapture(a.config.CheckpointDir, checkpointDir, retErr, log)
 			if err := os.RemoveAll(checkpointDir); err != nil {
 				log.WithError(err).WithField("dir", checkpointDir).Warn("cannot remove the failed capture's directory")
 			}

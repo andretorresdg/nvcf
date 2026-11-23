@@ -900,6 +900,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	members := make([]fabricMember, len(req.Members))
 	bases := make([]string, len(req.Members))
 	uids := make([]types.UID, len(req.Members))
+	baselines := make([]memberBaseline, len(req.Members))
 	for i, m := range req.Members {
 		if m.Namespace == "" || m.PodName == "" {
 			return nil, fmt.Errorf("member %d: namespace and podName required", i)
@@ -909,6 +910,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			return nil, fmt.Errorf("member %s/%s: %w", m.Namespace, m.PodName, err)
 		}
 		uids[i] = pod.UID
+		baselines[i] = baselineOf(pod)
 		if pod.Spec.NodeName == "" {
 			return nil, fmt.Errorf("member %s/%s is not scheduled", m.Namespace, m.PodName)
 		}
@@ -977,11 +979,15 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	// the freeze point. The members are released from it only once all are
 	// held.
 	hold := newInstanceHold(ctx, fabricHTTPClient, session, req.Members, bases, log)
-	defer func() {
-		hold.wait()
-		hold.cancel()
-		releaseMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
-	}()
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			hold.wait()
+			hold.cancel()
+			releaseMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
+		})
+	}
+	defer release()
 	freezeDone := make(chan struct{})
 	go func() {
 		defer close(freezeDone)
@@ -1021,6 +1027,16 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	}
 	if len(failed) > 0 {
 		return res, membersFailed("group checkpoint", session, len(res.Members), failed)
+	}
+	if req.LeaveRunning {
+		// Every member resumed: the instance is seen serving again before
+		// the capture succeeds (resume_guard.go). Released first: a held
+		// pod's readiness probe fails.
+		release()
+		if err := watchMembersAfterResume(ctx, a.kubeClient, baselines, postResumeWatch); err != nil {
+			log.WithError(err).Error("group checkpoint: the instance did not run again after its resume")
+			return res, fmt.Errorf("group checkpoint %s: %w", session, err)
+		}
 	}
 	return res, nil
 }

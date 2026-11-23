@@ -194,9 +194,11 @@ func sourceMustBeReplaced(err error) bool {
 }
 
 // sourceMustBeReplacedText is sourceMustBeReplaced on an error's text, as
-// it comes back from another node's agent.
+// it comes back from another node's agent; a source that exited while
+// suspended (markWorkloadExited) is replaced too.
 func sourceMustBeReplacedText(s string) bool {
-	return strings.Contains(s, errSourceLeftSuspended.Error()) || strings.Contains(s, errSourceLeftLocked.Error())
+	return strings.Contains(s, errSourceLeftSuspended.Error()) || strings.Contains(s, errSourceLeftLocked.Error()) ||
+		strings.Contains(s, errWorkloadExited.Error()) && strings.Contains(s, workloadExitedReplaced)
 }
 
 // runDump runs a CRIU dump (name args...) to its end, under its own
@@ -251,11 +253,14 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	// A dump that fails before CRIU has dumped the container, with the
 	// container's process ended, failed because the workload exited
 	// (workload_exited.go). Once CRIU has dumped it, the dump itself
-	// stopped the process, and a later failure is nvsnap's.
+	// stopped the process, and a later failure is nvsnap's; unless the
+	// dump left it running, when an end at any point is the workload's.
 	// A process already gone here is the workload's exit too.
 	initStart, initGone := initialStart(procBase, hostPID)
 	dumped := false
-	defer func() { retErr = dumpFailure(retErr, dumped, procBase, hostPID, initStart, initGone) }()
+	defer func() {
+		retErr = dumpFailure(retErr, stoppedByDump(dumped, leaveRunning), procBase, hostPID, initStart, initGone)
+	}()
 
 	// 1. The tools run from the node bundle mounted read-only in the
 	// container (bundle_tools.go), never from a copy in its filesystem. A
@@ -315,6 +320,9 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	var gsInfo *GPUShareInfo
 	var gpuMap string
 	var guard suspendGuard
+	// A leave-running capture watches the node's kernel log from before
+	// its suspend to after its resume (kmsg.go, resume_guard.go).
+	var faults *gpuFaultWatch
 	if fabricSession != "" && !gsOn {
 		return nil, errNoGPUProcess(fabricSession)
 	}
@@ -371,6 +379,10 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 					resumeModelExpress(ctx, hostPID, "", gsPIDs, log)
 				}
 			}()
+		}
+		if leaveRunning {
+			faults = startGPUFaultWatch(log)
+			defer faults.close()
 		}
 		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
 		if suspended {
@@ -462,8 +474,18 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	resumeErr := settleSource(gsOn, leaveRunning, err != nil, func() error {
 		return resumeSource(ctx, hostPID, gsPIDs, fabricDir, log)
 	})
-	if err != nil || resumeErr != nil {
-		return nil, errors.Join(err, resumeErr)
+	// A workload left running is seen running again before the capture
+	// succeeds: no GPU fault in the kernel log over the capture, and every
+	// GPU process it suspended still there (resume_guard.go).
+	var resumed error
+	if leaveRunning && gsOn {
+		resumed = faults.check(driverGPUsDir, gpuMap, checkpointDir)
+		if resumed == nil && err == nil && resumeErr == nil {
+			resumed = membersAfterResume(procBase, targetHostPID, gsPIDs)
+		}
+	}
+	if err != nil || resumeErr != nil || resumed != nil {
+		return nil, errors.Join(resumed, err, resumeErr)
 	}
 	if gsOn {
 		closeFabric()

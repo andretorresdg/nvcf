@@ -11,6 +11,7 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,19 +32,36 @@ const (
 // that failed the capture (a toolError in err) into dir, as
 // nvsnap-gpu-suspend-<command>.log, for keepFailureLogs to keep: the error
 // carries only what failed and the output's last lines.
-func writeToolOutput(dir string, err error) {
+// It returns the file's name, "" when it wrote none.
+func writeToolOutput(dir string, err error) string {
 	var te *toolError
 	if !errors.As(err, &te) || te.out == "" {
-		return
+		return ""
 	}
-	name := gpushareToolName + "-" + toolVerb(te.args) + ".log"
-	_ = os.WriteFile(filepath.Join(dir, filepath.Base(name)), []byte(te.out), 0o644) //nolint:gosec // dir is the capture's own directory
+	name := filepath.Base(gpushareToolName + "-" + toolVerb(te.args) + ".log")
+	if werr := os.WriteFile(filepath.Join(dir, name), []byte(te.out), 0o644); werr != nil { //nolint:gosec // dir is the capture's own directory
+		return ""
+	}
+	return name
+}
+
+// keepFailedCapture keeps the logs of the failed capture in dir (failed
+// with err) under root, the tool's whole output with them, and returns err
+// told where that output is kept: err carries only its last lines.
+func keepFailedCapture(root, dir string, err error, log *logrus.Entry) error {
+	name := writeToolOutput(dir, err)
+	kept := keepFailureLogs(root, dir, log)
+	if name == "" || kept == "" {
+		return err
+	}
+	return fmt.Errorf("%w (the tool's whole output is kept on the node in %s)", err, filepath.Join(kept, name))
 }
 
 // keepFailureLogs copies the *.log files of the failed capture in dir into
 // root's failed-logs directory and drops the oldest beyond
-// failureLogsKept.
-func keepFailureLogs(root, dir string, log *logrus.Entry) {
+// failureLogsKept. It returns the directory they are kept in, "" when
+// none was kept.
+func keepFailureLogs(root, dir string, log *logrus.Entry) string {
 	dst := filepath.Join(root, failureLogsDir, filepath.Base(dir))
 	n := 0
 	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
@@ -62,10 +80,11 @@ func keepFailureLogs(root, dir string, log *logrus.Entry) {
 		return nil
 	})
 	if n == 0 {
-		return
+		return ""
 	}
 	log.WithFields(logrus.Fields{"logs": n, "dir": dst}).Info("kept the failed capture's logs")
 	pruneFailureLogs(filepath.Join(root, failureLogsDir), failureLogsKept)
+	return dst
 }
 
 func copyLogFile(src, dst string) error {
