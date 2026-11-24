@@ -75,6 +75,70 @@ func TestSortReleasesMergesSources(t *testing.T) {
 	}
 }
 
+func TestSortReleasesOrdersPrereleasesBySemver(t *testing.T) {
+	// Pre-release identifiers compare numerically (rc.10 > rc.2), and an
+	// nv-X.Y.Z wrapper release sorts by its own version, above the bare
+	// upstream version it wraps.
+	rels := []release{
+		{Version: "0.160.0-nv-0.4.10"},
+		{Version: "1.0.0"},
+		{Version: "0.160.0-nv-0.4.2"},
+		{Version: "1.0.0-rc.10"},
+		{Version: "0.160.0"},
+		{Version: "1.0.0-rc.2"},
+		{Version: "0.160.0-nv-0.4.9"},
+		{Version: "1.0.0-rc"},
+		{Version: "0.157.0-nv-0.2.3"},
+		{Version: "1.0.0-beta.11"},
+		{Version: "0.160.0-nv-0.10.0"},
+		{Version: "1.0.0-rc.1"},
+	}
+	sortReleases(rels)
+	want := []string{
+		"0.157.0-nv-0.2.3",
+		"0.160.0",
+		"0.160.0-nv-0.4.2",
+		"0.160.0-nv-0.4.9",
+		"0.160.0-nv-0.4.10",
+		"0.160.0-nv-0.10.0",
+		"1.0.0-beta.11",
+		"1.0.0-rc",
+		"1.0.0-rc.1",
+		"1.0.0-rc.2",
+		"1.0.0-rc.10",
+		"1.0.0",
+	}
+	got := make([]string, len(rels))
+	for i, r := range rels {
+		got[i] = r.Version
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("sortReleases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+func TestComparePrerelease(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"", "", 0},
+		{"rc.1", "", -1},
+		{"", "rc.1", 1},
+		{"rc.2", "rc.10", -1},
+		{"rc.10", "rc.2", 1},
+		{"alpha", "alpha.1", -1},
+		{"alpha.1", "alpha.beta", -1}, // numeric sorts below text
+		{"alpha.beta", "beta", -1},
+		{"rc.01", "rc.1", 0},
+	}
+	for _, c := range cases {
+		if got := comparePrerelease(c.a, c.b); got != c.want {
+			t.Errorf("comparePrerelease(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
 // runGit runs git in dir with a deterministic identity, failing the test on error.
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
