@@ -166,7 +166,7 @@ func less(a, b semver) bool {
 // pre-release of the form nv-X.Y.Z (as in the collector's 0.160.0-nv-0.4.10)
 // is a wrapper release built on the upstream version in front of it. Wrapper
 // releases compare by their own X.Y.Z and sort above the bare upstream
-// version.
+// version. Build metadata (+...) is ignored, as SemVer 2.0.0 rule 10 requires.
 func compareSemver(a, b semver) int {
 	if c := cmp.Compare(a.major, b.major); c != 0 {
 		return c
@@ -177,8 +177,9 @@ func compareSemver(a, b semver) int {
 	if c := cmp.Compare(a.patch, b.patch); c != 0 {
 		return c
 	}
-	aWrapper, aWrapped := wrapperRelease(a.pre)
-	bWrapper, bWrapped := wrapperRelease(b.pre)
+	aPre, bPre := withoutBuild(a.pre), withoutBuild(b.pre)
+	aWrapper, aWrapped := wrapperRelease(aPre)
+	bWrapper, bWrapped := wrapperRelease(bPre)
 	switch {
 	case aWrapped && bWrapped:
 		return compareSemver(aWrapper, bWrapper)
@@ -187,7 +188,14 @@ func compareSemver(a, b semver) int {
 	case bWrapped:
 		return -1
 	}
-	return comparePrerelease(a.pre, b.pre)
+	return comparePrerelease(aPre, bPre)
+}
+
+// withoutBuild drops the build metadata from a pre-release string
+// ("rc.2+build" becomes "rc.2"), since it does not affect precedence.
+func withoutBuild(pre string) string {
+	pre, _, _ = strings.Cut(pre, "+")
+	return pre
 }
 
 // wrapperRelease parses X.Y.Z from a pre-release of the form nv-X.Y.Z.

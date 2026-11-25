@@ -139,6 +139,46 @@ func TestComparePrerelease(t *testing.T) {
 	}
 }
 
+func TestCompareSemverIgnoresBuildMetadata(t *testing.T) {
+	// SemVer 2.0.0 rule 10: build metadata does not affect precedence. It
+	// must not take part in the pre-release comparison or hide a wrapper
+	// release.
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"1.0.0-rc.2+build", "1.0.0-rc.3", -1},
+		{"1.0.0-rc.10+build.5", "1.0.0-rc.2", 1},
+		{"1.0.0-rc.2+build", "1.0.0-rc.2", 0},
+		{"1.0.0-rc.2+a", "1.0.0-rc.2+b", 0},
+		{"0.160.0-nv-0.4.2+build", "0.160.0", 1},
+		{"0.160.0-nv-0.4.2+build", "0.160.0-nv-0.4.10", -1},
+		{"0.160.0-nv-0.4.10+build", "0.160.0-nv-0.4.9", 1},
+	}
+	for _, c := range cases {
+		a, ok := parseTag(c.a, "")
+		if !ok {
+			t.Fatalf("parseTag(%q) failed", c.a)
+		}
+		b, ok := parseTag(c.b, "")
+		if !ok {
+			t.Fatalf("parseTag(%q) failed", c.b)
+		}
+		if got := compareSemver(a, b); got != c.want {
+			t.Errorf("compareSemver(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+		if got := compareSemver(b, a); got != -c.want {
+			t.Errorf("compareSemver(%q, %q) = %d, want %d", c.b, c.a, got, -c.want)
+		}
+	}
+
+	// The build metadata is still kept in the version and tag.
+	sv, _ := parseTag("v1.0.0-rc.2+build", "v")
+	if sv.version != "1.0.0-rc.2+build" || sv.tag != "v1.0.0-rc.2+build" {
+		t.Errorf("parseTag kept version %q, tag %q", sv.version, sv.tag)
+	}
+}
+
 // runGit runs git in dir with a deterministic identity, failing the test on error.
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
