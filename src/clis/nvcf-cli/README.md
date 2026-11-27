@@ -472,7 +472,7 @@ nvcf-cli function invoke --request-body '{"message": "hello world"}'
 nvcf-cli status
 
 # 7. Clean up when done
-nvcf-cli function deploy remove  # Remove the deployment (uses saved context)
+nvcf-cli function deploy remove --function-id func-abc123 --version-id ver-def456  # Remove the deployment (IDs required)
 nvcf-cli function delete         # Delete the function (uses saved context)
 ```
 
@@ -573,16 +573,13 @@ Displays:
 Remove function deployment while keeping function definition:
 
 ```bash
-# Undeploy current function (from state)
-nvcf-cli function deploy remove
-
-# Undeploy specific function
+# Undeploy a function (both IDs are required; saved context is not used)
 nvcf-cli function deploy remove --function-id func-123 --version-id ver-456
 ```
 
 Key Features:
 
-- Uses saved function context automatically
+- Requires --function-id and --version-id
 - Supports both cluster and direct modes
 - Function definition remains (can be redeployed)
 
